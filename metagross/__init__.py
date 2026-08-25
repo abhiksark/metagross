@@ -240,6 +240,12 @@ def run_live(cfg: Config) -> int:
     barrier_r, barrier_w = os.pipe()
     for fd in (profile_r, profile_w, barrier_r, barrier_w):
         os.set_inheritable(fd, False)
+    # Controller ruling: bump the profile pipe's capacity beyond the default
+    # 64KiB to mitigate its throughput cap; a failed bump is fine.
+    try:
+        fcntl.fcntl(profile_r, fcntl.F_SETPIPE_SZ, 1 << 20)
+    except OSError:
+        pass
 
     # 5. Fork the target. The child drops privileges and blocks on the
     # barrier until the parent has attached its probes.
@@ -247,8 +253,13 @@ def run_live(cfg: Config) -> int:
     if pid == 0:
         os.close(profile_r)
         os.close(barrier_w)
-        _child_main(script, cfg.script_args, creds, barrier_r, profile_w,
-                    cfg.project_root)
+        try:
+            _child_main(script, cfg.script_args, creds, barrier_r, profile_w,
+                        cfg.project_root)
+        except BaseException:
+            traceback.print_exc()
+        finally:
+            _exit_flushed(1)
     os.close(profile_w)
     os.close(barrier_r)
 
@@ -273,7 +284,11 @@ def run_live(cfg: Config) -> int:
         raise MetagrossError(f"failed to attach probes: {exc}") from exc
 
     # 7. Release the barrier; the child starts running the target script.
-    os.write(barrier_w, b"\x01")
+    try:
+        os.write(barrier_w, b"\x01")
+    except OSError:
+        os.waitpid(pid, 0)
+        raise MetagrossError("target exited before tracing began") from None
     os.close(barrier_w)
 
     # 8. Event loop: drain GPU events and profiling records, attribute,
@@ -313,14 +328,29 @@ def run_live(cfg: Config) -> int:
 
     status = None
     interrupted = False
+    reaped = False
     while True:
         try:
-            b.ring_buffer_poll(50)
-            _drain_profile()
-            _emit_all(joiner.flush(time.monotonic_ns()))
+            if not reaped:
+                b.ring_buffer_poll(50)
+                _drain_profile()
+                _emit_all(joiner.flush(time.monotonic_ns()))
+                wpid, status = os.waitpid(pid, os.WNOHANG)
+                reaped = wpid == pid
+            if reaped:
+                # Child has exited (status captured above): drain whatever
+                # remains once more and stop, regardless of further signals.
+                b.ring_buffer_poll(0)
+                _drain_profile()
+                _emit_all(joiner.flush(time.monotonic_ns(), force=True))
+                break
         except KeyboardInterrupt:
             # 10. Forward SIGINT to the child and keep looping; its exit
-            # status will yield 130 naturally once it terminates.
+            # status will yield 130 naturally once it terminates. If the
+            # child was already reaped, the exit status is already known,
+            # so stop instead of re-waiting on an already-reaped pid.
+            if reaped:
+                break
             if not interrupted:
                 interrupted = True
                 try:
@@ -328,12 +358,6 @@ def run_live(cfg: Config) -> int:
                 except OSError:
                     pass
             continue
-        wpid, status = os.waitpid(pid, os.WNOHANG)
-        if wpid == pid:
-            b.ring_buffer_poll(0)
-            _drain_profile()
-            _emit_all(joiner.flush(time.monotonic_ns(), force=True))
-            break
 
     # 9. Report loss counters as warnings and detach probes.
     lost = b["counters"][ct.c_int(0)].value
