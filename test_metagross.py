@@ -681,5 +681,41 @@ class LiveTraceTest(unittest.TestCase):
         self.assertLessEqual(len(after.splitlines()), len(before.splitlines()) + 1)
 
 
+def _torch_available():
+    try:
+        import torch
+        return torch.cuda.is_available()
+    except ImportError:
+        return False
+
+
+@unittest.skipUnless(INTEGRATION and os.geteuid() == 0 and _torch_available(),
+                     "needs integration env and CUDA-enabled torch")
+class TorchSmokeTest(unittest.TestCase):
+    def test_forward_pass_attributed(self):
+        path = "/tmp/metagross_torch.py"
+        with open(path, "w") as f:
+            f.write(
+                "import torch\n"
+                "def forward_step(a, b):\n"
+                "    return (a @ b).sum().item()\n"
+                "a = torch.randn(256, 256, device='cuda')\n"
+                "b = torch.randn(256, 256, device='cuda')\n"
+                "print('sum', forward_step(a, b))\n")
+        self.addCleanup(os.unlink, path)
+        out = tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False)
+        out.close()
+        self.addCleanup(os.unlink, out.name)
+        proc = subprocess.run(
+            ["/usr/bin/python3", "-m", "metagross", "--json", "--output",
+             out.name, "--project-root", "/tmp", path],
+            capture_output=True, text=True, timeout=300)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        records = [json_mod.loads(line) for line in open(out.name) if line.strip()]
+        launches = [r for r in records if r["api"].startswith("cuLaunchKernel")]
+        self.assertTrue(launches, "no kernel launches captured from torch")
+        self.assertIn("forward_step", {r["function"] for r in launches})
+
+
 if __name__ == "__main__":
     unittest.main()
