@@ -15,72 +15,72 @@ from metagross import _events
 
 
 def _raw(api_id, *, args=(), out=0, name=b"", ret=0, ts=0, dur=0, tid=1):
-	ev = _bpf.RawEvent(ts=ts, dur=dur, tid=tid, api_id=api_id, ret=ret,
-	                   out=out, name=name)
-	for i, v in enumerate(args):
-		ev.args[i] = v
-	return ev
+    ev = _bpf.RawEvent(ts=ts, dur=dur, tid=tid, api_id=api_id, ret=ret,
+                       out=out, name=name)
+    for i, v in enumerate(args):
+        ev.args[i] = v
+    return ev
 
 
 class KernelRegistryTest(unittest.TestCase):
-	def test_module_get_function_registers(self):
-		reg = _events.KernelRegistry()
-		api = _bpf.API_BY_ID[18]  # cuModuleGetFunction
-		reg.observe(api, _raw(18, out=0xF00, name=b"vec_add"))
-		self.assertEqual(reg.name(0xF00), "vec_add")
+    def test_module_get_function_registers(self):
+        reg = _events.KernelRegistry()
+        api = _bpf.API_BY_ID[18]  # cuModuleGetFunction
+        reg.observe(api, _raw(18, out=0xF00, name=b"vec_add"))
+        self.assertEqual(reg.name(0xF00), "vec_add")
 
-	def test_kernel_get_function_links_existing_name(self):
-		reg = _events.KernelRegistry()
-		reg.observe(_bpf.API_BY_ID[19], _raw(19, out=0xAAA, name=b"gemm"))
-		reg.observe(_bpf.API_BY_ID[20], _raw(20, args=(0, 0xAAA), out=0xBBB))
-		self.assertEqual(reg.name(0xBBB), "gemm")
+    def test_kernel_get_function_links_existing_name(self):
+        reg = _events.KernelRegistry()
+        reg.observe(_bpf.API_BY_ID[19], _raw(19, out=0xAAA, name=b"gemm"))
+        reg.observe(_bpf.API_BY_ID[20], _raw(20, args=(0, 0xAAA), out=0xBBB))
+        self.assertEqual(reg.name(0xBBB), "gemm")
 
-	def test_failed_registration_ignored(self):
-		reg = _events.KernelRegistry()
-		reg.observe(_bpf.API_BY_ID[18], _raw(18, out=0xF00, name=b"x", ret=1))
-		self.assertIsNone(reg.name(0xF00))
+    def test_failed_registration_ignored(self):
+        reg = _events.KernelRegistry()
+        reg.observe(_bpf.API_BY_ID[18], _raw(18, out=0xF00, name=b"x", ret=1))
+        self.assertIsNone(reg.name(0xF00))
 
 
 class DescribeTest(unittest.TestCase):
-	def setUp(self):
-		self.reg = _events.KernelRegistry()
-		self.allocs = _events.AllocTracker()
+    def setUp(self):
+        self.reg = _events.KernelRegistry()
+        self.allocs = _events.AllocTracker()
 
-	def test_launch_details(self):
-		self.reg.observe(_bpf.API_BY_ID[18], _raw(18, out=0xF00, name=b"vec_add"))
-		ev = _raw(1, args=(0xF00, 256, 1, 1, 128, 1, 1, 0, 0x77))
-		kernel, det = _events.describe(_bpf.API_BY_ID[1], ev, self.reg, self.allocs)
-		self.assertEqual(kernel, "vec_add")
-		self.assertEqual(det["grid"], "256,1,1")
-		self.assertEqual(det["block"], "128,1,1")
-		self.assertEqual(det["stream"], "0x77")
+    def test_launch_details(self):
+        self.reg.observe(_bpf.API_BY_ID[18], _raw(18, out=0xF00, name=b"vec_add"))
+        ev = _raw(1, args=(0xF00, 256, 1, 1, 128, 1, 1, 0, 0x77))
+        kernel, det = _events.describe(_bpf.API_BY_ID[1], ev, self.reg, self.allocs)
+        self.assertEqual(kernel, "vec_add")
+        self.assertEqual(det["grid"], "256,1,1")
+        self.assertEqual(det["block"], "128,1,1")
+        self.assertEqual(det["stream"], "0x77")
 
-	def test_launch_unknown_kernel_placeholder(self):
-		ev = _raw(1, args=(0xDEAD, 1, 1, 1, 1, 1, 1, 0, 0))
-		kernel, _ = _events.describe(_bpf.API_BY_ID[1], ev, self.reg, self.allocs)
-		self.assertEqual(kernel, "kernel@0xdead")
+    def test_launch_unknown_kernel_placeholder(self):
+        ev = _raw(1, args=(0xDEAD, 1, 1, 1, 1, 1, 1, 0, 0))
+        kernel, _ = _events.describe(_bpf.API_BY_ID[1], ev, self.reg, self.allocs)
+        self.assertEqual(kernel, "kernel@0xdead")
 
-	def test_alloc_free_tracking(self):
-		_, det = _events.describe(_bpf.API_BY_ID[3],
-		                          _raw(3, args=(0, 4096), out=0x9000),
-		                          self.reg, self.allocs)
-		self.assertEqual(det["bytes"], 4096)
-		self.assertEqual(self.allocs.total_bytes, 4096)
-		_, det = _events.describe(_bpf.API_BY_ID[5], _raw(5, args=(0x9000,)),
-		                          self.reg, self.allocs)
-		self.assertEqual(det["bytes"], 4096)
-		self.assertEqual(self.allocs.total_bytes, 0)
+    def test_alloc_free_tracking(self):
+        _, det = _events.describe(_bpf.API_BY_ID[3],
+                                  _raw(3, args=(0, 4096), out=0x9000),
+                                  self.reg, self.allocs)
+        self.assertEqual(det["bytes"], 4096)
+        self.assertEqual(self.allocs.total_bytes, 4096)
+        _, det = _events.describe(_bpf.API_BY_ID[5], _raw(5, args=(0x9000,)),
+                                  self.reg, self.allocs)
+        self.assertEqual(det["bytes"], 4096)
+        self.assertEqual(self.allocs.total_bytes, 0)
 
-	def test_copy_details(self):
-		_, det = _events.describe(_bpf.API_BY_ID[8],
-		                          _raw(8, args=(0x1, 0x2, 4194304, 0x77)),
-		                          self.reg, self.allocs)
-		self.assertEqual(det["bytes"], 4194304)
-		self.assertEqual(det["stream"], "0x77")
+    def test_copy_details(self):
+        _, det = _events.describe(_bpf.API_BY_ID[8],
+                                  _raw(8, args=(0x1, 0x2, 4194304, 0x77)),
+                                  self.reg, self.allocs)
+        self.assertEqual(det["bytes"], 4194304)
+        self.assertEqual(det["stream"], "0x77")
 
-	def test_shell_quoting(self):
-		s = _events.shell_quote_details({"path": "a b", "n": 3})
-		self.assertEqual(s, "path='a b' n=3")
+    def test_shell_quoting(self):
+        s = _events.shell_quote_details({"path": "a b", "n": 3})
+        self.assertEqual(s, "path='a b' n=3")
 
 
 class ParseArgsTest(unittest.TestCase):
