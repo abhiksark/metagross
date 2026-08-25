@@ -9,8 +9,9 @@ import stat
 import tempfile
 import unittest
 
+import metagross
 from metagross import (Config, Credentials, MetagrossError, UsageError, exit_status_from_wait,
-                       open_trace_output, parse_args, validate_sudo)
+                       open_trace_output, parse_args, validate_sudo, _validate_script)
 from metagross import _bpf
 from metagross import _events
 from metagross import _profile
@@ -485,6 +486,56 @@ class RendererTest(unittest.TestCase):
         self.assertIsNone(rec["file"])
         self.assertIsNone(rec["line"])
         self.assertIsNone(rec["kernel"])
+
+
+class ValidateScriptTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+
+    def test_valid_script(self):
+        p = os.path.join(self.dir.name, "s.py")
+        open(p, "w").close()
+        self.assertEqual(_validate_script(p, self.dir.name), os.path.realpath(p))
+
+    def test_missing_rejected(self):
+        with self.assertRaises(MetagrossError):
+            _validate_script(os.path.join(self.dir.name, "no.py"), self.dir.name)
+
+    def test_outside_root_rejected(self):
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        p = os.path.join(other.name, "s.py")
+        open(p, "w").close()
+        with self.assertRaises(MetagrossError):
+            _validate_script(p, self.dir.name)
+
+    def test_non_py_rejected(self):
+        p = os.path.join(self.dir.name, "s.sh")
+        open(p, "w").close()
+        with self.assertRaises(MetagrossError):
+            _validate_script(p, self.dir.name)
+
+    def test_symlink_out_of_root_rejected(self):
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        target = os.path.join(other.name, "real.py")
+        open(target, "w").close()
+        link = os.path.join(self.dir.name, "s.py")
+        os.symlink(target, link)
+        with self.assertRaises(MetagrossError):
+            _validate_script(link, self.dir.name)
+
+
+class MainRoutingTest(unittest.TestCase):
+    def test_unprivileged_live_run_fails_cleanly(self):
+        if os.geteuid() == 0:
+            self.skipTest("running as root")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = metagross.main(["examples/gpu_demo.py"])
+        self.assertEqual(rc, 1)
+        self.assertIn("root", err.getvalue())
 
 
 if __name__ == "__main__":

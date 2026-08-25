@@ -2,10 +2,20 @@
 """Metagross: eBPF GPU-call tracing for one Python script."""
 from __future__ import annotations
 
+import ctypes as ct
 import dataclasses
+import fcntl
+import io
 import os
+import pwd
+import runpy
+import selectors
+import signal
 import stat
 import sys
+import time
+import traceback
+from typing import NoReturn
 
 
 class MetagrossError(Exception):
@@ -124,6 +134,223 @@ def open_trace_output(path: str, uid: int, gid: int):
     return os.fdopen(fd, "wb")
 
 
+def _validate_script(script: str, project_root: str) -> str:
+    real = os.path.realpath(script)
+    root = os.path.realpath(project_root)
+    if not real.endswith(".py"):
+        raise MetagrossError(f"target must be a .py file: {script!r}")
+    if not os.path.isfile(real):
+        raise MetagrossError(f"target script not found: {script!r}")
+    if not real.startswith(root + os.sep):
+        raise MetagrossError(
+            f"target {script!r} resolves outside project root {root!r}")
+    return real
+
+
+def _exit_flushed(code: int) -> NoReturn:
+    # os._exit skips stdio flushing; the target's own stdout/stderr (and
+    # anything we just wrote to them) must reach the parent's pipes.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except OSError:
+            pass
+    os._exit(code)
+
+
+def _child_main(script, script_args, creds, barrier_r, profile_w,
+                project_root) -> NoReturn:
+    """Run post-fork in the traced child. Never returns to the caller."""
+    from metagross import _profile
+
+    if creds is not None:
+        os.setgroups(os.getgrouplist(creds.user, creds.gid))
+        os.setgid(creds.gid)
+        os.setuid(creds.uid)
+        os.environ["HOME"] = creds.home
+        os.environ["USER"] = creds.user
+        os.environ["LOGNAME"] = creds.user
+
+    # Close-on-exec: still usable by this process (fork already handed us
+    # the fd), but a subprocess the target execs will not inherit it.
+    flags = fcntl.fcntl(profile_w, fcntl.F_GETFD)
+    fcntl.fcntl(profile_w, fcntl.F_SETFD, flags | fcntl.FD_CLOEXEC)
+
+    if os.read(barrier_r, 1) == b"":
+        _exit_flushed(1)  # parent died before releasing the barrier
+    os.close(barrier_r)
+
+    _profile.install(profile_w, project_root)
+
+    sys.argv = [script, *script_args]
+    sys.path[0] = os.path.dirname(script)
+    try:
+        runpy.run_path(script, run_name="__main__")
+    except SystemExit as exc:
+        code = exc.code
+        if code is None:
+            code = 0
+        elif not isinstance(code, int):
+            sys.stderr.write(f"{code}\n")
+            code = 1
+        _exit_flushed(code)
+    except KeyboardInterrupt:
+        _exit_flushed(130)
+    except BaseException:
+        traceback.print_exc()
+        _exit_flushed(1)
+    _exit_flushed(0)
+
+
+def run_live(cfg: Config) -> int:
+    # 1. Root check; validate sudo metadata, or warn and run as root.
+    if os.geteuid() != 0:
+        raise MetagrossError("must run as root (use sudo)")
+    creds = validate_sudo(os.environ, pwd.getpwnam)
+    if creds is None:
+        print("metagross: running target as root", file=sys.stderr)
+        uid, gid = 0, 0
+    else:
+        uid, gid = creds.uid, creds.gid
+
+    # 2. Validate the target, resolve libcuda, and load bcc (lazily, since
+    # it is a privileged/optional dependency unneeded by unprivileged paths).
+    from metagross import _bpf
+    script = _validate_script(cfg.script, cfg.project_root)
+    lib_path = _bpf.find_libcuda()
+    try:
+        from bcc import BPF
+    except ImportError as exc:
+        raise MetagrossError(
+            "bcc (BPF Compiler Collection) not available; "
+            f"install python3-bpfcc: {exc}") from None
+
+    # 3. Clock anchor and the trace output stream. Renderer writes str;
+    # open_trace_output returns a binary file, so the wrapper is mandatory.
+    wall_minus_mono_ns = time.time_ns() - time.monotonic_ns()
+    if cfg.output_path:
+        stream = io.TextIOWrapper(
+            open_trace_output(cfg.output_path, uid, gid), encoding="utf-8")
+    else:
+        stream = sys.stderr
+
+    # 4. Pipes: profiling records (child -> parent) and the post-attach
+    # barrier (parent -> child).
+    profile_r, profile_w = os.pipe()
+    barrier_r, barrier_w = os.pipe()
+    for fd in (profile_r, profile_w, barrier_r, barrier_w):
+        os.set_inheritable(fd, False)
+
+    # 5. Fork the target. The child drops privileges and blocks on the
+    # barrier until the parent has attached its probes.
+    pid = os.fork()
+    if pid == 0:
+        os.close(profile_r)
+        os.close(barrier_w)
+        _child_main(script, cfg.script_args, creds, barrier_r, profile_w,
+                    cfg.project_root)
+    os.close(profile_w)
+    os.close(barrier_r)
+
+    # 6. Attach probes filtered to the child's exact TGID.
+    from metagross import _events, _profile
+    try:
+        b = BPF(text=_bpf.build_source(pid))
+        resolver = _bpf.dlsym_resolver(lib_path)
+        attachments = _bpf.resolve_attachments(_bpf.APIS, resolver)
+        for att in attachments:
+            b.attach_uprobe(name=lib_path, sym=att.symbol,
+                            fn_name=f"enter_{att.api.base}", pid=pid)
+            b.attach_uretprobe(name=lib_path, sym=att.symbol,
+                               fn_name=f"exit_{att.api.base}", pid=pid)
+    except Exception as exc:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+        os.waitpid(pid, 0)
+        os.close(barrier_w)
+        raise MetagrossError(f"failed to attach probes: {exc}") from exc
+
+    # 7. Release the barrier; the child starts running the target script.
+    os.write(barrier_w, b"\x01")
+    os.close(barrier_w)
+
+    # 8. Event loop: drain GPU events and profiling records, attribute,
+    # render, and watch for the child's exit.
+    joiner = _events.Joiner()
+    renderer = _events.Renderer(stream, cfg.json_output, wall_minus_mono_ns,
+                                pid, joiner)
+    renderer.header()
+    render_broken = False
+
+    def _emit_all(events):
+        nonlocal render_broken
+        for ev in events:
+            if render_broken:
+                continue
+            try:
+                renderer.emit(ev)
+            except MetagrossError as exc:
+                print(f"metagross: {exc}", file=sys.stderr)
+                render_broken = True
+
+    def _on_ring_event(_ctx, data, size):
+        joiner.on_gpu_event(_bpf.decode_event(ct.string_at(data, size)))
+
+    b["events"].open_ring_buffer(_on_ring_event)
+
+    reader = _profile.RecordReader()
+    selector = selectors.DefaultSelector()
+    selector.register(profile_r, selectors.EVENT_READ)
+
+    def _drain_profile():
+        for key, _mask in selector.select(0):
+            data = os.read(key.fd, 65536)
+            if data:
+                for rec in reader.feed(data):
+                    joiner.on_profile_record(rec)
+
+    status = None
+    interrupted = False
+    while True:
+        try:
+            b.ring_buffer_poll(50)
+            _drain_profile()
+            _emit_all(joiner.flush(time.monotonic_ns()))
+        except KeyboardInterrupt:
+            # 10. Forward SIGINT to the child and keep looping; its exit
+            # status will yield 130 naturally once it terminates.
+            if not interrupted:
+                interrupted = True
+                try:
+                    os.kill(pid, signal.SIGINT)
+                except OSError:
+                    pass
+            continue
+        wpid, status = os.waitpid(pid, os.WNOHANG)
+        if wpid == pid:
+            b.ring_buffer_poll(0)
+            _drain_profile()
+            _emit_all(joiner.flush(time.monotonic_ns(), force=True))
+            break
+
+    # 9. Report loss counters as warnings and detach probes.
+    lost = b["counters"][ct.c_int(0)].value
+    dropped = b["counters"][ct.c_int(1)].value
+    if lost:
+        print(f"metagross: lost {lost} events (ring buffer full)",
+             file=sys.stderr)
+    if dropped:
+        print(f"metagross: dropped {dropped} nested calls", file=sys.stderr)
+    b.cleanup()
+    if stream is not sys.stderr:
+        stream.close()
+
+    # 10. Forward the target's exit status.
+    return exit_status_from_wait(status)
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     try:
@@ -135,5 +362,9 @@ def main(argv: list[str] | None = None) -> int:
         from metagross import _bpf
         print(_bpf.build_source(0))
         return 0
-    # Later tasks route cfg to the ebpf dump or the live launcher.
-    raise NotImplementedError(cfg)
+    # 11. Route to the live launcher; report tracer failures as exit 1.
+    try:
+        return run_live(cfg)
+    except MetagrossError as exc:
+        print(f"metagross: {exc}", file=sys.stderr)
+        return 1
