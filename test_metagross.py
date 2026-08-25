@@ -263,6 +263,11 @@ class SymbolResolutionTest(unittest.TestCase):
         self.assertIsInstance(resolver("read"), int)
         self.assertIsNone(resolver("definitely_not_a_symbol_xyz"))
 
+    def test_find_libcuda_returns_absolute_existing_path(self):
+        path = _bpf.find_libcuda()
+        self.assertTrue(path.startswith("/"), f"not absolute: {path!r}")
+        self.assertTrue(os.path.exists(path), f"does not exist: {path!r}")
+
 
 class BpfSourceTest(unittest.TestCase):
     def setUp(self):

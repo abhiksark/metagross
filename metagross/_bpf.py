@@ -5,6 +5,8 @@ from __future__ import annotations
 import ctypes as ct
 import ctypes.util
 import dataclasses
+import os
+import subprocess
 from typing import Callable
 
 from metagross import MetagrossError
@@ -86,16 +88,60 @@ def dlsym_resolver(lib_path: str) -> Callable[[str], int | None]:
     return resolve
 
 
+_LIBCUDA_CANDIDATES = [
+    "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+    "/lib/x86_64-linux-gnu/libcuda.so.1",
+    "/usr/lib/libcuda.so.1",
+]
+
+
+def _ldconfig_libcuda_path() -> str | None:
+    """Ask ldconfig's cache for libcuda.so.1, preferring the x86-64 entry.
+
+    Last-resort lookup for nonstandard installs where libcuda.so.1 lives
+    outside the usual multiarch directories. Any failure (ldconfig missing,
+    not executable, unexpected output) is treated as "no result" rather
+    than propagated.
+    """
+    try:
+        out = subprocess.run(
+            ["ldconfig", "-p"], capture_output=True, text=True,
+            check=True, timeout=5).stdout
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        return None
+    candidates = []
+    for line in out.splitlines():
+        if "libcuda.so.1" not in line or "=> " not in line:
+            continue
+        path = line.rsplit("=> ", 1)[-1].strip()
+        candidates.append((("x86-64" in line), path))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: c[0], reverse=True)
+    return candidates[0][1]
+
+
 def find_libcuda() -> str:
+    """Locate libcuda.so.1 as an absolute filesystem path.
+
+    An absolute path is required (not merely a soname like "libcuda.so.1")
+    because BCC's uprobe attachment opens and parses the target's ELF file
+    directly to resolve symbol addresses; it does not go through the
+    dynamic loader's search path and cannot resolve a bare soname. ctypes
+    and the dynamic loader tolerate a bare soname, which is why that used
+    to look like it worked -- but BCC attach_uprobe fails on it.
+    """
     path = ctypes.util.find_library("cuda")
-    if path is None:
-        fallback = "/usr/lib/x86_64-linux-gnu/libcuda.so.1"
-        import os
-        if os.path.exists(fallback):
-            return fallback
-        raise MetagrossError(
-            "libcuda.so.1 not found; is the NVIDIA driver installed?")
-    return path
+    if path is not None and path.startswith("/"):
+        return path
+    for candidate in _LIBCUDA_CANDIDATES:
+        if os.path.exists(candidate):
+            return candidate
+    ldconfig_path = _ldconfig_libcuda_path()
+    if ldconfig_path is not None and os.path.exists(ldconfig_path):
+        return ldconfig_path
+    raise MetagrossError(
+        "libcuda.so.1 not found; is the NVIDIA driver installed?")
 
 
 _HEADER = r"""
