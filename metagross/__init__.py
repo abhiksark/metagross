@@ -319,57 +319,104 @@ def run_live(cfg: Config) -> int:
     selector = selectors.DefaultSelector()
     selector.register(profile_r, selectors.EVENT_READ)
 
-    def _drain_profile():
+    def _drain_profile(drain_to_eof=False):
+        if drain_to_eof:
+            # Post-exit: the write end is closed (the child that held it is
+            # gone), so os.read reliably reaches EOF (b"") without blocking
+            # forever. Loop until the pipe is fully emptied.
+            while True:
+                data = os.read(profile_r, 65536)
+                if not data:
+                    break
+                for rec in reader.feed(data):
+                    joiner.on_profile_record(rec)
+            return
         for key, _mask in selector.select(0):
             data = os.read(key.fd, 65536)
             if data:
                 for rec in reader.feed(data):
                     joiner.on_profile_record(rec)
 
+    def _reap_and_capture():
+        """Ensure the child is dead and reaped; return its wait status."""
+        nonlocal status, reaped
+        if reaped:
+            return status
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+        _, status = os.waitpid(pid, 0)
+        reaped = True
+        return status
+
     status = None
     interrupted = False
     reaped = False
-    while True:
-        try:
-            if not reaped:
-                b.ring_buffer_poll(50)
-                _drain_profile()
-                _emit_all(joiner.flush(time.monotonic_ns()))
-                wpid, status = os.waitpid(pid, os.WNOHANG)
-                reaped = wpid == pid
-            if reaped:
-                # Child has exited (status captured above): drain whatever
-                # remains once more and stop, regardless of further signals.
-                b.ring_buffer_poll(0)
-                _drain_profile()
-                _emit_all(joiner.flush(time.monotonic_ns(), force=True))
-                break
-        except KeyboardInterrupt:
-            # 10. Forward SIGINT to the child and keep looping; its exit
-            # status will yield 130 naturally once it terminates. If the
-            # child was already reaped, the exit status is already known,
-            # so stop instead of re-waiting on an already-reaped pid.
-            if reaped:
-                break
-            if not interrupted:
-                interrupted = True
-                try:
-                    os.kill(pid, signal.SIGINT)
-                except OSError:
-                    pass
-            continue
+    try:
+        renderer.header()
+        while True:
+            try:
+                if not reaped:
+                    b.ring_buffer_poll(50)
+                    _drain_profile()
+                    _emit_all(joiner.flush(time.monotonic_ns()))
+                    wpid, status = os.waitpid(pid, os.WNOHANG)
+                    reaped = wpid == pid
+                if reaped:
+                    # Child has exited (status captured above): drain
+                    # whatever remains once more and stop, regardless of
+                    # further signals. Use ring_buffer_consume() when
+                    # available so events committed just before the child
+                    # exited (adaptive-wakeup) are not missed by a plain
+                    # poll(0).
+                    try:
+                        b.ring_buffer_consume()
+                    except AttributeError:
+                        b.ring_buffer_poll(0)
+                    _drain_profile(drain_to_eof=True)
+                    _emit_all(joiner.flush(time.monotonic_ns(), force=True))
+                    break
+            except KeyboardInterrupt:
+                # 10. Forward SIGINT to the child and keep looping; its exit
+                # status will yield 130 naturally once it terminates. If the
+                # child was already reaped, the exit status is already
+                # known, so stop instead of re-waiting on an already-reaped
+                # pid.
+                if reaped:
+                    break
+                if not interrupted:
+                    interrupted = True
+                    try:
+                        os.kill(pid, signal.SIGINT)
+                    except OSError:
+                        pass
+                continue
 
-    # 9. Report loss counters as warnings and detach probes.
-    lost = b["counters"][ct.c_int(0)].value
-    dropped = b["counters"][ct.c_int(1)].value
-    if lost:
-        print(f"metagross: lost {lost} events (ring buffer full)",
-             file=sys.stderr)
-    if dropped:
-        print(f"metagross: dropped {dropped} nested calls", file=sys.stderr)
-    b.cleanup()
-    if stream is not sys.stderr:
-        stream.close()
+        # 9. Report loss counters as warnings and detach probes.
+        lost = b["counters"][ct.c_int(0)].value
+        dropped = b["counters"][ct.c_int(1)].value
+        if lost:
+            print(f"metagross: lost {lost} events (ring buffer full)",
+                 file=sys.stderr)
+        if dropped:
+            print(f"metagross: dropped {dropped} nested calls", file=sys.stderr)
+    except Exception as exc:
+        # Any unexpected failure here must not lose the target's exit
+        # status: kill and reap the child so its status is captured, warn
+        # once, and fall through to report that status below.
+        status = _reap_and_capture()
+        print(f"metagross: {exc}", file=sys.stderr)
+    finally:
+        b.cleanup()
+        if stream is not sys.stderr:
+            try:
+                stream.close()
+            except OSError as exc:
+                print(f"metagross: {exc}", file=sys.stderr)
+
+    if status is None:
+        status = _reap_and_capture()
 
     # 10. Forward the target's exit status.
     return exit_status_from_wait(status)

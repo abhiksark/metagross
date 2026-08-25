@@ -31,8 +31,8 @@ class RecordReader:
             total = _HEADER.size + fl + pl
             if len(self._buf) < total:
                 break
-            func = self._buf[_HEADER.size:_HEADER.size + fl].decode("utf-8")
-            path = self._buf[_HEADER.size + fl:total].decode("utf-8")
+            func = self._buf[_HEADER.size:_HEADER.size + fl].decode("utf-8", "replace")
+            path = self._buf[_HEADER.size + fl:total].decode("utf-8", "replace")
             self._buf = self._buf[total:]
             out.append((kind, tid, ts, func, path, line))
         return out

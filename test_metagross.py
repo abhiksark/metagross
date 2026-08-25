@@ -341,6 +341,21 @@ class RecordCodecTest(unittest.TestCase):
                 + _profile.encode_record(1, 1, 2, "a", "/p/a.py", 1))
         self.assertEqual(len(_profile.RecordReader().feed(blob)), 2)
 
+    def test_truncated_multibyte_does_not_raise(self):
+        # "x" + "e"-acute * 300 is 601 bytes; the raw 500-byte truncation in
+        # encode_record cuts the 500th byte inside a two-byte "e"-acute
+        # character (byte 499 is its leading 0xC3), so a strict utf-8
+        # decode of the truncated bytes raises UnicodeDecodeError. feed()
+        # must not raise; it replaces the partial character and still
+        # yields exactly one record.
+        long_str = "x" + "é" * 300
+        blob = _profile.encode_record(_profile.CALL, 3, 42, long_str,
+                                      long_str, 5)
+        records = _profile.RecordReader().feed(blob)
+        self.assertEqual(len(records), 1)
+        self.assertTrue(records[0][3].endswith("�"))
+        self.assertTrue(records[0][4].endswith("�"))
+
 
 class ProjectFileTest(unittest.TestCase):
     def test_inside_root(self):

@@ -76,10 +76,11 @@ performed inside a standard-library function, for example, remains attributable 
 the project function that initiated it. Imported project modules and Python
 threads are included.
 
-The target remains behind a pipe barrier until both raw API tracepoints are
-attached for its exact process ID. Startup API calls before the first project
-frame are suppressed. Events are held for 100 ms to tolerate cross-CPU and
-cross-stream delivery ordering. Long API calls appear after they complete.
+The target remains behind a pipe barrier until every uprobe and uretprobe
+pair is attached for its exact process ID. API calls that occur before any
+project frame is active are attributed as unknown rather than suppressed.
+Events are held for 100 ms to tolerate cross-CPU and cross-stream delivery
+ordering. Long API calls appear after they complete.
 
 ## Output
 
