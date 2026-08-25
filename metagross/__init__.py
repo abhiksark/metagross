@@ -44,6 +44,8 @@ class Credentials:
     home: str
 
 
+_FINAL_DRAIN_TIMEOUT_S = 2.0
+
 _USAGE = (
     "usage: sudo /usr/bin/python3 -m metagross [--json] [--output FILE]\n"
     "           [--project-root DIR] script.py [script arguments...]\n"
@@ -141,7 +143,11 @@ def _validate_script(script: str, project_root: str) -> str:
         raise MetagrossError(f"target must be a .py file: {script!r}")
     if not os.path.isfile(real):
         raise MetagrossError(f"target script not found: {script!r}")
-    if not real.startswith(root + os.sep):
+    # root already ends with os.sep only when it is the filesystem root
+    # ("/"); appending another separator there ("//") would fail to
+    # prefix-match every real path and reject all of them.
+    root_prefix = root if root.endswith(os.sep) else root + os.sep
+    if not real.startswith(root_prefix):
         raise MetagrossError(
             f"target {script!r} resolves outside project root {root!r}")
     return real
@@ -296,7 +302,6 @@ def run_live(cfg: Config) -> int:
     joiner = _events.Joiner()
     renderer = _events.Renderer(stream, cfg.json_output, wall_minus_mono_ns,
                                 pid, joiner)
-    renderer.header()
     render_broken = False
 
     def _emit_all(events):
@@ -321,15 +326,24 @@ def run_live(cfg: Config) -> int:
 
     def _drain_profile(drain_to_eof=False):
         if drain_to_eof:
-            # Post-exit: the write end is closed (the child that held it is
-            # gone), so os.read reliably reaches EOF (b"") without blocking
-            # forever. Loop until the pipe is fully emptied.
+            # Post-exit: normally the write end is already closed (the
+            # child that held it is gone) and this reaches EOF (b"")
+            # quickly. But a grandchild the target forked without exec
+            # could still hold profile_w open, so this must never block
+            # forever: bound the wait with a wall-clock deadline and stop
+            # on EOF or timeout, whichever comes first.
+            deadline = time.monotonic() + _FINAL_DRAIN_TIMEOUT_S
             while True:
-                data = os.read(profile_r, 65536)
-                if not data:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
                     break
-                for rec in reader.feed(data):
-                    joiner.on_profile_record(rec)
+                ready = selector.select(remaining)
+                for key, _mask in ready:
+                    data = os.read(key.fd, 65536)
+                    if not data:
+                        return  # EOF: pipe fully drained
+                    for rec in reader.feed(data):
+                        joiner.on_profile_record(rec)
             return
         for key, _mask in selector.select(0):
             data = os.read(key.fd, 65536)
@@ -439,3 +453,8 @@ def main(argv: list[str] | None = None) -> int:
     except MetagrossError as exc:
         print(f"metagross: {exc}", file=sys.stderr)
         return 1
+    except KeyboardInterrupt:
+        # Ctrl-C before run_live's own loop is watching (e.g. during BPF
+        # compile/attach, or during header/counter prints outside the
+        # loop) must still exit 130 instead of an unhandled traceback.
+        return 130

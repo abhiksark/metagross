@@ -97,7 +97,7 @@ stream did not contain enough matching data for safe attribution.
 JSONL records use this exact top-level schema:
 
 ```json
-{"timestamp":"2026-08-24T12:10:03.410000+05:30","pid":1234,"tid":1234,"function":"compute","file":"gpu_demo.py","line":86,"api":"cuLaunchKernel","kernel":"vec_add","return_code":0,"duration_ns":50000,"details":{"grid":"8,1,1","block":"128,1,1","stream":"0x0","function_handle":"0xf00"}}
+{"timestamp":"2026-08-24T12:10:03.410000+05:30","pid":1234,"tid":1234,"function":"compute","file":"gpu_demo.py","line":86,"api":"cuLaunchKernel","kernel":"vec_add","return_code":0,"duration_ns":50000,"details":{"grid":"8,1,1","block":"128,1,1","shared":0,"stream":"0x0","function_handle":"0xf00"}}
 ```
 
 `function`, `file`, and `line` are `null` when attribution is unknown. `line` is

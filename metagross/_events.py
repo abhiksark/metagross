@@ -151,8 +151,12 @@ def describe(api, ev, registry: KernelRegistry, allocs: AllocTracker):
     if cat in ("launch", "launch_ex"):
         if cat == "launch":
             handle = ev.args[0]
-            det["grid"] = f"{ev.args[1]},{ev.args[2]},{ev.args[3]}"
-            det["block"] = f"{ev.args[4]},{ev.args[5]},{ev.args[6] & 0xFFFFFFFF}"
+            gx, gy, gz = (ev.args[1] & 0xFFFFFFFF, ev.args[2] & 0xFFFFFFFF,
+                         ev.args[3] & 0xFFFFFFFF)
+            bx, by, bz = (ev.args[4] & 0xFFFFFFFF, ev.args[5] & 0xFFFFFFFF,
+                         ev.args[6] & 0xFFFFFFFF)
+            det["grid"] = f"{gx},{gy},{gz}"
+            det["block"] = f"{bx},{by},{bz}"
             det["shared"] = ev.args[7] & 0xFFFFFFFF
             det["stream"] = _hex(ev.args[8])
         else:
@@ -176,9 +180,10 @@ def describe(api, ev, registry: KernelRegistry, allocs: AllocTracker):
         det["gpu_total"] = allocs.total_bytes
     elif cat in ("free", "free_async"):
         det["ptr"] = _hex(ev.args[0])
-        size = allocs.on_free(ev.args[0])
-        if size is not None:
-            det["bytes"] = size
+        if ev.ret == 0:
+            size = allocs.on_free(ev.args[0])
+            if size is not None:
+                det["bytes"] = size
         if cat == "free_async":
             det["stream"] = _hex(ev.args[1])
         det["gpu_total"] = allocs.total_bytes

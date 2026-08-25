@@ -4,7 +4,6 @@ import collections
 import contextlib
 import io
 import json
-import json as json_mod
 import os
 import shutil
 import stat
@@ -92,6 +91,30 @@ class DescribeTest(unittest.TestCase):
                                   self.reg, self.allocs)
         self.assertEqual(det["bytes"], 4096)
         self.assertEqual(self.allocs.total_bytes, 0)
+
+    def test_free_failure_does_not_skew_gpu_total(self):
+        _, det = _events.describe(_bpf.API_BY_ID[3],
+                                  _raw(3, args=(0, 4096), out=0x9000),
+                                  self.reg, self.allocs)
+        self.assertEqual(self.allocs.total_bytes, 4096)
+        # A failed cuMemFree (ret != 0) must not remove the allocation from
+        # tracking or decrement gpu_total; the ptr detail still renders.
+        _, det = _events.describe(_bpf.API_BY_ID[5],
+                                  _raw(5, args=(0x9000,), ret=1),
+                                  self.reg, self.allocs)
+        self.assertNotIn("bytes", det)
+        self.assertEqual(det["ptr"], "0x9000")
+        self.assertEqual(self.allocs.total_bytes, 4096)
+
+    def test_launch_masks_dirty_high_bits(self):
+        # A dirty high half of a 64-bit register in a 32-bit dimension
+        # argument must not corrupt the printed grid/block dims.
+        dirty = 0xDEADBEEF00000010
+        ev = _raw(1, args=(0xF00, dirty, dirty, dirty, dirty, dirty, dirty,
+                           0, 0x77))
+        _, det = _events.describe(_bpf.API_BY_ID[1], ev, self.reg, self.allocs)
+        self.assertEqual(det["grid"], "16,16,16")
+        self.assertEqual(det["block"], "16,16,16")
 
     def test_copy_details(self):
         _, det = _events.describe(_bpf.API_BY_ID[8],
@@ -182,7 +205,6 @@ class ValidateSudoTest(unittest.TestCase):
 class ExitStatusTest(unittest.TestCase):
     def test_exit_codes_preserved(self):
         for code in (0, 1, 42, 255):
-            status = os.waitstatus_to_exitcode  # noqa: F841
             self.assertEqual(exit_status_from_wait(code << 8), code)
 
     def test_signal_death(self):
@@ -211,7 +233,8 @@ class OutputSafetyTest(unittest.TestCase):
             f.write(b"old-content")
         with open_trace_output(path, self.uid, self.gid) as f:
             f.write(b"n")
-        self.assertEqual(open(path, "rb").read(), b"n")
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), b"n")
 
     def test_symlink_rejected(self):
         target = self._path("real")
@@ -565,6 +588,14 @@ class ValidateScriptTest(unittest.TestCase):
         with self.assertRaises(MetagrossError):
             _validate_script(link, self.dir.name)
 
+    def test_root_slash_accepts_any_absolute_path(self):
+        # project_root="/" normalizes to root_prefix="/" (not "//"), so
+        # any absolute path under it must be accepted rather than every
+        # path being rejected.
+        p = os.path.join(self.dir.name, "s.py")
+        open(p, "w").close()
+        self.assertEqual(_validate_script(p, "/"), os.path.realpath(p))
+
 
 class MainRoutingTest(unittest.TestCase):
     def test_unprivileged_live_run_fails_cleanly(self):
@@ -619,7 +650,7 @@ class LiveTraceTest(unittest.TestCase):
             capture_output=True, text=True, timeout=300)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         with open(out_name) as handle:
-            records = [json_mod.loads(line) for line in handle if line.strip()]
+            records = [json.loads(line) for line in handle if line.strip()]
         apis = {r["api"] for r in records}
         self.assertTrue(any(a.startswith("cuMemcpyHtoD") for a in apis),
                         f"cudart caller invisible to uprobes; saw {apis}")
@@ -633,7 +664,7 @@ class LiveTraceTest(unittest.TestCase):
              "--output", out_name, *extra, "examples/gpu_demo.py"],
             capture_output=True, text=True, timeout=120)
         with open(out_name) as handle:
-            records = [json_mod.loads(line)
+            records = [json.loads(line)
                        for line in handle if line.strip()]
         return proc, records
 
@@ -741,7 +772,7 @@ class TorchSmokeTest(unittest.TestCase):
             capture_output=True, text=True, timeout=300)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         with open(out_name) as handle:
-            records = [json_mod.loads(line) for line in handle if line.strip()]
+            records = [json.loads(line) for line in handle if line.strip()]
         launches = [r for r in records if r["api"].startswith("cuLaunchKernel")]
         self.assertTrue(launches, "no kernel launches captured from torch")
         self.assertIn("forward_step", {r["function"] for r in launches})

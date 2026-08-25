@@ -16,6 +16,16 @@ Run the demo under Metagross to trace GPU kernel calls:
 sudo /usr/bin/python3 -m metagross examples/gpu_demo.py
 ```
 
+## Other Examples
+
+- **quicklook.py** is a smaller GPU workload with clearly named steps, meant
+  to produce a readable trace. Run it bare with
+  `/usr/bin/python3 examples/quicklook.py` (no root required), or traced
+  with `sudo /usr/bin/python3 -m metagross examples/quicklook.py`.
+- **run_integration.sh** (repository root) runs the root-gated live
+  integration suite (`test_metagross.LiveTraceTest`) under sudo with
+  `RUN_EBPF_INTEGRATION=1` set.
+
 ## Function Overview
 
 The demo is structured into project functions that serve as integration test assertions:
