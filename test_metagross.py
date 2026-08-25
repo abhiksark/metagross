@@ -2,10 +2,12 @@
 """Tests for metagross. Unprivileged unless RUN_EBPF_INTEGRATION=1."""
 import collections
 import os
+import stat
+import tempfile
 import unittest
 
 from metagross import (Config, Credentials, MetagrossError, UsageError, exit_status_from_wait,
-                       parse_args, validate_sudo)
+                       open_trace_output, parse_args, validate_sudo)
 
 
 class ParseArgsTest(unittest.TestCase):
@@ -91,6 +93,48 @@ class ExitStatusTest(unittest.TestCase):
     def test_signal_death(self):
         self.assertEqual(exit_status_from_wait(2), 130)   # SIGINT
         self.assertEqual(exit_status_from_wait(9), 137)   # SIGKILL
+
+
+class OutputSafetyTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.uid, self.gid = os.getuid(), os.getgid()
+
+    def _path(self, name):
+        return os.path.join(self.dir.name, name)
+
+    def test_new_file_created_0600(self):
+        path = self._path("out.jsonl")
+        with open_trace_output(path, self.uid, self.gid) as f:
+            f.write(b"x")
+        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+
+    def test_existing_owned_regular_file_truncated(self):
+        path = self._path("out.jsonl")
+        with open(path, "wb") as f:
+            f.write(b"old-content")
+        with open_trace_output(path, self.uid, self.gid) as f:
+            f.write(b"n")
+        self.assertEqual(open(path, "rb").read(), b"n")
+
+    def test_symlink_rejected(self):
+        target = self._path("real")
+        open(target, "wb").close()
+        link = self._path("link")
+        os.symlink(target, link)
+        with self.assertRaises(MetagrossError):
+            open_trace_output(link, self.uid, self.gid)
+
+    def test_directory_rejected(self):
+        with self.assertRaises(MetagrossError):
+            open_trace_output(self.dir.name, self.uid, self.gid)
+
+    def test_foreign_owner_rejected(self):
+        path = self._path("owned.jsonl")
+        open(path, "wb").close()
+        with self.assertRaises(MetagrossError):
+            open_trace_output(path, self.uid + 1, self.gid)
 
 
 if __name__ == "__main__":

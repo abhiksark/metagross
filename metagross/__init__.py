@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import stat
 import sys
 
 
@@ -100,6 +101,27 @@ def exit_status_from_wait(status: int) -> int:
     if os.WIFSIGNALED(status):
         return 128 + os.WTERMSIG(status)
     return os.WEXITSTATUS(status)
+
+
+def open_trace_output(path: str, uid: int, gid: int):
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.chown(path, uid, gid)
+        return os.fdopen(fd, "wb")
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        raise MetagrossError(f"cannot create output {path!r}: {exc}") from None
+    info = os.lstat(path)
+    if not stat.S_ISREG(info.st_mode):
+        raise MetagrossError(f"output {path!r} is not a regular file")
+    if info.st_uid != uid:
+        raise MetagrossError(f"output {path!r} is not owned by uid {uid}")
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise MetagrossError(f"cannot open output {path!r}: {exc}") from None
+    return os.fdopen(fd, "wb")
 
 
 def main(argv: list[str] | None = None) -> int:
