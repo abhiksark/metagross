@@ -12,6 +12,7 @@ from metagross import (Config, Credentials, MetagrossError, UsageError, exit_sta
                        open_trace_output, parse_args, validate_sudo)
 from metagross import _bpf
 from metagross import _events
+from metagross import _profile
 
 
 def _raw(api_id, *, args=(), out=0, name=b"", ret=0, ts=0, dur=0, tid=1):
@@ -291,6 +292,80 @@ class BpfSourceTest(unittest.TestCase):
             rc = metagross.main(["--ebpf"])
         self.assertEqual(rc, 0)
         self.assertIn("enter_cuLaunchKernel", buf.getvalue())
+
+
+class RecordCodecTest(unittest.TestCase):
+    def test_roundtrip_single(self):
+        blob = _profile.encode_record(_profile.CALL, 7, 123456789,
+                                      "train_step", "/p/train.py", 31)
+        reader = _profile.RecordReader()
+        self.assertEqual(reader.feed(blob),
+                         [(_profile.CALL, 7, 123456789, "train_step",
+                           "/p/train.py", 31)])
+
+    def test_split_feed(self):
+        blob = _profile.encode_record(_profile.RETURN, 7, 99, "f", "/p/a.py", 2)
+        reader = _profile.RecordReader()
+        self.assertEqual(reader.feed(blob[:5]), [])
+        self.assertEqual(reader.feed(blob[5:]),
+                         [(_profile.RETURN, 7, 99, "f", "/p/a.py", 2)])
+
+    def test_multiple_records_one_feed(self):
+        blob = (_profile.encode_record(0, 1, 1, "a", "/p/a.py", 1)
+                + _profile.encode_record(1, 1, 2, "a", "/p/a.py", 1))
+        self.assertEqual(len(_profile.RecordReader().feed(blob)), 2)
+
+
+class ProjectFileTest(unittest.TestCase):
+    def test_inside_root(self):
+        self.assertTrue(_profile.is_project_file("/p/x/y.py", "/p"))
+
+    def test_outside_root(self):
+        self.assertFalse(_profile.is_project_file("/usr/lib/python3.10/os.py", "/p"))
+
+    def test_site_packages_inside_root_excluded(self):
+        self.assertFalse(
+            _profile.is_project_file("/p/venv/lib/python3.10/site-packages/m.py", "/p"))
+
+    def test_metagross_itself_excluded(self):
+        import metagross
+        path = metagross.__file__
+        root = os.path.dirname(os.path.dirname(path))
+        self.assertFalse(_profile.is_project_file(path, root))
+
+
+class InstallHookTest(unittest.TestCase):
+    def test_hook_reports_project_calls(self):
+        r, w = os.pipe()
+        code = (
+            "import os, sys, tempfile, textwrap\n"
+            "sys.path.insert(0, %r)\n"
+            "from metagross import _profile\n"
+            "d = tempfile.mkdtemp()\n"
+            "p = os.path.join(d, 'proj.py')\n"
+            "open(p, 'w').write('def hot():\\n    return 1\\n')\n"
+            "sys.path.insert(0, d)\n"
+            "_profile.install(%d, d)\n"
+            "import proj\n"
+            "proj.hot()\n"
+            "sys.setprofile(None)\n"
+        ) % (os.getcwd(), w)
+        pid = os.fork()
+        if pid == 0:
+            os.close(r)
+            exec(code)  # noqa: S102 — test child
+            os._exit(0)
+        os.close(w)
+        data = b""
+        while chunk := os.read(r, 4096):
+            data += chunk
+        os.close(r)
+        os.waitpid(pid, 0)
+        records = _profile.RecordReader().feed(data)
+        funcs = [rec[3] for rec in records]
+        self.assertIn("hot", funcs)
+        kinds = [rec[0] for rec in records if rec[3] == "hot"]
+        self.assertEqual(sorted(set(kinds)), [_profile.CALL, _profile.RETURN])
 
 
 if __name__ == "__main__":
