@@ -4,8 +4,11 @@ import collections
 import contextlib
 import io
 import json
+import json as json_mod
 import os
+import shutil
 import stat
+import subprocess
 import tempfile
 import unittest
 
@@ -15,6 +18,9 @@ from metagross import (Config, Credentials, MetagrossError, UsageError, exit_sta
 from metagross import _bpf
 from metagross import _events
 from metagross import _profile
+
+
+INTEGRATION = os.environ.get("RUN_EBPF_INTEGRATION") == "1"
 
 
 def _raw(api_id, *, args=(), out=0, name=b"", ret=0, ts=0, dur=0, tid=1):
@@ -536,6 +542,143 @@ class MainRoutingTest(unittest.TestCase):
             rc = metagross.main(["examples/gpu_demo.py"])
         self.assertEqual(rc, 1)
         self.assertIn("root", err.getvalue())
+
+
+@unittest.skipUnless(INTEGRATION and os.geteuid() == 0,
+                     "needs RUN_EBPF_INTEGRATION=1 and root")
+class LiveTraceTest(unittest.TestCase):
+    def test_cudart_caller_visible(self):
+        nvcc = shutil.which("nvcc") or "/usr/local/cuda/bin/nvcc"
+        if not os.path.exists(nvcc):
+            self.skipTest("nvcc unavailable")
+        src = "/tmp/metagross_rt.cu"
+        binary = "/tmp/metagross_rt"
+        with open(src, "w") as f:
+            f.write(
+                "#include <cuda_runtime.h>\n"
+                "__global__ void bump(float *p) { p[threadIdx.x] += 1.0f; }\n"
+                "int main() {\n"
+                "  float host[32] = {0}; float *dev;\n"
+                "  cudaMalloc(&dev, sizeof host);\n"
+                "  cudaMemcpy(dev, host, sizeof host, cudaMemcpyHostToDevice);\n"
+                "  bump<<<1, 32>>>(dev);\n"
+                "  cudaDeviceSynchronize();\n"
+                "  cudaMemcpy(host, dev, sizeof host, cudaMemcpyDeviceToHost);\n"
+                "  cudaFree(dev);\n"
+                "  return host[0] == 1.0f ? 0 : 1;\n"
+                "}\n")
+        self.addCleanup(os.unlink, src)
+        subprocess.run([nvcc, "-o", binary, src], check=True, timeout=300)
+        self.addCleanup(os.unlink, binary)
+        # A forked child would fall outside the TGID filter, so the wrapper
+        # must exec the cudart binary, keeping the traced TGID.
+        wrapper = "/tmp/metagross_rt.py"
+        with open(wrapper, "w") as f:
+            f.write("import os\n"
+                    "def run_cudart():\n"
+                    f"    os.execv({binary!r}, [{binary!r}])\n"
+                    "run_cudart()\n")
+        self.addCleanup(os.unlink, wrapper)
+        out = tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False)
+        out.close()
+        self.addCleanup(os.unlink, out.name)
+        proc = subprocess.run(
+            ["/usr/bin/python3", "-m", "metagross", "--json", "--output",
+             out.name, "--project-root", "/tmp", wrapper],
+            capture_output=True, text=True, timeout=300)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        records = [json_mod.loads(line) for line in open(out.name) if line.strip()]
+        apis = {r["api"] for r in records}
+        self.assertTrue(any(a.startswith("cuMemcpyHtoD") for a in apis),
+                        f"cudart caller invisible to uprobes; saw {apis}")
+        self.assertTrue(any(a.startswith("cuLaunchKernel") for a in apis),
+                        f"cudart kernel launch invisible; saw {apis}")
+
+    def _trace_demo(self, *extra):
+        out = tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False)
+        out.close()
+        self.addCleanup(os.unlink, out.name)
+        proc = subprocess.run(
+            ["/usr/bin/python3", "-m", "metagross", "--json",
+             "--output", out.name, *extra, "examples/gpu_demo.py"],
+            capture_output=True, text=True, timeout=120)
+        records = [json_mod.loads(line)
+                   for line in open(out.name) if line.strip()]
+        return proc, records
+
+    def test_end_to_end(self):
+        proc, records = self._trace_demo()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("vec_add ok", proc.stdout)      # target stdout untouched
+        apis = {r["api"] for r in records}
+        for expected in ("cuLaunchKernel", "cuMemcpyHtoD", "cuMemcpyDtoH",
+                         "cuStreamSynchronize", "cuMemFree"):
+            self.assertTrue(any(a.startswith(expected.rstrip("_")) or a == expected
+                                for a in apis), f"missing {expected} in {apis}")
+        launches = [r for r in records if r["api"].startswith("cuLaunchKernel")]
+        self.assertTrue(launches)
+        self.assertEqual(launches[0]["kernel"], "vec_add")
+        self.assertEqual(launches[0]["function"], "compute")
+        copies = [r for r in records if r["api"].startswith("cuMemcpyHtoD")]
+        self.assertEqual(copies[0]["details"]["bytes"], 4096)
+        self.assertEqual(copies[0]["function"], "upload")
+        # The driver may route internal allocations through its own public
+        # exports, so assert on the demo's three 4096-byte allocs, not totals.
+        demo_allocs = [r for r in records
+                       if r["api"].startswith("cuMemAlloc")
+                       and r["details"].get("bytes") == 4096
+                       and r["function"] == "upload"]
+        self.assertEqual(len(demo_allocs), 3)
+        frees = [r for r in records if r["api"].startswith("cuMemFree")]
+        self.assertGreaterEqual(len(frees), 3)
+
+    def test_exit_status_forwarded(self):
+        proc = subprocess.run(
+            ["/usr/bin/python3", "-m", "metagross", "--project-root", "/tmp",
+             self._failing_script()], capture_output=True, timeout=120)
+        self.assertEqual(proc.returncode, 42)
+
+    def _failing_script(self):
+        path = "/tmp/metagross_exit42.py"
+        with open(path, "w") as f:
+            f.write("import sys\nsys.exit(42)\n")
+        self.addCleanup(os.unlink, path)
+        return path
+
+    def test_target_runs_as_invoker(self):
+        if "SUDO_UID" not in os.environ:
+            self.skipTest("not under sudo")
+        path = "/tmp/metagross_whoami.py"
+        with open(path, "w") as f:
+            f.write("import os\nprint('uid', os.getuid())\n")
+        self.addCleanup(os.unlink, path)
+        proc = subprocess.run(
+            ["/usr/bin/python3", "-m", "metagross", "--project-root", "/tmp",
+             path], capture_output=True, text=True, timeout=120)
+        self.assertIn(f"uid {os.environ['SUDO_UID']}", proc.stdout)
+
+    def test_ctrl_c_returns_130(self):
+        path = "/tmp/metagross_sleep.py"
+        with open(path, "w") as f:
+            f.write("import time\nprint('sleeping', flush=True)\ntime.sleep(60)\n")
+        self.addCleanup(os.unlink, path)
+        proc = subprocess.Popen(
+            ["/usr/bin/python3", "-m", "metagross", "--project-root", "/tmp",
+             path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertIn("sleeping", proc.stdout.readline())
+        proc.send_signal(2)  # SIGINT, as Ctrl-C would deliver
+        proc.wait(timeout=60)
+        self.assertEqual(proc.returncode, 130)
+
+    def test_no_bpf_programs_left_behind(self):
+        if not shutil.which("bpftool"):
+            self.skipTest("bpftool unavailable")
+        before = subprocess.run(["bpftool", "prog", "list"],
+                                capture_output=True, text=True).stdout
+        self._trace_demo()
+        after = subprocess.run(["bpftool", "prog", "list"],
+                               capture_output=True, text=True).stdout
+        self.assertLessEqual(len(after.splitlines()), len(before.splitlines()) + 1)
 
 
 if __name__ == "__main__":
