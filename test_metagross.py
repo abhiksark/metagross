@@ -23,6 +23,19 @@ from metagross import _profile
 INTEGRATION = os.environ.get("RUN_EBPF_INTEGRATION") == "1"
 
 
+def _fresh_output_path(test):
+    """Return a not-yet-created trace-output path metagross can create and own.
+
+    The live suite runs as root; pre-creating the file would make it
+    root-owned and metagross (dropped to the invoking uid) would rightly
+    refuse to truncate it. Letting metagross create the file matches real
+    usage and lets it chown the file to the invoker.
+    """
+    directory = tempfile.mkdtemp()
+    test.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+    return os.path.join(directory, "trace.jsonl")
+
+
 def _raw(api_id, *, args=(), out=0, name=b"", ret=0, ts=0, dur=0, tid=1):
     ev = _bpf.RawEvent(ts=ts, dur=dur, tid=tid, api_id=api_id, ret=ret,
                        out=out, name=name)
@@ -584,15 +597,14 @@ class LiveTraceTest(unittest.TestCase):
                     f"    os.execv({binary!r}, [{binary!r}])\n"
                     "run_cudart()\n")
         self.addCleanup(os.unlink, wrapper)
-        out = tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False)
-        out.close()
-        self.addCleanup(os.unlink, out.name)
+        out_name = _fresh_output_path(self)
         proc = subprocess.run(
             ["/usr/bin/python3", "-m", "metagross", "--json", "--output",
-             out.name, "--project-root", "/tmp", wrapper],
+             out_name, "--project-root", "/tmp", wrapper],
             capture_output=True, text=True, timeout=300)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        records = [json_mod.loads(line) for line in open(out.name) if line.strip()]
+        with open(out_name) as handle:
+            records = [json_mod.loads(line) for line in handle if line.strip()]
         apis = {r["api"] for r in records}
         self.assertTrue(any(a.startswith("cuMemcpyHtoD") for a in apis),
                         f"cudart caller invisible to uprobes; saw {apis}")
@@ -600,15 +612,14 @@ class LiveTraceTest(unittest.TestCase):
                         f"cudart kernel launch invisible; saw {apis}")
 
     def _trace_demo(self, *extra):
-        out = tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False)
-        out.close()
-        self.addCleanup(os.unlink, out.name)
+        out_name = _fresh_output_path(self)
         proc = subprocess.run(
             ["/usr/bin/python3", "-m", "metagross", "--json",
-             "--output", out.name, *extra, "examples/gpu_demo.py"],
+             "--output", out_name, *extra, "examples/gpu_demo.py"],
             capture_output=True, text=True, timeout=120)
-        records = [json_mod.loads(line)
-                   for line in open(out.name) if line.strip()]
+        with open(out_name) as handle:
+            records = [json_mod.loads(line)
+                       for line in handle if line.strip()]
         return proc, records
 
     def test_end_to_end(self):
@@ -708,15 +719,14 @@ class TorchSmokeTest(unittest.TestCase):
                 "b = torch.randn(256, 256, device='cuda')\n"
                 "print('sum', forward_step(a, b))\n")
         self.addCleanup(os.unlink, path)
-        out = tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False)
-        out.close()
-        self.addCleanup(os.unlink, out.name)
+        out_name = _fresh_output_path(self)
         proc = subprocess.run(
             ["/usr/bin/python3", "-m", "metagross", "--json", "--output",
-             out.name, "--project-root", "/tmp", path],
+             out_name, "--project-root", "/tmp", path],
             capture_output=True, text=True, timeout=300)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        records = [json_mod.loads(line) for line in open(out.name) if line.strip()]
+        with open(out_name) as handle:
+            records = [json_mod.loads(line) for line in handle if line.strip()]
         launches = [r for r in records if r["api"].startswith("cuLaunchKernel")]
         self.assertTrue(launches, "no kernel launches captured from torch")
         self.assertIn("forward_step", {r["function"] for r in launches})
