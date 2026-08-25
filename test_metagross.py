@@ -8,6 +8,7 @@ import unittest
 
 from metagross import (Config, Credentials, MetagrossError, UsageError, exit_status_from_wait,
                        open_trace_output, parse_args, validate_sudo)
+from metagross import _bpf
 
 
 class ParseArgsTest(unittest.TestCase):
@@ -135,6 +136,51 @@ class OutputSafetyTest(unittest.TestCase):
         open(path, "wb").close()
         with self.assertRaises(MetagrossError):
             open_trace_output(path, self.uid + 1, self.gid)
+
+
+class SymbolResolutionTest(unittest.TestCase):
+    def test_candidate_symbols(self):
+        self.assertEqual(
+            _bpf.candidate_symbols("cuMemcpyHtoD"),
+            ["cuMemcpyHtoD", "cuMemcpyHtoD_v2", "cuMemcpyHtoD_v3",
+             "cuMemcpyHtoD_ptds", "cuMemcpyHtoD_ptsz",
+             "cuMemcpyHtoD_v2_ptds", "cuMemcpyHtoD_v2_ptsz"])
+
+    def test_dedupe_by_address(self):
+        apis = [_bpf.Api(1, "cuLaunchKernel", "launch", mandatory=True)]
+        addrs = {"cuLaunchKernel": 100, "cuLaunchKernel_ptsz": 100}
+        got = _bpf.resolve_attachments(apis, addrs.get)
+        self.assertEqual([a.symbol for a in got], ["cuLaunchKernel"])
+
+    def test_distinct_addresses_both_attached(self):
+        apis = [_bpf.Api(1, "cuLaunchKernel", "launch", mandatory=True)]
+        addrs = {"cuLaunchKernel": 100, "cuLaunchKernel_ptsz": 200}
+        got = _bpf.resolve_attachments(apis, addrs.get)
+        self.assertEqual({a.symbol for a in got},
+                         {"cuLaunchKernel", "cuLaunchKernel_ptsz"})
+
+    def test_missing_mandatory_raises(self):
+        apis = [_bpf.Api(1, "cuLaunchKernel", "launch", mandatory=True)]
+        with self.assertRaises(MetagrossError):
+            _bpf.resolve_attachments(apis, lambda s: None)
+
+    def test_missing_optional_skipped(self):
+        apis = [_bpf.Api(5, "cuMemAllocAsync", "alloc_async")]
+        self.assertEqual(_bpf.resolve_attachments(apis, lambda s: None), [])
+
+    def test_api_table_shape(self):
+        ids = [a.api_id for a in _bpf.APIS]
+        self.assertEqual(ids, sorted(set(ids)), "api ids must be unique+sorted")
+        bases = {a.base for a in _bpf.APIS}
+        for required in ("cuLaunchKernel", "cuMemAlloc", "cuMemcpyHtoD",
+                         "cuStreamSynchronize", "cuModuleGetFunction"):
+            self.assertIn(required, bases)
+
+    def test_dlsym_resolver_against_libc(self):
+        import ctypes.util
+        resolver = _bpf.dlsym_resolver(ctypes.util.find_library("c"))
+        self.assertIsInstance(resolver("read"), int)
+        self.assertIsNone(resolver("definitely_not_a_symbol_xyz"))
 
 
 if __name__ == "__main__":
