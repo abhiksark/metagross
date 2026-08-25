@@ -1,8 +1,11 @@
 # test_metagross.py
 """Tests for metagross. Unprivileged unless RUN_EBPF_INTEGRATION=1."""
+import collections
+import os
 import unittest
 
-from metagross import Config, UsageError, parse_args
+from metagross import (Config, Credentials, MetagrossError, UsageError, exit_status_from_wait,
+                       parse_args, validate_sudo)
 
 
 class ParseArgsTest(unittest.TestCase):
@@ -35,6 +38,59 @@ class ParseArgsTest(unittest.TestCase):
     def test_unknown_option_is_usage_error(self) -> None:
         with self.assertRaises(UsageError):
             parse_args(["--bogus", "script.py"])
+
+
+FakePw = collections.namedtuple(
+    "FakePw", "pw_name pw_uid pw_gid pw_dir")
+
+
+class ValidateSudoTest(unittest.TestCase):
+    def _lookup(self, name):
+        if name == "tester":
+            return FakePw("tester", 1000, 1000, "/home/tester")
+        raise KeyError(name)
+
+    def test_valid_sudo(self):
+        env = {"SUDO_UID": "1000", "SUDO_GID": "1000", "SUDO_USER": "tester"}
+        creds = validate_sudo(env, self._lookup)
+        self.assertEqual(creds, Credentials(1000, 1000, "tester", "/home/tester"))
+
+    def test_direct_root_returns_none(self):
+        self.assertIsNone(validate_sudo({}, self._lookup))
+
+    def test_partial_metadata_rejected(self):
+        with self.assertRaises(MetagrossError):
+            validate_sudo({"SUDO_UID": "1000"}, self._lookup)
+
+    def test_non_numeric_rejected(self):
+        env = {"SUDO_UID": "x", "SUDO_GID": "1000", "SUDO_USER": "tester"}
+        with self.assertRaises(MetagrossError):
+            validate_sudo(env, self._lookup)
+
+    def test_mismatched_uid_rejected(self):
+        env = {"SUDO_UID": "1001", "SUDO_GID": "1000", "SUDO_USER": "tester"}
+        with self.assertRaises(MetagrossError):
+            validate_sudo(env, self._lookup)
+
+    def test_unknown_user_rejected(self):
+        env = {"SUDO_UID": "1", "SUDO_GID": "1", "SUDO_USER": "ghost"}
+        with self.assertRaises(MetagrossError):
+            validate_sudo(env, self._lookup)
+
+    def test_sudo_root_is_direct_root(self):
+        env = {"SUDO_UID": "0", "SUDO_GID": "0", "SUDO_USER": "root"}
+        self.assertIsNone(validate_sudo(env, lambda n: FakePw("root", 0, 0, "/root")))
+
+
+class ExitStatusTest(unittest.TestCase):
+    def test_exit_codes_preserved(self):
+        for code in (0, 1, 42, 255):
+            status = os.waitstatus_to_exitcode  # noqa: F841
+            self.assertEqual(exit_status_from_wait(code << 8), code)
+
+    def test_signal_death(self):
+        self.assertEqual(exit_status_from_wait(2), 130)   # SIGINT
+        self.assertEqual(exit_status_from_wait(9), 137)   # SIGKILL
 
 
 if __name__ == "__main__":
