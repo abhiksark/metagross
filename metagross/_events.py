@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import bisect
 import dataclasses
+import datetime
+import json as _json
+import os
 import shlex
 
-from metagross import _bpf
+from metagross import _bpf, MetagrossError
 
 
 class KernelRegistry:
@@ -197,3 +200,64 @@ def shell_quote_details(details: dict) -> str:
         text = value if isinstance(value, str) else str(value)
         parts.append(f"{key}={shlex.quote(text)}")
     return " ".join(parts)
+
+
+_COLUMNS = (("TIME", 12), ("FUNCTION", 18), ("LOCATION", 20),
+            ("API", 16), ("RET", 5), ("DURATION", 9))
+
+
+class Renderer:
+    def __init__(self, stream, json_output, wall_minus_mono_ns, pid, joiner):
+        self.stream = stream
+        self.json_output = json_output
+        self.wall_minus_mono_ns = wall_minus_mono_ns
+        self.pid = pid
+        self.joiner = joiner
+
+    def header(self) -> None:
+        if not self.json_output:
+            self._write("".join(n.ljust(w) for n, w in _COLUMNS) + "DETAILS\n")
+
+    def emit(self, ev) -> None:
+        kernel, details = describe(ev.api, ev.raw, self.joiner.registry,
+                                   self.joiner.allocs)
+        wall_ns = ev.raw.ts + self.wall_minus_mono_ns
+        moment = datetime.datetime.fromtimestamp(
+            wall_ns / 1e9).astimezone()
+        if self.json_output:
+            if kernel is not None and kernel.startswith("kernel@"):
+                kernel = None
+            record = {
+                "timestamp": moment.isoformat(),
+                "pid": self.pid,
+                "tid": ev.raw.tid,
+                "function": ev.frame.function if ev.frame else None,
+                "file": ev.frame.file if ev.frame else None,
+                "line": ev.frame.line if ev.frame else None,
+                "api": ev.api.base,
+                "kernel": kernel,
+                "return_code": ev.raw.ret,
+                "duration_ns": ev.raw.dur,
+                "details": details,
+            }
+            self._write(_json.dumps(record, separators=(",", ":")) + "\n")
+            return
+        if kernel is not None:
+            details = {"kernel": kernel, **details}
+            details.pop("function_handle", None)
+        func = ev.frame.function if ev.frame else "<unknown>"
+        loc = (f"{os.path.basename(ev.frame.file)}:{ev.frame.line}"
+               if ev.frame else "<unknown>")
+        cells = (moment.strftime("%H:%M:%S.") + f"{moment.microsecond // 10000:02d}",
+                 func, loc, ev.api.base.removeprefix("cu"),
+                 str(ev.raw.ret), f"{ev.raw.dur / 1e6:.2f}ms")
+        row = "".join(c.ljust(w) if len(c) < w else c + " "
+                      for c, (_, w) in zip(cells, _COLUMNS))
+        self._write(row + shell_quote_details(details) + "\n")
+
+    def _write(self, text: str) -> None:
+        try:
+            self.stream.write(text)
+            self.stream.flush()
+        except OSError as exc:
+            raise MetagrossError(f"trace output failed: {exc}") from None

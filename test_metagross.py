@@ -3,6 +3,7 @@
 import collections
 import contextlib
 import io
+import json
 import os
 import stat
 import tempfile
@@ -426,6 +427,64 @@ class JoinerTest(unittest.TestCase):
         j.on_gpu_event(_raw(18, out=0xF00, name=b"vec_add", ts=1, tid=1))
         self.assertEqual(j.flush(now_ns=10**12), [])
         self.assertEqual(j.registry.name(0xF00), "vec_add")
+
+
+class RendererTest(unittest.TestCase):
+    def _emit(self, ev, json_output):
+        j = _events.Joiner()
+        j.registry.observe(_bpf.API_BY_ID[18], _raw(18, out=0xF00, name=b"vec_add"))
+        buf = io.StringIO()
+        r = _events.Renderer(buf, json_output, wall_minus_mono_ns=0,
+                             pid=1234, joiner=j)
+        r.header()
+        r.emit(ev)
+        return buf.getvalue()
+
+    def test_table_launch_row(self):
+        raw = _raw(1, args=(0xF00, 256, 1, 1, 128, 1, 1, 0, 0x77),
+                   ts=3_600_000_000_000, dur=20_000, tid=1)
+        ev = _events.AttributedEvent(raw, _bpf.API_BY_ID[1],
+                                     _events.FrameInfo("train_step", "/p/train.py", 31))
+        out = self._emit(ev, json_output=False)
+        self.assertIn("LaunchKernel", out)
+        self.assertIn("train_step", out)
+        self.assertIn("train.py:31", out)
+        self.assertIn("kernel=vec_add", out)
+        self.assertIn("0.02ms", out)
+
+    def test_table_unknown_attribution(self):
+        raw = _raw(16, ts=1, dur=1, tid=1)
+        out = self._emit(_events.AttributedEvent(raw, _bpf.API_BY_ID[16], None),
+                         json_output=False)
+        self.assertIn("<unknown>", out)
+
+    def test_json_schema(self):
+        raw = _raw(1, args=(0xF00, 256, 1, 1, 128, 1, 1, 0, 0x77),
+                   ts=1_000_000_000, dur=20_000, tid=5)
+        ev = _events.AttributedEvent(raw, _bpf.API_BY_ID[1],
+                                     _events.FrameInfo("f", "/p/a.py", 2))
+        line = self._emit(ev, json_output=True).strip()
+        rec = json.loads(line)
+        self.assertEqual(
+            sorted(rec),
+            ["api", "details", "duration_ns", "file", "function", "kernel",
+             "line", "pid", "return_code", "tid", "timestamp"])
+        self.assertEqual(rec["api"], "cuLaunchKernel")
+        self.assertEqual(rec["kernel"], "vec_add")
+        self.assertEqual(rec["pid"], 1234)
+        self.assertEqual(rec["tid"], 5)
+        self.assertEqual(rec["duration_ns"], 20_000)
+        self.assertEqual(rec["details"]["grid"], "256,1,1")
+
+    def test_json_nulls_when_unknown(self):
+        raw = _raw(16, ts=1, dur=1, tid=1)
+        line = self._emit(_events.AttributedEvent(raw, _bpf.API_BY_ID[16], None),
+                          json_output=True).strip()
+        rec = json.loads(line)
+        self.assertIsNone(rec["function"])
+        self.assertIsNone(rec["file"])
+        self.assertIsNone(rec["line"])
+        self.assertIsNone(rec["kernel"])
 
 
 if __name__ == "__main__":
