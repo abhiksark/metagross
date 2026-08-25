@@ -368,5 +368,65 @@ class InstallHookTest(unittest.TestCase):
         self.assertEqual(sorted(set(kinds)), [_profile.CALL, _profile.RETURN])
 
 
+class AttributionTest(unittest.TestCase):
+    def setUp(self):
+        self.tl = _events.FrameTimeline()
+
+    def test_deepest_active_frame(self):
+        self.tl.on_record(_profile.CALL, 1, 100, "outer", "/p/a.py", 1)
+        self.tl.on_record(_profile.CALL, 1, 200, "inner", "/p/a.py", 5)
+        info = self.tl.attribute(1, 250)
+        self.assertEqual((info.function, info.line), ("inner", 5))
+
+    def test_after_return_attributes_to_caller(self):
+        self.tl.on_record(_profile.CALL, 1, 100, "outer", "/p/a.py", 1)
+        self.tl.on_record(_profile.CALL, 1, 200, "inner", "/p/a.py", 5)
+        self.tl.on_record(_profile.RETURN, 1, 300, "inner", "/p/a.py", 5)
+        self.assertEqual(self.tl.attribute(1, 350).function, "outer")
+
+    def test_unknown_before_first_frame(self):
+        self.tl.on_record(_profile.CALL, 1, 100, "f", "/p/a.py", 1)
+        self.assertIsNone(self.tl.attribute(1, 50))
+
+    def test_unknown_tid(self):
+        self.assertIsNone(self.tl.attribute(99, 50))
+
+    def test_orphan_return_ignored(self):
+        self.tl.on_record(_profile.RETURN, 1, 100, "ghost", "/p/a.py", 1)
+        self.tl.on_record(_profile.CALL, 1, 200, "f", "/p/a.py", 1)
+        self.assertEqual(self.tl.attribute(1, 250).function, "f")
+
+
+class JoinerTest(unittest.TestCase):
+    def test_hold_then_release(self):
+        j = _events.Joiner(hold_ns=100)
+        j.on_profile_record((_profile.CALL, 1, 10, "f", "/p/a.py", 1))
+        j.on_gpu_event(_raw(15, args=(0x77,), ts=50, dur=5, tid=1))
+        self.assertEqual(j.flush(now_ns=100), [])          # still held
+        released = j.flush(now_ns=200)
+        self.assertEqual(len(released), 1)
+        self.assertEqual(released[0].frame.function, "f")
+        self.assertEqual(released[0].api.base, "cuStreamSynchronize")
+
+    def test_late_profile_record_beats_hold(self):
+        j = _events.Joiner(hold_ns=100)
+        j.on_gpu_event(_raw(16, ts=50, dur=5, tid=1))
+        j.on_profile_record((_profile.CALL, 1, 10, "f", "/p/a.py", 1))
+        self.assertEqual(j.flush(now_ns=200)[0].frame.function, "f")
+
+    def test_force_flush(self):
+        j = _events.Joiner(hold_ns=10**12)
+        j.on_gpu_event(_raw(16, ts=50, dur=5, tid=1))
+        out = j.flush(now_ns=60, force=True)
+        self.assertEqual(len(out), 1)
+        self.assertIsNone(out[0].frame)
+
+    def test_register_events_feed_registry_not_output(self):
+        j = _events.Joiner(hold_ns=0)
+        j.on_gpu_event(_raw(18, out=0xF00, name=b"vec_add", ts=1, tid=1))
+        self.assertEqual(j.flush(now_ns=10**12), [])
+        self.assertEqual(j.registry.name(0xF00), "vec_add")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -2,7 +2,11 @@
 """Event enrichment, attribution, and rendering for Metagross."""
 from __future__ import annotations
 
+import bisect
+import dataclasses
 import shlex
+
+from metagross import _bpf
 
 
 class KernelRegistry:
@@ -40,6 +44,97 @@ class AllocTracker:
         if size is not None:
             self.total_bytes -= size
         return size
+
+
+@dataclasses.dataclass(frozen=True)
+class FrameInfo:
+    function: str
+    file: str
+    line: int
+
+
+class FrameTimeline:
+    """Per-TID log of profile records, replayed to answer point-in-time queries."""
+
+    def __init__(self):
+        self._logs: dict[int, list[tuple]] = {}
+
+    def on_record(self, kind, tid, ts_ns, func, path, line) -> None:
+        self._logs.setdefault(tid, []).append((ts_ns, kind, func, path, line))
+
+    def attribute(self, tid: int, ts_ns: int):
+        log = self._logs.get(tid)
+        if not log:
+            return None
+        stack: list[FrameInfo] = []
+        idx = bisect.bisect_right(log, (ts_ns, 2))
+        for _, kind, func, path, line in log[:idx]:
+            if kind == 0:
+                stack.append(FrameInfo(func, path, line))
+            elif stack and stack[-1].function == func:
+                stack.pop()
+            elif stack:
+                stack.pop()  # unwind mismatch conservatively
+        return stack[-1] if stack else None
+
+    def prune(self, min_ts_ns: int) -> None:
+        # ponytail: O(n) replay per attribute + periodic prune; index it if
+        # profiles of long-running loops ever measure slow.
+        for tid, log in self._logs.items():
+            depth = 0
+            cut = 0
+            for i, (ts, kind, *_rest) in enumerate(log):
+                if ts >= min_ts_ns:
+                    break
+                depth += 1 if kind == 0 else -1
+                if depth <= 0:
+                    depth = max(depth, 0)
+                    cut = i + 1
+            if cut:
+                self._logs[tid] = log[cut:]
+
+
+@dataclasses.dataclass
+class AttributedEvent:
+    raw: object
+    api: object
+    frame: FrameInfo | None
+
+
+class Joiner:
+    def __init__(self, hold_ns: int = 100_000_000):
+        self.hold_ns = hold_ns
+        self.timeline = FrameTimeline()
+        self.registry = KernelRegistry()
+        self.allocs = AllocTracker()
+        self._pending: list = []
+
+    def on_gpu_event(self, raw) -> None:
+        api = _bpf.API_BY_ID.get(raw.api_id)
+        if api is None:
+            return
+        if api.category == "register":
+            self.registry.observe(api, raw)
+            return
+        self._pending.append((raw.ts, raw, api))
+
+    def on_profile_record(self, rec) -> None:
+        self.timeline.on_record(*rec)
+
+    def flush(self, now_ns: int, force: bool = False):
+        released, kept = [], []
+        for ts, raw, api in self._pending:
+            if force or now_ns - ts >= self.hold_ns:
+                released.append((ts, raw, api))
+            else:
+                kept.append((ts, raw, api))
+        self._pending = kept
+        released.sort(key=lambda item: item[0])
+        out = [AttributedEvent(raw, api, self.timeline.attribute(raw.tid, ts))
+               for ts, raw, api in released]
+        if released:
+            self.timeline.prune(min(ts for ts, _, _ in kept) if kept else now_ns)
+        return out
 
 
 def _hex(v: int) -> str:
