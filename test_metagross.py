@@ -1,6 +1,8 @@
 # test_metagross.py
 """Tests for metagross. Unprivileged unless RUN_EBPF_INTEGRATION=1."""
 import collections
+import contextlib
+import io
 import os
 import stat
 import tempfile
@@ -181,6 +183,44 @@ class SymbolResolutionTest(unittest.TestCase):
         resolver = _bpf.dlsym_resolver(ctypes.util.find_library("c"))
         self.assertIsInstance(resolver("read"), int)
         self.assertIsNone(resolver("definitely_not_a_symbol_xyz"))
+
+
+class BpfSourceTest(unittest.TestCase):
+    def setUp(self):
+        self.src = _bpf.build_source(4242)
+
+    def test_tgid_substituted(self):
+        self.assertIn("4242", self.src)
+        self.assertNotIn("TARGET_TGID_PLACEHOLDER", self.src)
+
+    def test_handler_pair_per_api(self):
+        for api in _bpf.APIS:
+            self.assertIn(f"int enter_{api.base}(", self.src)
+            self.assertIn(f"int exit_{api.base}(", self.src)
+
+    def test_braces_balanced(self):
+        self.assertEqual(self.src.count("{"), self.src.count("}"))
+
+    def test_launch_reads_stack_args(self):
+        self.assertIn("bpf_probe_read_user", self.src)
+
+    def test_decode_event_roundtrip(self):
+        raw = _bpf.RawEvent(ts=7, dur=9, tid=5, api_id=1, ret=0)
+        raw.args[0] = 0xAB
+        raw.name = b"vec_add"
+        data = bytes(bytearray(raw))
+        ev = _bpf.decode_event(data)
+        self.assertEqual((ev.ts, ev.dur, ev.tid, ev.api_id), (7, 9, 5, 1))
+        self.assertEqual(ev.args[0], 0xAB)
+        self.assertEqual(ev.name, b"vec_add")
+
+    def test_ebpf_flag_prints_source(self):
+        import metagross
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = metagross.main(["--ebpf"])
+        self.assertEqual(rc, 0)
+        self.assertIn("enter_cuLaunchKernel", buf.getvalue())
 
 
 if __name__ == "__main__":

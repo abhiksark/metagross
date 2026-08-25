@@ -131,5 +131,9 @@ def main(argv: list[str] | None = None) -> int:
     except UsageError as exc:
         print(f"metagross: {exc}\n{_USAGE}", file=sys.stderr, end="")
         return 2
+    if cfg.dump_ebpf:
+        from metagross import _bpf
+        print(_bpf.build_source(0))
+        return 0
     # Later tasks route cfg to the ebpf dump or the live launcher.
     raise NotImplementedError(cfg)
