@@ -15,6 +15,7 @@ Update `README.md` in the same change when altering:
 - JSONL top-level fields or detail fields.
 - Traced CUDA API coverage.
 - Attribution behavior, limitations, overhead, or known blind spots.
+- Visual viewer commands, layouts, supported schemas, or TTY requirements.
 - Integration-test commands or setup instructions.
 
 ## Schema/version discipline

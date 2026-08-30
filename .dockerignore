@@ -1,0 +1,9 @@
+# .dockerignore
+.git
+.benchmarks
+.code-review-graph
+.pytest_cache
+.ruff_cache
+.superpowers
+**/__pycache__
+**/*.pyc

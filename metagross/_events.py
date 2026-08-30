@@ -56,33 +56,66 @@ class FrameInfo:
     line: int
 
 
+class _ReplayState:
+    __slots__ = ("index", "last_ts_ns", "stack")
+
+    def __init__(self):
+        self.index = 0
+        self.last_ts_ns = -1
+        self.stack: list[FrameInfo] = []
+
+
 class FrameTimeline:
-    """Per-TID log of profile records, replayed to answer point-in-time queries."""
+    """Per-TID profile logs with incremental point-in-time stack replay."""
 
     def __init__(self):
         self._logs: dict[int, list[tuple]] = {}
+        self._states: dict[int, _ReplayState] = {}
+
+    @staticmethod
+    def _apply(stack: list[FrameInfo], record: tuple) -> None:
+        _, kind, func, path, line = record
+        if kind == 0:
+            stack.append(FrameInfo(func, path, line))
+        elif stack and stack[-1].function == func:
+            stack.pop()
+        elif stack:
+            stack.pop()  # unwind mismatch conservatively
 
     def on_record(self, kind, tid, ts_ns, func, path, line) -> None:
-        self._logs.setdefault(tid, []).append((ts_ns, kind, func, path, line))
+        record = (ts_ns, kind, func, path, line)
+        log = self._logs.setdefault(tid, [])
+        if log and record < log[-1]:
+            bisect.insort_right(log, record)
+        else:
+            log.append(record)
+        state = self._states.get(tid)
+        if state is not None and ts_ns <= state.last_ts_ns:
+            # A late record invalidates the incremental stack. The next
+            # monotonic query rebuilds it once from the now-sorted log.
+            self._states[tid] = _ReplayState()
 
     def attribute(self, tid: int, ts_ns: int):
         log = self._logs.get(tid)
         if not log:
             return None
-        stack: list[FrameInfo] = []
-        idx = bisect.bisect_right(log, (ts_ns, 2))
-        for _, kind, func, path, line in log[:idx]:
-            if kind == 0:
-                stack.append(FrameInfo(func, path, line))
-            elif stack and stack[-1].function == func:
-                stack.pop()
-            elif stack:
-                stack.pop()  # unwind mismatch conservatively
-        return stack[-1] if stack else None
+        state = self._states.setdefault(tid, _ReplayState())
+        if ts_ns < state.last_ts_ns:
+            # GPU delivery can rarely exceed the hold window. Answer an older
+            # query independently rather than rewinding the monotonic cursor.
+            stack: list[FrameInfo] = []
+            end = bisect.bisect_right(log, (ts_ns, 2))
+            for record in log[:end]:
+                self._apply(stack, record)
+            return stack[-1] if stack else None
+
+        while state.index < len(log) and log[state.index][0] <= ts_ns:
+            self._apply(state.stack, log[state.index])
+            state.index += 1
+        state.last_ts_ns = ts_ns
+        return state.stack[-1] if state.stack else None
 
     def prune(self, min_ts_ns: int) -> None:
-        # ponytail: O(n) replay per attribute + periodic prune; index it if
-        # profiles of long-running loops ever measure slow.
         for tid, log in self._logs.items():
             depth = 0
             cut = 0
@@ -94,7 +127,13 @@ class FrameTimeline:
                     depth = max(depth, 0)
                     cut = i + 1
             if cut:
-                self._logs[tid] = log[cut:]
+                del log[:cut]
+                state = self._states.get(tid)
+                if state is not None:
+                    if cut >= state.index:
+                        self._states[tid] = _ReplayState()
+                    else:
+                        state.index -= cut
 
 
 @dataclasses.dataclass
@@ -102,6 +141,15 @@ class AttributedEvent:
     raw: object
     api: object
     frame: FrameInfo | None
+
+
+@dataclasses.dataclass
+class EnrichedEvent:
+    raw: object
+    api: object
+    frame: FrameInfo | None
+    kernel: str | None
+    details: dict
 
 
 class Joiner:
@@ -123,6 +171,14 @@ class Joiner:
 
     def on_profile_record(self, rec) -> None:
         self.timeline.on_record(*rec)
+
+    def enrich(self, event: AttributedEvent) -> EnrichedEvent:
+        kernel, details = describe(
+            event.api, event.raw, self.registry, self.allocs
+        )
+        return EnrichedEvent(
+            event.raw, event.api, event.frame, kernel, details
+        )
 
     def flush(self, now_ns: int, force: bool = False):
         released, kept = [], []
@@ -199,6 +255,132 @@ def describe(api, ev, registry: KernelRegistry, allocs: AllocTracker):
     return kernel, det
 
 
+@dataclasses.dataclass
+class _Aggregate:
+    count: int = 0
+    errors: int = 0
+    total_duration_ns: int = 0
+    max_duration_ns: int = 0
+    successful_bytes: int = 0
+
+    def observe(self, event: EnrichedEvent) -> None:
+        self.count += 1
+        self.errors += event.raw.ret != 0
+        self.total_duration_ns += event.raw.dur
+        self.max_duration_ns = max(self.max_duration_ns, event.raw.dur)
+        if event.raw.ret == 0:
+            self.successful_bytes += int(event.details.get("bytes", 0))
+
+    def fields(self) -> dict:
+        return {
+            "count": self.count,
+            "errors": self.errors,
+            "total_duration_ns": self.total_duration_ns,
+            "max_duration_ns": self.max_duration_ns,
+            "successful_bytes": self.successful_bytes,
+        }
+
+
+class CaptureStats:
+    """Aggregate enriched events without changing event rendering."""
+
+    def __init__(self):
+        self.events = 0
+        self.attributed = 0
+        self.cuda_errors = 0
+        self.total_api_duration_ns = 0
+        self.synchronization_duration_ns = 0
+        self.successful_allocation_bytes = 0
+        self.observed_peak_bytes = 0
+        self._api: dict[str, _Aggregate] = {}
+        self._function: dict[tuple[str, str, int], _Aggregate] = {}
+        self._kernel: dict[str, _Aggregate] = {}
+        self._copy_bytes: dict[str, int] = {}
+
+    def observe(self, event: EnrichedEvent) -> None:
+        self.events += 1
+        self.attributed += event.frame is not None
+        self.cuda_errors += event.raw.ret != 0
+        self.total_api_duration_ns += event.raw.dur
+        if event.api.category == "sync":
+            self.synchronization_duration_ns += event.raw.dur
+        if event.api.category in ("alloc", "alloc_async") and event.raw.ret == 0:
+            self.successful_allocation_bytes += int(event.details.get("bytes", 0))
+        gpu_total = event.details.get("gpu_total")
+        if isinstance(gpu_total, int):
+            self.observed_peak_bytes = max(self.observed_peak_bytes, gpu_total)
+        if event.api.category.startswith("copy") and event.raw.ret == 0:
+            copied = int(event.details.get("bytes", 0))
+            self._copy_bytes[event.api.base] = (
+                self._copy_bytes.get(event.api.base, 0) + copied
+            )
+
+        self._api.setdefault(event.api.base, _Aggregate()).observe(event)
+        if event.frame is not None:
+            function_key = (
+                event.frame.function, event.frame.file, event.frame.line
+            )
+            self._function.setdefault(function_key, _Aggregate()).observe(event)
+        if event.kernel is not None and not event.kernel.startswith("kernel@"):
+            self._kernel.setdefault(event.kernel, _Aggregate()).observe(event)
+
+    @staticmethod
+    def _top_rows(groups: dict, field_names: tuple[str, ...]) -> list[dict]:
+        ordered = sorted(
+            groups.items(),
+            key=lambda item: (
+                -item[1].count, -item[1].total_duration_ns, item[0]
+            ),
+        )
+        rows = []
+        for key, aggregate in ordered[:20]:
+            values = key if isinstance(key, tuple) else (key,)
+            row = dict(zip(field_names, values))
+            row.update(aggregate.fields())
+            rows.append(row)
+        return rows
+
+    def snapshot(self, *, lost_events: int, dropped_nested_calls: int,
+                 observed_outstanding_bytes: int, render_failed: bool,
+                 trace_failed: bool = False) -> dict:
+        complete = not any((lost_events, dropped_nested_calls,
+                            render_failed, trace_failed))
+        return {
+            "schema_version": 1,
+            "complete": complete,
+            "capture": {
+                "events": self.events,
+                "attributed": self.attributed,
+                "unknown_attribution": self.events - self.attributed,
+                "cuda_errors": self.cuda_errors,
+                "lost_events": lost_events,
+                "dropped_nested_calls": dropped_nested_calls,
+                "render_failed": render_failed,
+                "trace_failed": trace_failed,
+            },
+            "timing": {
+                "total_api_duration_ns": self.total_api_duration_ns,
+                "synchronization_duration_ns": self.synchronization_duration_ns,
+            },
+            "memory": {
+                "successful_allocation_bytes": self.successful_allocation_bytes,
+                "observed_peak_bytes": self.observed_peak_bytes,
+                "observed_outstanding_bytes": observed_outstanding_bytes,
+            },
+            "copies": {
+                "successful_bytes_by_api": dict(sorted(self._copy_bytes.items())),
+            },
+            "apis": [
+                {"api": api, **aggregate.fields()}
+                for api, aggregate in sorted(self._api.items())
+            ],
+            "top_functions": self._top_rows(
+                self._function, ("function", "file", "line")
+            ),
+            "top_kernels": self._top_rows(self._kernel, ("kernel",)),
+        }
+
+
 def shell_quote_details(details: dict) -> str:
     parts = []
     for key, value in details.items():
@@ -212,20 +394,19 @@ _COLUMNS = (("TIME", 12), ("FUNCTION", 18), ("LOCATION", 20),
 
 
 class Renderer:
-    def __init__(self, stream, json_output, wall_minus_mono_ns, pid, joiner):
+    def __init__(self, stream, json_output, wall_minus_mono_ns, pid):
         self.stream = stream
         self.json_output = json_output
         self.wall_minus_mono_ns = wall_minus_mono_ns
         self.pid = pid
-        self.joiner = joiner
 
     def header(self) -> None:
         if not self.json_output:
             self._write("".join(n.ljust(w) for n, w in _COLUMNS) + "DETAILS\n")
+            self.flush()
 
-    def emit(self, ev) -> None:
-        kernel, details = describe(ev.api, ev.raw, self.joiner.registry,
-                                   self.joiner.allocs)
+    def emit(self, ev: EnrichedEvent) -> None:
+        kernel, details = ev.kernel, ev.details
         wall_ns = ev.raw.ts + self.wall_minus_mono_ns
         moment = datetime.datetime.fromtimestamp(
             wall_ns / 1e9).astimezone()
@@ -260,9 +441,14 @@ class Renderer:
                       for c, (_, w) in zip(cells, _COLUMNS))
         self._write(row + shell_quote_details(details) + "\n")
 
+    def flush(self) -> None:
+        try:
+            self.stream.flush()
+        except OSError as exc:
+            raise MetagrossError(f"trace output failed: {exc}") from None
+
     def _write(self, text: str) -> None:
         try:
             self.stream.write(text)
-            self.stream.flush()
         except OSError as exc:
             raise MetagrossError(f"trace output failed: {exc}") from None

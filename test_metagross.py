@@ -5,15 +5,19 @@ import contextlib
 import io
 import json
 import os
+import runpy
 import shutil
 import stat
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 import metagross
-from metagross import (Config, Credentials, MetagrossError, UsageError, exit_status_from_wait,
-                       open_trace_output, parse_args, validate_sudo, _validate_script)
+from metagross import (Config, Credentials, MetagrossError, UsageError,
+                       _validate_output_paths, _validate_script,
+                       exit_status_from_wait, open_trace_output, parse_args,
+                       validate_sudo)
 from metagross import _bpf
 from metagross import _events
 from metagross import _profile
@@ -128,6 +132,73 @@ class DescribeTest(unittest.TestCase):
         self.assertEqual(s, "path='a b' n=3")
 
 
+class CaptureStatsTest(unittest.TestCase):
+    def test_snapshot_aggregates_capture_memory_copy_and_timing(self):
+        joiner = _events.Joiner()
+        stats = _events.CaptureStats()
+        frame = _events.FrameInfo("step", "/p/train.py", 10)
+        attributed = [
+            _events.AttributedEvent(
+                _raw(3, args=(0, 1024), out=0xA, dur=10),
+                _bpf.API_BY_ID[3], frame,
+            ),
+            _events.AttributedEvent(
+                _raw(7, args=(0xA, 0xB, 512), dur=20),
+                _bpf.API_BY_ID[7], frame,
+            ),
+            _events.AttributedEvent(
+                _raw(9, args=(0xB, 0xA, 256), ret=1, dur=30),
+                _bpf.API_BY_ID[9], frame,
+            ),
+            _events.AttributedEvent(
+                _raw(15, args=(0x77,), dur=40),
+                _bpf.API_BY_ID[15], None,
+            ),
+        ]
+        for event in attributed:
+            stats.observe(joiner.enrich(event))
+
+        snapshot = stats.snapshot(
+            lost_events=0,
+            dropped_nested_calls=0,
+            observed_outstanding_bytes=joiner.allocs.total_bytes,
+            render_failed=False,
+        )
+        self.assertTrue(snapshot["complete"])
+        self.assertEqual(snapshot["capture"]["events"], 4)
+        self.assertEqual(snapshot["capture"]["attributed"], 3)
+        self.assertEqual(snapshot["capture"]["unknown_attribution"], 1)
+        self.assertEqual(snapshot["capture"]["cuda_errors"], 1)
+        self.assertEqual(snapshot["timing"]["total_api_duration_ns"], 100)
+        self.assertEqual(snapshot["timing"]["synchronization_duration_ns"], 40)
+        self.assertEqual(snapshot["memory"]["successful_allocation_bytes"], 1024)
+        self.assertEqual(snapshot["memory"]["observed_peak_bytes"], 1024)
+        self.assertEqual(snapshot["memory"]["observed_outstanding_bytes"], 1024)
+        self.assertEqual(
+            snapshot["copies"]["successful_bytes_by_api"],
+            {"cuMemcpyHtoD": 512},
+        )
+        self.assertEqual(snapshot["top_functions"][0]["function"], "step")
+        self.assertEqual(snapshot["top_functions"][0]["count"], 3)
+
+    def test_loss_or_render_failure_marks_snapshot_incomplete(self):
+        stats = _events.CaptureStats()
+        snapshot = stats.snapshot(
+            lost_events=2,
+            dropped_nested_calls=0,
+            observed_outstanding_bytes=0,
+            render_failed=False,
+        )
+        self.assertFalse(snapshot["complete"])
+        snapshot = stats.snapshot(
+            lost_events=0,
+            dropped_nested_calls=0,
+            observed_outstanding_bytes=0,
+            render_failed=True,
+        )
+        self.assertFalse(snapshot["complete"])
+
+
 class ParseArgsTest(unittest.TestCase):
     def test_minimal(self) -> None:
         cfg: Config = parse_args(["script.py"])
@@ -136,6 +207,10 @@ class ParseArgsTest(unittest.TestCase):
         self.assertFalse(cfg.json_output)
         self.assertIsNone(cfg.output_path)
         self.assertEqual(cfg.project_root, ".")
+        self.assertFalse(cfg.show_stats)
+        self.assertIsNone(cfg.summary_output_path)
+        self.assertTrue(cfg.python_attribution)
+        self.assertIsNone(cfg.trace_families)
 
     def test_options_before_script_args_after(self) -> None:
         cfg: Config = parse_args(
@@ -145,6 +220,34 @@ class ParseArgsTest(unittest.TestCase):
         self.assertEqual(cfg.output_path, "/tmp/x.jsonl")
         self.assertEqual(cfg.project_root, "/p")
         self.assertEqual(cfg.script_args, ["--json", "positional"])
+
+    def test_capture_policy_options(self) -> None:
+        cfg = parse_args([
+            "--trace", "launch,sync", "--no-attribution", "--stats",
+            "--summary-output", "/tmp/summary.json", "script.py",
+        ])
+        self.assertEqual(cfg.trace_families, frozenset(("launch", "sync")))
+        self.assertFalse(cfg.python_attribution)
+        self.assertTrue(cfg.show_stats)
+        self.assertEqual(cfg.summary_output_path, "/tmp/summary.json")
+
+    def test_trace_all_uses_default_selection(self) -> None:
+        cfg = parse_args(["--trace", "all", "script.py"])
+        self.assertIsNone(cfg.trace_families)
+
+    def test_invalid_trace_family_is_usage_error(self) -> None:
+        with self.assertRaisesRegex(UsageError, "unknown trace family"):
+            parse_args(["--trace", "launch,banana", "script.py"])
+        with self.assertRaisesRegex(UsageError, "cannot be combined"):
+            parse_args(["--trace", "all,sync", "script.py"])
+        with self.assertRaisesRegex(UsageError, "comma-separated"):
+            parse_args(["--trace", ",", "script.py"])
+
+    def test_value_options_require_values(self) -> None:
+        for option in ("--trace", "--summary-output"):
+            with self.subTest(option=option):
+                with self.assertRaisesRegex(UsageError, "requires a value"):
+                    parse_args([option])
 
     def test_ebpf_dump_needs_no_script(self) -> None:
         cfg: Config = parse_args(["--ebpf"])
@@ -162,6 +265,55 @@ class ParseArgsTest(unittest.TestCase):
 
 FakePw = collections.namedtuple(
     "FakePw", "pw_name pw_uid pw_gid pw_dir")
+
+
+class BenchmarkHarnessTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.benchmark = runpy.run_path(
+            "examples/docker/benchmark_overhead.py"
+        )
+
+    def test_bare_command_bypasses_metagross(self):
+        command = self.benchmark["_docker_command"](
+            "image:test", "basic_tensor_ops.py", "bare"
+        )
+        self.assertIn("--entrypoint", command)
+        self.assertIn("/usr/bin/python3", command)
+        self.assertNotIn("--privileged", command)
+        self.assertNotIn("--no-attribution", command)
+
+    def test_launch_only_command_uses_capture_controls(self):
+        command = self.benchmark["_docker_command"](
+            "image:test", "basic_tensor_ops.py", "launch-only"
+        )
+        self.assertIn("--privileged", command)
+        self.assertIn("--pid=host", command)
+        self.assertIn("--no-attribution", command)
+        trace_index = command.index("--trace")
+        self.assertEqual(command[trace_index + 1], "launch")
+
+    def test_steady_state_command_uses_benchmark_target(self):
+        command = self.benchmark["_docker_command"](
+            "image:test", "rapid-launches", "full"
+        )
+        self.assertIn("/workspace/benchmarks/steady_state.py", command)
+        self.assertIn("--iterations", command)
+        self.assertIn("2000", command)
+
+    def test_summary_counts_loss_and_uses_median(self):
+        summary = self.benchmark["_summarize"]([
+            {"elapsed_seconds": 3.0, "lost_events": 2,
+             "dropped_nested_calls": 0},
+            {"elapsed_seconds": 1.0, "lost_events": 0,
+             "dropped_nested_calls": 1},
+            {"elapsed_seconds": 2.0, "lost_events": 3,
+             "dropped_nested_calls": 0},
+        ])
+        self.assertEqual(summary["median_seconds"], 2.0)
+        self.assertEqual(summary["lost_events"], 5)
+        self.assertEqual(summary["dropped_nested_calls"], 1)
+        self.assertIsNone(summary["target_median_seconds"])
 
 
 class ValidateSudoTest(unittest.TestCase):
@@ -254,6 +406,12 @@ class OutputSafetyTest(unittest.TestCase):
         with self.assertRaises(MetagrossError):
             open_trace_output(path, self.uid + 1, self.gid)
 
+    def test_trace_and_summary_outputs_must_be_distinct(self):
+        trace = self._path("trace.jsonl")
+        with self.assertRaisesRegex(MetagrossError, "must be different"):
+            _validate_output_paths(trace, os.path.join(self.dir.name, ".", "trace.jsonl"))
+        _validate_output_paths(trace, self._path("summary.json"))
+
 
 class SymbolResolutionTest(unittest.TestCase):
     def test_candidate_symbols(self):
@@ -293,16 +451,41 @@ class SymbolResolutionTest(unittest.TestCase):
                          "cuStreamSynchronize", "cuModuleGetFunction"):
             self.assertIn(required, bases)
 
+    def test_select_launch_apis_includes_registration_dependency(self):
+        selected = _bpf.select_apis(frozenset(("launch",)))
+        categories = {api.category for api in selected}
+        self.assertEqual(categories, {"launch", "launch_ex", "register"})
+
+    def test_select_multiple_api_families(self):
+        selected = _bpf.select_apis(frozenset(("copy", "sync")))
+        categories = {api.category for api in selected}
+        self.assertIn("copy_h2d", categories)
+        self.assertIn("copy_generic", categories)
+        self.assertEqual(categories - {"copy_h2d", "copy_d2h", "copy_d2d",
+                                       "copy_generic", "sync"}, set())
+
+    def test_select_all_apis_returns_copy(self):
+        selected = _bpf.select_apis()
+        self.assertEqual(selected, _bpf.APIS)
+        self.assertIsNot(selected, _bpf.APIS)
+
     def test_dlsym_resolver_against_libc(self):
         import ctypes.util
         resolver = _bpf.dlsym_resolver(ctypes.util.find_library("c"))
         self.assertIsInstance(resolver("read"), int)
         self.assertIsNone(resolver("definitely_not_a_symbol_xyz"))
 
-    def test_find_libcuda_returns_absolute_existing_path(self):
-        path = _bpf.find_libcuda()
+    def test_find_libcuda_returns_mocked_existing_absolute_path(self):
+        expected = _bpf._LIBCUDA_CANDIDATES[1]
+        with (mock.patch.object(_bpf.ctypes.util, "find_library",
+                                return_value=None),
+              mock.patch.object(_bpf.os.path, "exists",
+                                side_effect=lambda path: path == expected),
+              mock.patch.object(_bpf, "_ldconfig_libcuda_path",
+                                return_value=None)):
+            path = _bpf.find_libcuda()
+        self.assertEqual(path, expected)
         self.assertTrue(path.startswith("/"), f"not absolute: {path!r}")
-        self.assertTrue(os.path.exists(path), f"does not exist: {path!r}")
 
 
 class BpfSourceTest(unittest.TestCase):
@@ -324,6 +507,16 @@ class BpfSourceTest(unittest.TestCase):
     def test_launch_reads_stack_args(self):
         self.assertIn("bpf_probe_read_user", self.src)
 
+    def test_ring_buffer_has_four_mibibyte_capacity(self):
+        self.assertIn("BPF_RINGBUF_OUTPUT(events, 1024)", self.src)
+
+    def test_filtered_source_contains_only_selected_families(self):
+        selected = _bpf.select_apis(frozenset(("sync",)))
+        src = _bpf.build_source(4242, selected)
+        self.assertIn("enter_cuStreamSynchronize", src)
+        self.assertNotIn("enter_cuLaunchKernel", src)
+        self.assertNotIn("enter_cuMemAlloc", src)
+
     def test_decode_event_roundtrip(self):
         raw = _bpf.RawEvent(ts=7, dur=9, tid=5, api_id=1, ret=0)
         raw.args[0] = 0xAB
@@ -341,6 +534,15 @@ class BpfSourceTest(unittest.TestCase):
             rc = metagross.main(["--ebpf"])
         self.assertEqual(rc, 0)
         self.assertIn("enter_cuLaunchKernel", buf.getvalue())
+
+    def test_ebpf_flag_honors_trace_selection(self):
+        import metagross
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = metagross.main(["--trace", "sync", "--ebpf"])
+        self.assertEqual(rc, 0)
+        self.assertIn("enter_cuStreamSynchronize", buf.getvalue())
+        self.assertNotIn("enter_cuLaunchKernel", buf.getvalue())
 
 
 class RecordCodecTest(unittest.TestCase):
@@ -397,6 +599,18 @@ class ProjectFileTest(unittest.TestCase):
         root = os.path.dirname(os.path.dirname(path))
         self.assertFalse(_profile.is_project_file(path, root))
 
+    def test_filesystem_root_accepts_project_file(self):
+        self.assertTrue(_profile.is_project_file("/tmp/project.py", "/"))
+
+    def test_classifier_caches_path_resolution(self):
+        realpath = _profile.os.path.realpath
+        with mock.patch.object(_profile.os.path, "realpath",
+                               wraps=realpath) as resolve:
+            classifier = _profile._ProjectClassifier("/p")
+            self.assertTrue(classifier.includes("/p/project.py"))
+            self.assertTrue(classifier.includes("/p/project.py"))
+        self.assertEqual(resolve.call_count, 2)  # root once, project path once
+
 
 class InstallHookTest(unittest.TestCase):
     def test_hook_reports_project_calls(self):
@@ -407,7 +621,8 @@ class InstallHookTest(unittest.TestCase):
             "from metagross import _profile\n"
             "d = tempfile.mkdtemp()\n"
             "p = os.path.join(d, 'proj.py')\n"
-            "open(p, 'w').write('def hot():\\n    return 1\\n')\n"
+            "with open(p, 'w') as stream:\n"
+            "    stream.write('def hot():\\n    return 1\\n')\n"
             "sys.path.insert(0, d)\n"
             "_profile.install(%d, d)\n"
             "import proj\n"
@@ -460,6 +675,44 @@ class AttributionTest(unittest.TestCase):
         self.tl.on_record(_profile.CALL, 1, 200, "f", "/p/a.py", 1)
         self.assertEqual(self.tl.attribute(1, 250).function, "f")
 
+    def test_monotonic_queries_advance_incremental_cursor(self):
+        self.tl.on_record(_profile.CALL, 1, 100, "outer", "/p/a.py", 1)
+        self.tl.on_record(_profile.CALL, 1, 200, "inner", "/p/a.py", 2)
+        self.tl.on_record(_profile.RETURN, 1, 300, "inner", "/p/a.py", 2)
+        self.assertEqual(self.tl.attribute(1, 250).function, "inner")
+        self.assertEqual(self.tl._states[1].index, 2)
+        self.assertEqual(self.tl.attribute(1, 350).function, "outer")
+        self.assertEqual(self.tl._states[1].index, 3)
+
+    def test_late_profile_record_rebuilds_incremental_stack(self):
+        self.tl.on_record(_profile.CALL, 1, 100, "outer", "/p/a.py", 1)
+        self.assertEqual(self.tl.attribute(1, 200).function, "outer")
+        self.tl.on_record(_profile.CALL, 1, 150, "inner", "/p/a.py", 2)
+        self.assertEqual(self.tl.attribute(1, 250).function, "inner")
+
+    def test_older_query_does_not_rewind_monotonic_cursor(self):
+        self.tl.on_record(_profile.CALL, 1, 100, "outer", "/p/a.py", 1)
+        self.tl.on_record(_profile.RETURN, 1, 300, "outer", "/p/a.py", 1)
+        self.assertIsNone(self.tl.attribute(1, 350))
+        self.assertEqual(self.tl.attribute(1, 150).function, "outer")
+        self.assertIsNone(self.tl.attribute(1, 400))
+
+    def test_prune_preserves_incremental_active_stack(self):
+        self.tl.on_record(_profile.CALL, 1, 100, "done", "/p/a.py", 1)
+        self.tl.on_record(_profile.RETURN, 1, 150, "done", "/p/a.py", 1)
+        self.tl.on_record(_profile.CALL, 1, 200, "active", "/p/a.py", 2)
+        self.assertEqual(self.tl.attribute(1, 250).function, "active")
+        self.tl.prune(175)
+        self.assertEqual(len(self.tl._logs[1]), 1)
+        self.assertEqual(self.tl.attribute(1, 300).function, "active")
+
+    def test_prune_resets_stack_when_cut_includes_unreplayed_return(self):
+        self.tl.on_record(_profile.CALL, 1, 100, "done", "/p/a.py", 1)
+        self.tl.on_record(_profile.RETURN, 1, 150, "done", "/p/a.py", 1)
+        self.assertEqual(self.tl.attribute(1, 120).function, "done")
+        self.tl.prune(175)
+        self.assertIsNone(self.tl.attribute(1, 200))
+
 
 class JoinerTest(unittest.TestCase):
     def test_hold_then_release(self):
@@ -497,10 +750,11 @@ class RendererTest(unittest.TestCase):
         j = _events.Joiner()
         j.registry.observe(_bpf.API_BY_ID[18], _raw(18, out=0xF00, name=b"vec_add"))
         buf = io.StringIO()
-        r = _events.Renderer(buf, json_output, wall_minus_mono_ns=0,
-                             pid=1234, joiner=j)
+        r = _events.Renderer(
+            buf, json_output, wall_minus_mono_ns=0, pid=1234
+        )
         r.header()
-        r.emit(ev)
+        r.emit(j.enrich(ev))
         return buf.getvalue()
 
     def test_table_launch_row(self):
@@ -548,6 +802,25 @@ class RendererTest(unittest.TestCase):
         self.assertIsNone(rec["file"])
         self.assertIsNone(rec["line"])
         self.assertIsNone(rec["kernel"])
+
+    def test_event_writes_are_buffered_until_batch_flush(self):
+        class TrackingStream(io.StringIO):
+            flush_count = 0
+
+            def flush(self):
+                self.flush_count += 1
+                super().flush()
+
+        stream = TrackingStream()
+        joiner = _events.Joiner()
+        renderer = _events.Renderer(stream, True, 0, 1234)
+        raw = _raw(16, ts=1, dur=1, tid=1)
+        renderer.emit(joiner.enrich(
+            _events.AttributedEvent(raw, _bpf.API_BY_ID[16], None)
+        ))
+        self.assertEqual(stream.flush_count, 0)
+        renderer.flush()
+        self.assertEqual(stream.flush_count, 1)
 
 
 class ValidateScriptTest(unittest.TestCase):
@@ -694,6 +967,33 @@ class LiveTraceTest(unittest.TestCase):
         frees = [r for r in records if r["api"].startswith("cuMemFree")]
         self.assertGreaterEqual(len(frees), 3)
 
+    def test_launch_only_without_attribution(self):
+        summary_name = _fresh_output_path(self)
+        proc, records = self._trace_demo(
+            "--trace", "launch", "--no-attribution", "--stats",
+            "--summary-output", summary_name,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("vec_add ok", proc.stdout)
+        self.assertTrue(records, "no launch records captured")
+        self.assertEqual({record["api"] for record in records},
+                         {"cuLaunchKernel"})
+        self.assertTrue(all(record["function"] is None for record in records))
+        self.assertTrue(all(record["file"] is None for record in records))
+        self.assertTrue(all(record["line"] is None for record in records))
+        self.assertEqual(records[0]["kernel"], "vec_add")
+        self.assertIn("metagross: stats", proc.stderr)
+        with open(summary_name) as handle:
+            summary = json.load(handle)
+        self.assertEqual(summary["schema_version"], 1)
+        self.assertTrue(summary["complete"])
+        self.assertEqual(summary["capture"]["events"], len(records))
+        self.assertEqual(summary["capture"]["attributed"], 0)
+        self.assertEqual(summary["configuration"]["trace_families"], ["launch"])
+        self.assertFalse(summary["configuration"]["python_attribution"])
+        self.assertEqual(summary["target"]["exit_status"], 0)
+        self.assertEqual(summary["top_kernels"][0]["kernel"], "vec_add")
+
     def test_exit_status_forwarded(self):
         proc = subprocess.run(
             ["/usr/bin/python3", "-m", "metagross", "--project-root", "/tmp",
@@ -729,7 +1029,7 @@ class LiveTraceTest(unittest.TestCase):
              path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.assertIn("sleeping", proc.stdout.readline())
         proc.send_signal(2)  # SIGINT, as Ctrl-C would deliver
-        proc.wait(timeout=60)
+        proc.communicate(timeout=60)
         self.assertEqual(proc.returncode, 130)
 
     def test_no_bpf_programs_left_behind(self):

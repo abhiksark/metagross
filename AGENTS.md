@@ -53,6 +53,8 @@ Verification; user-visible/product changes also require Documentation and releas
   generated eBPF C source, BCC loading, probe attachment, and raw event structs.
 - `metagross/_profile.py`: profiling hook installed in the traced child and the
   binary profile-record codec read by the parent.
+- `metagross/_viewer.py`: unprivileged streaming JSONL model, summary loading,
+  terminal sanitization, and static visual trace rendering.
 - `metagross/_events.py`: profile/GPU stream joining, attribution, kernel-name and
   allocation tracking, detail enrichment, table rendering, and JSONL rendering.
 - `test_metagross.py`: unprivileged unit suite plus root/CUDA integration tests

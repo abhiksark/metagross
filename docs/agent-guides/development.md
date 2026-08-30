@@ -14,6 +14,8 @@ predictable, and diagnosable. Favor a boring core over clever tracing magic.
   resolution, eBPF C generation, BCC loading, probe attachment, and raw structs.
 - `metagross/_profile.py` owns the child-process Python profiler and binary
   profile record codec.
+- `metagross/_viewer.py` owns unprivileged trace-file parsing, bounded viewer
+  state, summary reconciliation, terminal sanitization, and static rendering.
 - `metagross/_events.py` owns stream joining, attribution, enrichment, allocation
   and kernel registries, and output rendering.
 - Keep examples lightweight. They should demonstrate behavior, not become test
@@ -28,6 +30,8 @@ predictable, and diagnosable. Favor a boring core over clever tracing magic.
 - Target scripts must resolve to regular `.py` files inside the project root.
 - `--ebpf` must work without root, BCC, CUDA, libcuda discovery, or an NVIDIA
   driver.
+- `view` must route before live-trace validation and work without root, BCC,
+  CUDA, libcuda discovery, or an NVIDIA driver.
 - Do not write Metagross diagnostics to stdout during normal tracing; stdout is
   target-owned. Trace output defaults to stderr unless `--output` is provided.
 

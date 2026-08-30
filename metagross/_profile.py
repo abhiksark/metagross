@@ -13,10 +13,16 @@ _HEADER = struct.Struct("<BIQIHH")
 _MAX_STR = 500
 
 
+def _encode_record_bytes(kind, tid, ts_ns, func_bytes, path_bytes,
+                         line) -> bytes:
+    return (_HEADER.pack(kind, tid, ts_ns, line, len(func_bytes), len(path_bytes))
+            + func_bytes + path_bytes)
+
+
 def encode_record(kind, tid, ts_ns, func, path, line) -> bytes:
-    fb = func.encode("utf-8", "replace")[:_MAX_STR]
-    pb = path.encode("utf-8", "replace")[:_MAX_STR]
-    return _HEADER.pack(kind, tid, ts_ns, line, len(fb), len(pb)) + fb + pb
+    func_bytes = func.encode("utf-8", "replace")[:_MAX_STR]
+    path_bytes = path.encode("utf-8", "replace")[:_MAX_STR]
+    return _encode_record_bytes(kind, tid, ts_ns, func_bytes, path_bytes, line)
 
 
 class RecordReader:
@@ -42,19 +48,56 @@ _EXCLUDED_PARTS = ("site-packages", "dist-packages")
 _SELF_DIR = os.path.dirname(os.path.realpath(__file__))
 
 
+class _ProjectClassifier:
+    """Cache project membership and static record fields for profile events."""
+
+    def __init__(self, project_root: str):
+        self.root = os.path.realpath(project_root)
+        self.root_prefix = (self.root if self.root.endswith(os.sep)
+                            else self.root + os.sep)
+        self._path_cache: dict[str, bool] = {}
+        self._code_cache: dict[object, tuple[bytes, bytes, int] | None] = {}
+
+    def includes(self, path: str) -> bool:
+        cached = self._path_cache.get(path)
+        if cached is not None:
+            return cached
+        real = os.path.realpath(path)
+        included = real.startswith(self.root_prefix)
+        if included and real.startswith(_SELF_DIR + os.sep):
+            included = False
+        if included:
+            relative = real[len(self.root_prefix):]
+            included = not any(
+                part in _EXCLUDED_PARTS for part in relative.split(os.sep)
+            )
+        self._path_cache[path] = included
+        return included
+
+    def metadata(self, code) -> tuple[bytes, bytes, int] | None:
+        try:
+            return self._code_cache[code]
+        except KeyError:
+            pass
+        if not self.includes(code.co_filename):
+            self._code_cache[code] = None
+            return None
+        metadata = (
+            code.co_name.encode("utf-8", "replace")[:_MAX_STR],
+            code.co_filename.encode("utf-8", "replace")[:_MAX_STR],
+            code.co_firstlineno,
+        )
+        self._code_cache[code] = metadata
+        return metadata
+
+
 def is_project_file(path: str, project_root: str) -> bool:
-    real = os.path.realpath(path)
-    root = os.path.realpath(project_root)
-    if not real.startswith(root + os.sep):
-        return False
-    if real.startswith(_SELF_DIR + os.sep):
-        return False
-    parts = real[len(root):].split(os.sep)
-    return not any(p in _EXCLUDED_PARTS for p in parts)
+    return _ProjectClassifier(project_root).includes(path)
 
 
 def install(write_fd: int, project_root: str) -> None:
     local = threading.local()
+    classifier = _ProjectClassifier(project_root)
 
     def hook(frame, event, arg):
         if event == "call":
@@ -63,15 +106,16 @@ def install(write_fd: int, project_root: str) -> None:
             kind = RETURN
         else:
             return
-        code = frame.f_code
-        if not is_project_file(code.co_filename, project_root):
+        metadata = classifier.metadata(frame.f_code)
+        if metadata is None:
             return
         tid = getattr(local, "tid", None)
         if tid is None:
             tid = local.tid = threading.get_native_id()
-        record = encode_record(kind, tid, time.monotonic_ns(),
-                               code.co_name, code.co_filename,
-                               code.co_firstlineno)
+        func_bytes, path_bytes, line = metadata
+        record = _encode_record_bytes(
+            kind, tid, time.monotonic_ns(), func_bytes, path_bytes, line
+        )
         try:
             os.write(write_fd, record)
         except OSError:

@@ -1,6 +1,7 @@
 # Metagross GPU Demo
 
-This demo illustrates how to drive the CUDA driver API directly via ctypes, launching a vector addition kernel on the GPU.
+This demo drives the CUDA driver API directly through `ctypes` and launches a
+vector-addition kernel on the GPU.
 
 ## Running the Demo
 
@@ -25,14 +26,25 @@ sudo /usr/bin/python3 -m metagross examples/gpu_demo.py
 - **run_integration.sh** (repository root) runs the root-gated live
   integration suite (`test_metagross.LiveTraceTest`) under sudo with
   `RUN_EBPF_INTEGRATION=1` set.
+- **docker/** contains a containerized Metagross + PyTorch environment with
+  tensor, CNN, ViT, decoder-only transformer, training, and multi-stage pipeline
+  workloads. See [`docker/README.md`](docker/README.md) for the required NVIDIA,
+  host-PID, and BPF flags.
 
 ## Function Overview
 
-The demo is structured into project functions that serve as integration test assertions:
+The demo is structured into project functions that serve as integration-test
+assertions:
 
-- **setup_gpu()** exercises `cuInit`, `cuDeviceGet`, and `cuCtxCreate_v2` to initialize the GPU and establish a CUDA context on device 0.
-- **load_kernel()** exercises `cuModuleLoadData` and `cuModuleGetFunction` to compile the embedded PTX code and extract the vec_add kernel function.
-- **upload()** exercises `cuMemAlloc_v2` and `cuMemcpyHtoD_v2` to allocate device memory and transfer input arrays (A=1.0, B=2.0) from host to GPU, plus allocate output buffer C.
-- **compute()** exercises `cuLaunchKernel` and `cuStreamSynchronize` to configure grid and thread blocks (grid = ceil(N/128), block = 128) and launch the kernel, waiting for completion.
-- **download_and_check()** exercises `cuMemcpyDtoH_v2` to transfer the output array from device back to host and validates that all elements are 3.0 (A+B).
-- **teardown()** exercises `cuMemFree_v2`, `cuModuleUnload`, and `cuCtxDestroy_v2` to release allocated device memory, unload the module, and destroy the CUDA context.
+- **setup_gpu()** exercises `cuInit`, `cuDeviceGet`, and `cuCtxCreate_v2` to
+  initialize the GPU and establish a CUDA context on device 0.
+- **load_kernel()** exercises `cuModuleLoadData` and `cuModuleGetFunction` to
+  compile the embedded PTX and obtain the `vec_add` kernel function.
+- **upload()** exercises `cuMemAlloc_v2` and `cuMemcpyHtoD_v2` to allocate device
+  memory and transfer inputs from host to GPU.
+- **compute()** exercises `cuLaunchKernel` and `cuStreamSynchronize` with a block
+  size of 128 and waits for completion.
+- **download_and_check()** exercises `cuMemcpyDtoH_v2` and verifies that every
+  output element is `3.0`.
+- **teardown()** exercises `cuMemFree_v2`, `cuModuleUnload`, and
+  `cuCtxDestroy_v2` to release resources.

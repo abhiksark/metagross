@@ -65,6 +65,9 @@ after shutdown.
   and cross-thread tests.
 - Rendering/schema changes: table snapshots/assertions, JSONL schema assertions,
   and README updates.
+- Viewer changes: unprivileged parser/model tests, bounded-state assertions,
+  control-character sanitization, deterministic width snapshots, and CLI routing
+  before root/BCC validation.
 
 ## Handoff expectations
 

@@ -47,6 +47,30 @@ APIS = [
 
 API_BY_ID = {a.api_id: a for a in APIS}
 
+_TRACE_CATEGORY_MAP = {
+    "launch": frozenset(("launch", "launch_ex", "register")),
+    "memory": frozenset(("alloc", "alloc_async", "free", "free_async")),
+    "copy": frozenset(("copy_h2d", "copy_d2h", "copy_d2d", "copy_generic")),
+    "sync": frozenset(("sync",)),
+}
+
+
+def select_apis(families: frozenset[str] | None = None) -> list[Api]:
+    """Return APIs needed by a user-visible capture-family selection.
+
+    ``None`` means all APIs. Kernel-name registration is an internal dependency
+    of launch capture and is therefore selected with the launch family.
+    """
+    if families is None:
+        return list(APIS)
+    unknown = families - _TRACE_CATEGORY_MAP.keys()
+    if unknown:
+        raise MetagrossError(f"unknown trace family: {sorted(unknown)[0]}")
+    categories = set()
+    for family in families:
+        categories.update(_TRACE_CATEGORY_MAP[family])
+    return [api for api in APIS if api.category in categories]
+
 
 @dataclasses.dataclass(frozen=True)
 class Attachment:
@@ -168,7 +192,7 @@ struct event_t {
 };
 
 BPF_HASH(inflight, u32, struct inflight_t);
-BPF_RINGBUF_OUTPUT(events, 256);
+BPF_RINGBUF_OUTPUT(events, 1024);
 BPF_ARRAY(counters, u64, 2);
 
 static __always_inline void bump(int idx) {
@@ -275,9 +299,10 @@ _EXIT_EXTRA = {
 }
 
 
-def build_source(target_tgid: int) -> str:
+def build_source(target_tgid: int, apis: list[Api] | None = None) -> str:
+    selected = APIS if apis is None else apis
     parts = [_HEADER]
-    for api in APIS:
+    for api in selected:
         exit_extra = _EXIT_EXTRA.get(api.category, "")
         if api.base in ("cuModuleGetFunction", "cuLibraryGetKernel"):
             exit_extra = _READ_OUT_AND_NAME

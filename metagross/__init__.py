@@ -6,6 +6,7 @@ import ctypes as ct
 import dataclasses
 import fcntl
 import io
+import json
 import os
 import pwd
 import runpy
@@ -32,6 +33,10 @@ class Config:
     output_path: str | None = None
     project_root: str = "."
     dump_ebpf: bool = False
+    show_stats: bool = False
+    summary_output_path: str | None = None
+    python_attribution: bool = True
+    trace_families: frozenset[str] | None = None
     script: str | None = None
     script_args: list[str] = dataclasses.field(default_factory=list)
 
@@ -45,12 +50,33 @@ class Credentials:
 
 
 _FINAL_DRAIN_TIMEOUT_S = 2.0
+_TRACE_FAMILIES = frozenset(("launch", "memory", "copy", "sync"))
 
 _USAGE = (
     "usage: sudo /usr/bin/python3 -m metagross [--json] [--output FILE]\n"
-    "           [--project-root DIR] script.py [script arguments...]\n"
-    "       /usr/bin/python3 -m metagross --ebpf\n"
+    "           [--stats] [--summary-output FILE] [--project-root DIR]\n"
+    "           [--trace FAMILIES] [--no-attribution]\n"
+    "           script.py [script arguments...]\n"
+    "       /usr/bin/python3 -m metagross [--trace FAMILIES] --ebpf\n"
+    "       /usr/bin/python3 -m metagross view --snapshot TRACE.jsonl\n"
 )
+
+
+def _parse_trace_families(value: str) -> frozenset[str] | None:
+    names = [name.strip() for name in value.split(",")]
+    if not names or any(not name for name in names):
+        raise UsageError("--trace requires a comma-separated family list")
+    selected = frozenset(names)
+    if "all" in selected:
+        if len(selected) != 1:
+            raise UsageError("--trace all cannot be combined with other families")
+        return None
+    unknown = selected - _TRACE_FAMILIES
+    if unknown:
+        supported = ", ".join(sorted(_TRACE_FAMILIES))
+        raise UsageError(
+            f"unknown trace family {sorted(unknown)[0]!r}; supported: {supported}")
+    return selected
 
 
 def parse_args(argv: list[str]) -> Config:
@@ -66,15 +92,23 @@ def parse_args(argv: list[str]) -> Config:
             cfg.json_output = True
         elif arg == "--ebpf":
             cfg.dump_ebpf = True
-        elif arg in ("--output", "--project-root"):
+        elif arg == "--stats":
+            cfg.show_stats = True
+        elif arg == "--no-attribution":
+            cfg.python_attribution = False
+        elif arg in ("--output", "--summary-output", "--project-root", "--trace"):
             if i + 1 >= len(argv):
                 raise UsageError(f"{arg} requires a value")
             value = argv[i + 1]
             i += 1
             if arg == "--output":
                 cfg.output_path = value
-            else:
+            elif arg == "--summary-output":
+                cfg.summary_output_path = value
+            elif arg == "--project-root":
                 cfg.project_root = value
+            else:
+                cfg.trace_families = _parse_trace_families(value)
         else:
             raise UsageError(f"unknown option: {arg}")
         i += 1
@@ -136,6 +170,14 @@ def open_trace_output(path: str, uid: int, gid: int):
     return os.fdopen(fd, "wb")
 
 
+def _validate_output_paths(output_path: str | None,
+                           summary_output_path: str | None) -> None:
+    if output_path is None or summary_output_path is None:
+        return
+    if os.path.realpath(output_path) == os.path.realpath(summary_output_path):
+        raise MetagrossError("trace output and summary output must be different files")
+
+
 def _validate_script(script: str, project_root: str) -> str:
     real = os.path.realpath(script)
     root = os.path.realpath(project_root)
@@ -165,7 +207,7 @@ def _exit_flushed(code: int) -> NoReturn:
 
 
 def _child_main(script, script_args, creds, barrier_r, profile_w,
-                project_root) -> NoReturn:
+                project_root, python_attribution) -> NoReturn:
     """Run post-fork in the traced child. Never returns to the caller."""
     from metagross import _profile
 
@@ -186,7 +228,8 @@ def _child_main(script, script_args, creds, barrier_r, profile_w,
         _exit_flushed(1)  # parent died before releasing the barrier
     os.close(barrier_r)
 
-    _profile.install(profile_w, project_root)
+    if python_attribution:
+        _profile.install(profile_w, project_root)
 
     sys.argv = [script, *script_args]
     sys.path[0] = os.path.dirname(script)
@@ -234,11 +277,23 @@ def run_live(cfg: Config) -> int:
     # 3. Clock anchor and the trace output stream. Renderer writes str;
     # open_trace_output returns a binary file, so the wrapper is mandatory.
     wall_minus_mono_ns = time.time_ns() - time.monotonic_ns()
+    _validate_output_paths(cfg.output_path, cfg.summary_output_path)
     if cfg.output_path:
         stream = io.TextIOWrapper(
             open_trace_output(cfg.output_path, uid, gid), encoding="utf-8")
     else:
         stream = sys.stderr
+    if cfg.summary_output_path:
+        try:
+            summary_stream = io.TextIOWrapper(
+                open_trace_output(cfg.summary_output_path, uid, gid),
+                encoding="utf-8")
+        except BaseException:
+            if stream is not sys.stderr:
+                stream.close()
+            raise
+    else:
+        summary_stream = None
 
     # 4. Pipes: profiling records (child -> parent) and the post-attach
     # barrier (parent -> child).
@@ -261,20 +316,24 @@ def run_live(cfg: Config) -> int:
         os.close(barrier_w)
         try:
             _child_main(script, cfg.script_args, creds, barrier_r, profile_w,
-                        cfg.project_root)
+                        cfg.project_root, cfg.python_attribution)
         except BaseException:
             traceback.print_exc()
         finally:
             _exit_flushed(1)
     os.close(profile_w)
     os.close(barrier_r)
+    os.set_blocking(profile_r, False)
 
     # 6. Attach probes filtered to the child's exact TGID.
     from metagross import _events, _profile
     try:
-        b = BPF(text=_bpf.build_source(pid))
+        selected_apis = _bpf.select_apis(cfg.trace_families)
+        b = BPF(text=_bpf.build_source(pid, selected_apis))
         resolver = _bpf.dlsym_resolver(lib_path)
-        attachments = _bpf.resolve_attachments(_bpf.APIS, resolver)
+        attachments = _bpf.resolve_attachments(selected_apis, resolver)
+        if not attachments:
+            raise MetagrossError("no symbols found for selected trace families")
         for att in attachments:
             b.attach_uprobe(name=lib_path, sym=att.symbol,
                             fn_name=f"enter_{att.api.base}", pid=pid)
@@ -300,17 +359,34 @@ def run_live(cfg: Config) -> int:
     # 8. Event loop: drain GPU events and profiling records, attribute,
     # render, and watch for the child's exit.
     joiner = _events.Joiner()
-    renderer = _events.Renderer(stream, cfg.json_output, wall_minus_mono_ns,
-                                pid, joiner)
+    renderer = _events.Renderer(
+        stream, cfg.json_output, wall_minus_mono_ns, pid
+    )
+    stats = (
+        _events.CaptureStats()
+        if cfg.show_stats or summary_stream is not None else None
+    )
     render_broken = False
+    trace_failed = False
 
     def _emit_all(events):
         nonlocal render_broken
-        for ev in events:
+        emitted = False
+        for event in events:
+            enriched = joiner.enrich(event)
+            if stats is not None:
+                stats.observe(enriched)
             if render_broken:
                 continue
             try:
-                renderer.emit(ev)
+                renderer.emit(enriched)
+                emitted = True
+            except MetagrossError as exc:
+                print(f"metagross: {exc}", file=sys.stderr)
+                render_broken = True
+        if emitted and not render_broken:
+            try:
+                renderer.flush()
             except MetagrossError as exc:
                 print(f"metagross: {exc}", file=sys.stderr)
                 render_broken = True
@@ -323,6 +399,21 @@ def run_live(cfg: Config) -> int:
     reader = _profile.RecordReader()
     selector = selectors.DefaultSelector()
     selector.register(profile_r, selectors.EVENT_READ)
+
+    def _read_available_profile_records(fd, max_reads=None):
+        """Drain profile data fairly; return True when the fd reaches EOF."""
+        reads = 0
+        while max_reads is None or reads < max_reads:
+            try:
+                data = os.read(fd, 65536)
+            except BlockingIOError:
+                return False
+            if not data:
+                return True
+            reads += 1
+            for rec in reader.feed(data):
+                joiner.on_profile_record(rec)
+        return False
 
     def _drain_profile(drain_to_eof=False):
         if drain_to_eof:
@@ -339,17 +430,13 @@ def run_live(cfg: Config) -> int:
                     break
                 ready = selector.select(remaining)
                 for key, _mask in ready:
-                    data = os.read(key.fd, 65536)
-                    if not data:
+                    if _read_available_profile_records(key.fd):
                         return  # EOF: pipe fully drained
-                    for rec in reader.feed(data):
-                        joiner.on_profile_record(rec)
             return
         for key, _mask in selector.select(0):
-            data = os.read(key.fd, 65536)
-            if data:
-                for rec in reader.feed(data):
-                    joiner.on_profile_record(rec)
+            # One MiB per loop matches the requested pipe capacity while
+            # returning promptly enough to keep draining the BPF ring.
+            _read_available_profile_records(key.fd, max_reads=16)
 
     def _reap_and_capture():
         """Ensure the child is dead and reaped; return its wait status."""
@@ -367,6 +454,8 @@ def run_live(cfg: Config) -> int:
     status = None
     interrupted = False
     reaped = False
+    lost = 0
+    dropped = 0
     try:
         renderer.header()
         while True:
@@ -416,28 +505,85 @@ def run_live(cfg: Config) -> int:
         if dropped:
             print(f"metagross: dropped {dropped} nested calls", file=sys.stderr)
     except Exception as exc:
+        trace_failed = True
         # Any unexpected failure here must not lose the target's exit
         # status: kill and reap the child so its status is captured, warn
         # once, and fall through to report that status below.
         status = _reap_and_capture()
         print(f"metagross: {exc}", file=sys.stderr)
     finally:
+        selector.close()
+        os.close(profile_r)
         b.cleanup()
         if stream is not sys.stderr:
             try:
                 stream.close()
             except OSError as exc:
+                render_broken = True
                 print(f"metagross: {exc}", file=sys.stderr)
 
     if status is None:
         status = _reap_and_capture()
 
+    target_exit_status = exit_status_from_wait(status)
+    if stats is not None:
+        summary = stats.snapshot(
+            lost_events=lost,
+            dropped_nested_calls=dropped,
+            observed_outstanding_bytes=joiner.allocs.total_bytes,
+            render_failed=render_broken,
+            trace_failed=trace_failed,
+        )
+        selected_families = (
+            _TRACE_FAMILIES if cfg.trace_families is None
+            else cfg.trace_families
+        )
+        summary["configuration"] = {
+            "trace_families": sorted(selected_families),
+            "python_attribution": cfg.python_attribution,
+            "attached_symbol_variants": len(attachments),
+            "attached_probes": len(attachments) * 2,
+        }
+        summary["target"] = {
+            "pid": pid,
+            "script": script,
+            "exit_status": target_exit_status,
+        }
+        if cfg.show_stats:
+            capture = summary["capture"]
+            print(
+                "metagross: stats "
+                f"events={capture['events']} "
+                f"attributed={capture['attributed']} "
+                f"unknown={capture['unknown_attribution']} "
+                f"errors={capture['cuda_errors']} "
+                f"lost={capture['lost_events']} "
+                f"dropped={capture['dropped_nested_calls']} "
+                f"complete={str(summary['complete']).lower()}",
+                file=sys.stderr,
+            )
+        if summary_stream is not None:
+            try:
+                json.dump(summary, summary_stream, indent=2, sort_keys=True)
+                summary_stream.write("\n")
+                summary_stream.flush()
+            except OSError as exc:
+                print(f"metagross: summary output failed: {exc}", file=sys.stderr)
+            finally:
+                try:
+                    summary_stream.close()
+                except OSError as exc:
+                    print(f"metagross: {exc}", file=sys.stderr)
+
     # 10. Forward the target's exit status.
-    return exit_status_from_wait(status)
+    return target_exit_status
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] == "view":
+        from metagross import _viewer
+        return _viewer.main(argv[1:])
     try:
         cfg = parse_args(argv)
     except UsageError as exc:
@@ -445,7 +591,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if cfg.dump_ebpf:
         from metagross import _bpf
-        print(_bpf.build_source(0))
+        print(_bpf.build_source(0, _bpf.select_apis(cfg.trace_families)))
         return 0
     # 11. Route to the live launcher; report tracer failures as exit 1.
     try:

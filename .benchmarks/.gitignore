@@ -1,0 +1,3 @@
+# Keep local, hardware-specific benchmark reports out of version control.
+*
+!.gitignore
