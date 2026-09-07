@@ -19,11 +19,12 @@ GPU, or an NVIDIA driver.
 Use focused tests while iterating:
 
 ```sh
-/usr/bin/python3 -m unittest -v test_metagross.ParseTest
-/usr/bin/python3 -m unittest -v test_metagross.RenderTest
-/usr/bin/python3 -m unittest -v test_metagross.JoinerTest
-/usr/bin/python3 -m unittest -v test_metagross.ProfileTest
-/usr/bin/python3 -m unittest -v test_metagross.BpfSourceTest
+/usr/bin/python3 -B -m unittest -v \
+  test_metagross.ParseArgsTest \
+  test_metagross.RendererTest \
+  test_metagross.DashboardPublisherTest \
+  test_viewer.WebDashboardTest \
+  test_viewer.ViewerRoutingTest
 ```
 
 If class names change, inspect `test_metagross.py` and run the closest affected
@@ -47,9 +48,60 @@ or:
 ```
 
 The live gate should exercise kernel launches, memory operations,
-synchronization, process credentials, output file handling, and eBPF cleanup.
-When `bpftool` is available, it should also verify no extra BPF program remains
-after shutdown.
+synchronization, process credentials, output file handling, direct dashboard
+delivery and startup rejection, and eBPF cleanup. When `bpftool` is available,
+it should also verify no extra BPF program remains after shutdown.
+
+## Direct Docker dashboard gate
+
+Rebuild the source-baked image. In the host terminal, generate one token and
+start the loopback-only receiver:
+
+```sh
+export METAGROSS_DASHBOARD_TOKEN="$(/usr/bin/python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+printf 'Copy this token into the Docker terminal: %s\n' "$METAGROSS_DASHBOARD_TOKEN"
+/usr/bin/python3 -B -m metagross view --web --receive --port 8765
+```
+
+In the Docker terminal, export the copied token, rebuild, and run:
+
+```sh
+docker build \
+  --build-arg TARGET_UID="$(id -u)" \
+  --build-arg TARGET_GID="$(id -g)" \
+  -f examples/docker/Dockerfile \
+  -t metagross-pytorch .
+
+docker run --rm \
+  --gpus all \
+  --privileged \
+  --pid=host \
+  --network host \
+  -e METAGROSS_DASHBOARD_TOKEN \
+  -v /lib/modules:/lib/modules:ro \
+  -v /usr/src:/usr/src:ro \
+  -v /sys/kernel/debug:/sys/kernel/debug \
+  -v /sys/kernel/tracing:/sys/kernel/tracing \
+  metagross-pytorch \
+  --dashboard-port 8765 \
+  --project-root /workspace/workloads \
+  /workspace/workloads/basic_tensor_ops.py
+```
+
+Do not mount `/traces` or pass output options for this gate. In a real browser,
+verify `WAITING → LIVE → COMPLETE`, timeline growth without reload, launch/copy/
+memory/sync events, attributed workload functions, target checksum stdout, and
+the container's target exit status. `--network host` removes Docker network
+isolation; `--pid=host` remains separately necessary for eBPF process identity.
+The receiver is ephemeral: stopping it loses state, and a new authorized run
+replaces the retained capture. Explicit `--output` and `--summary-output` remain
+the durable path.
+
+Also run two failures. A wrong token must return tracer failure before any
+target sentinel. Stopping the receiver during a longer workload must produce
+one prefixed controller warning without hanging or changing target stdout,
+stderr, or exit status. Restart the receiver with the correct token and run
+again to confirm replacement rather than count merging.
 
 ## What to test by change type
 
@@ -66,8 +118,10 @@ after shutdown.
 - Rendering/schema changes: table snapshots/assertions, JSONL schema assertions,
   and README updates.
 - Viewer changes: unprivileged parser/model tests, bounded-state assertions,
-  control-character sanitization, deterministic width snapshots, and CLI routing
-  before root/BCC validation.
+  control-character sanitization, deterministic width/height snapshots, CLI
+  routing before root/BCC validation, partial-line and rotation tests for live
+  modes, a pseudo-terminal smoke test for curses behavior, loopback HTTP/API
+  tests, and a real-browser layout check when practical.
 
 ## Handoff expectations
 

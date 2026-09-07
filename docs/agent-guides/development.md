@@ -16,8 +16,17 @@ predictable, and diagnosable. Favor a boring core over clever tracing magic.
   profile record codec.
 - `metagross/_viewer.py` owns unprivileged trace-file parsing, bounded viewer
   state, summary reconciliation, terminal sanitization, and static rendering.
+- `metagross/_follow.py` owns bounded incremental reads, partial JSONL records,
+  truncation/replacement detection, and final-summary watching.
+- `metagross/_tui.py` owns the standard-library curses dashboard, live overview
+  layout, refresh loop, and keyboard controls.
+- `metagross/_web.py` owns the loopback-only standard-library HTTP server,
+  bounded file and authenticated in-memory state, browser JSON payload, and
+  embedded static frontend.
+- `metagross/_publish.py` owns bounded ordered delivery from the privileged
+  controller to the local dashboard.
 - `metagross/_events.py` owns stream joining, attribution, enrichment, allocation
-  and kernel registries, and output rendering.
+  and kernel registries, canonical event records, and output rendering.
 - Keep examples lightweight. They should demonstrate behavior, not become test
   harnesses or product code.
 
@@ -44,9 +53,13 @@ predictable, and diagnosable. Favor a boring core over clever tracing magic.
 - Preserve `HOME`, `USER`, and `LOGNAME` for the dropped user.
 - Keep inherited profile pipe file descriptors close-on-exec.
 - Maintain the startup barrier: the child must not execute target code until the
-  parent has attached every required uprobe/uretprobe to the exact child PID.
+  parent has attached every required uprobe/uretprobe to the exact child PID and
+  any explicitly requested dashboard has acknowledged capture start.
 - Flush target stdout/stderr before child `os._exit`.
 - Broken trace pipes must not kill the target.
+- Pop `METAGROSS_DASHBOARD_TOKEN` before forking and defensively remove it again
+  in the child before target code runs. Never put it in diagnostics, URLs,
+  browser assets, API state, or response bodies.
 
 ## Output files
 
@@ -57,6 +70,30 @@ predictable, and diagnosable. Favor a boring core over clever tracing magic.
   non-symlink files owned by the invoking uid.
 - Reject directories, symlinks, device files, FIFOs, and files owned by another
   user.
+
+## Direct dashboard transport
+
+- `--dashboard-port` is the only producer opt-in. A token in the environment
+  alone must not enable network activity.
+- The privileged producer may connect only to numeric IPv4 `127.0.0.1` at the
+  validated port with `http.client`; do not add DNS, proxy, redirect,
+  non-loopback, or browser-token paths.
+- Keep JSON encoding and HTTP outside the trace loop. The trace loop may only
+  normalize an event and perform a nonblocking offer to a bounded FIFO.
+- Capture start is fail-closed while the target is behind the startup barrier.
+  Delivery loss after release is fail-open for the target, bounded for the
+  controller, declared in the HTTP-only summary, and must not change target
+  stdout, stderr, signals, or exit status.
+- The receiver remains bound to `127.0.0.1`, requires the matching bearer token,
+  validates complete bounded batches before one locked commit, and retains only
+  one in-memory capture. A new authorized start replaces the prior capture.
+- Docker direct delivery uses both `--network host` for loopback connectivity
+  and the independently required `--pid=host` for eBPF identity. Host networking
+  removes Docker network isolation, so this workflow is only for trusted local
+  containers.
+- Existing table, JSONL, summary-file, snapshot, follow, and file-backed web
+  paths remain independent. Direct delivery creates no durable file unless an
+  existing output option is explicitly supplied.
 
 ## eBPF and CUDA API changes
 

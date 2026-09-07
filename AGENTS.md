@@ -55,6 +55,10 @@ Verification; user-visible/product changes also require Documentation and releas
   binary profile-record codec read by the parent.
 - `metagross/_viewer.py`: unprivileged streaming JSONL model, summary loading,
   terminal sanitization, and static visual trace rendering.
+- `metagross/_follow.py`: bounded incremental JSONL following, partial-line
+  handling, trace replacement detection, and final-summary watching.
+- `metagross/_tui.py`: dependency-free curses live dashboard and terminal-sized
+  overview layout.
 - `metagross/_events.py`: profile/GPU stream joining, attribution, kernel-name and
   allocation tracking, detail enrichment, table rendering, and JSONL rendering.
 - `test_metagross.py`: unprivileged unit suite plus root/CUDA integration tests

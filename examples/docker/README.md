@@ -88,6 +88,58 @@ The elevated flags are important:
   clean up uprobe events. Omitting them can produce a successful trace followed
   by a cleanup failure.
 
+## Stream directly to the host browser dashboard
+
+This path sends normalized events directly to a loopback-only dashboard without
+creating a JSONL or summary file. Rebuild the image after source changes, then
+generate one token and start the receiver in the host terminal:
+
+```sh
+export METAGROSS_DASHBOARD_TOKEN="$(/usr/bin/python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+printf 'Copy this token into the Docker terminal: %s\n' "$METAGROSS_DASHBOARD_TOKEN"
+/usr/bin/python3 -B -m metagross view --web --receive --port 8765
+```
+
+Export the copied value as `METAGROSS_DASHBOARD_TOKEN` in the Docker terminal,
+then run:
+
+```sh
+docker run --rm \
+  --gpus all \
+  --privileged \
+  --pid=host \
+  --network host \
+  -e METAGROSS_DASHBOARD_TOKEN \
+  -v /lib/modules:/lib/modules:ro \
+  -v /usr/src:/usr/src:ro \
+  -v /sys/kernel/debug:/sys/kernel/debug \
+  -v /sys/kernel/tracing:/sys/kernel/tracing \
+  metagross-pytorch \
+  --dashboard-port 8765 \
+  --project-root /workspace/workloads \
+  /workspace/workloads/basic_tensor_ops.py
+```
+
+Do not mount `/traces` and do not pass `--output` or `--summary-output` for the
+fileless workflow. Open the printed host URL: it moves from `WAITING` to `LIVE`
+and then to a final status while the target checksum remains on container
+stdout.
+
+`--network host` is required because the privileged producer connects only to
+numeric `127.0.0.1`; it removes Docker network isolation. `--pid=host` remains
+separately required so the PID filtered by Metagross matches the TGID observed
+by host eBPF. Use these privileges and host namespaces only with trusted local
+code. The shared token is removed before the target script runs and is not
+available to browser JavaScript.
+
+Receiver state exists only in memory and is lost when the host dashboard stops.
+A new authorized container run replaces the retained capture rather than
+merging with it. Use the existing `--output` and `--summary-output` options, plus
+a host volume, when durable JSONL and summary files are required. Missing,
+wrong-token, or unreachable receivers fail the handshake before target
+execution. Losing the receiver after startup emits one controller warning,
+marks delivery incomplete, and preserves target stdout, stderr, and exit status.
+
 ## Run another workload
 
 Select any script from the table above:
@@ -135,8 +187,13 @@ quality or benchmark accuracy.
 
 ## Write JSONL to the host
 
+Use the image built with your host UID/GID in [Build](#build). The command below
+creates a private directory regardless of umask. For an existing `traces`
+directory, `mkdir` leaves permissions unchanged; run `chmod 700 traces` if you
+own it and intend to keep it private, or use a new directory and update the mount.
+
 ```sh
-mkdir -p traces
+mkdir -p -m 700 traces
 docker run --rm \
   --gpus all \
   --privileged \
@@ -157,7 +214,7 @@ Both files are created with mode `0600` and ownership matching the target
 UID/GID selected at image build time. The summary is a versioned JSON document;
 the event file retains the stable JSONL event schema.
 
-Render an unprivileged terminal dashboard from the host checkout:
+Render an unprivileged terminal snapshot from the host checkout:
 
 ```sh
 python3 -m metagross view \
@@ -165,8 +222,35 @@ python3 -m metagross view \
   traces/basic.jsonl
 ```
 
-The viewer only reads the saved files; it does not need Docker, root, BCC, CUDA,
-or access to the GPU after capture.
+Or start the live dashboard before running the Docker capture in another
+terminal. It waits if the event file does not exist yet:
+
+```sh
+python3 -m metagross view \
+  --follow --summary traces/basic-summary.json \
+  traces/basic.jsonl
+```
+
+For the responsive browser dashboard instead, run:
+
+```sh
+python3 -m metagross view \
+  --web --summary traces/basic-summary.json \
+  traces/basic.jsonl
+```
+
+Open the printed loopback URL in a browser. Use `--port PORT` when port 8765 is
+already occupied.
+
+Press `p` to pause file consumption and `q` to quit in the terminal dashboard.
+Follow mode needs an interactive terminal of at least 80 columns by 18 rows.
+The browser dashboard needs no TTY and provides a function-lane CUDA API
+timeline with search, family filters, zoom/pan, event selection, source details,
+Pause, and Refresh controls. Its timeline represents CPU-side API call timing,
+not GPU kernel execution. Both viewers only read the saved files; they do not
+need Docker, root, BCC, CUDA, or
+access to the GPU. The `traces/` directory is ignored by Git because traces can
+contain sensitive source paths and timing data.
 
 ## Run a workload without tracing
 
@@ -238,6 +322,11 @@ capture was incomplete.
   included.
 - `libcuda.so.1 not found`: verify the container is launched with NVIDIA GPU
   passthrough; the NVIDIA runtime supplies the host driver library.
+- Direct delivery returns HTTP 401 or fails before the workload starts: export
+  the same `METAGROSS_DASHBOARD_TOKEN` in both terminals and start the receiver
+  before the container.
+- Direct delivery cannot connect: include `--network host`, keep the receiver
+  port and `--dashboard-port` equal, and verify the host port is unused.
 
 Docker Desktop on macOS and Windows does not expose a native NVIDIA Linux driver
 and host eBPF environment suitable for this example.

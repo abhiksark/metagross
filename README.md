@@ -42,6 +42,53 @@ the NVIDIA Container Toolkit, host kernel headers and tracefs mounts,
 `--privileged`, and `--pid=host`. It is a local development example rather than
 an isolation boundary for untrusted code.
 
+#### Stream a Docker capture directly to the browser dashboard
+
+Direct delivery is fileless and ephemeral. In the host terminal, generate one
+secret and start the unprivileged, loopback-only receiver:
+
+```sh
+export METAGROSS_DASHBOARD_TOKEN="$(/usr/bin/python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+printf 'Copy this token into the Docker terminal: %s\n' "$METAGROSS_DASHBOARD_TOKEN"
+/usr/bin/python3 -B -m metagross view --web --receive --port 8765
+```
+
+After exporting the copied token in the Docker terminal, run the already-built
+example image:
+
+```sh
+docker run --rm \
+  --gpus all \
+  --privileged \
+  --pid=host \
+  --network host \
+  -e METAGROSS_DASHBOARD_TOKEN \
+  -v /lib/modules:/lib/modules:ro \
+  -v /usr/src:/usr/src:ro \
+  -v /sys/kernel/debug:/sys/kernel/debug \
+  -v /sys/kernel/tracing:/sys/kernel/tracing \
+  metagross-pytorch \
+  --dashboard-port 8765 \
+  --project-root /workspace/workloads \
+  /workspace/workloads/basic_tensor_ops.py
+```
+
+`--network host` makes the container's numeric `127.0.0.1` reach the host
+receiver and removes Docker's network-namespace isolation. It is separate from
+the still-required `--pid=host`, which keeps eBPF process identity consistent.
+Use both only with trusted local containers. The matching token is removed from
+the controller environment before the target starts and is never sent to the
+browser.
+
+No `/traces` mount, JSONL file, or summary file is needed. The dashboard starts
+at `WAITING`, changes to `LIVE`, and retains the completed capture in memory.
+Stopping the host dashboard loses that state; a new authorized run replaces it
+instead of merging counts. Add the existing `--output` and `--summary-output`
+options when a durable recording is required. An unavailable or unauthorized
+dashboard fails before target execution; a receiver lost after startup produces
+one controller warning, marks delivery incomplete, and does not replace the
+target's exit status.
+
 ## Usage
 
 Run the included demonstration from the repository root:
@@ -56,7 +103,7 @@ The complete interface is:
 sudo /usr/bin/python3 -m metagross \
   [--json] [--output FILE] [--stats] [--summary-output FILE] \
   [--project-root DIR] [--trace FAMILIES] [--no-attribution] \
-  script.py [script arguments...]
+  [--dashboard-port PORT] script.py [script arguments...]
 ```
 
 Metagross options must appear before the script. Everything after the script is
@@ -88,7 +135,18 @@ sudo /usr/bin/python3 -m metagross \
 
 New trace and summary files have mode `0600` and are owned by the invoking user.
 Metagross truncates an existing output only when it is a regular, non-symlink
-file owned by that user. Trace and summary output must use different paths.
+file owned by that user, verified through the opened file descriptor. Trace
+and summary outputs must refer to different files, including through hard links;
+both are validated before either existing file is truncated.
+
+Output parent directories must be owned by root or the invoking user. Symlinked
+parents and group- or other-writable non-sticky parents are rejected. Standard
+sticky directories such as `/tmp` are supported; use a private directory when
+working in a shared writable project directory. Ownership changes apply only
+to newly created open files, never to a replacement pathname. Another process
+with permission to rename your files can still move or unlink the capture;
+keep its directory private when stable paths matter.
+
 Under sudo, the controller retains the privileges needed for BPF while the
 target runs as the validated invoking user. Direct root execution runs the
 target as root and emits a warning.
@@ -182,11 +240,11 @@ failed. Unknown Python attribution does not by itself make capture incomplete.
 Allocation and byte totals describe successfully observed driver calls, not
 physical GPU usage or framework-level tensor allocations.
 
-### Visual trace snapshot
+### Visual trace viewer
 
-The unprivileged viewer streams an existing JSONL trace into a bounded in-memory
-model and prints a terminal dashboard. It does not import BCC, inspect libcuda,
-or require root, CUDA, or a GPU:
+The unprivileged viewer accepts saved JSONL files and authenticated direct
+captures. It does not import BCC, inspect libcuda, or require root, CUDA, or a
+GPU. Print a static terminal dashboard from a completed trace with:
 
 ```sh
 /usr/bin/python3 -m metagross view \
@@ -194,13 +252,63 @@ or require root, CUDA, or a GPU:
   /tmp/events.jsonl
 ```
 
-The snapshot shows capture health, attribution coverage, CUDA errors, CPU API and
-synchronization duration, copy and observed-memory totals, top APIs, functions,
-kernels, and recent events. Use `--width COLUMNS` to make output deterministic
-for CI or saved reports and `--recent N` to bound retained recent events. The
-viewer tolerates malformed lines when valid records remain, reports their count,
-sanitizes terminal control characters, and warns when summary and event counts
-differ. Interactive curses and live-follow modes are planned next.
+`--width COLUMNS` is snapshot-only, accepts 60 through 240, and makes output
+deterministic for CI or saved reports. `--recent N` bounds retained recent
+events in every viewer mode (maximum 10,000).
+
+To watch a trace while its target is running, start the dependency-free curses
+dashboard in an interactive terminal. The trace may not exist yet; the viewer
+waits for its creation:
+
+```sh
+/usr/bin/python3 -m metagross view \
+  --follow --summary /tmp/summary.json \
+  /tmp/events.jsonl
+```
+
+The live overview refreshes every 0.2 seconds and shows event rate, attribution,
+CUDA errors, CPU API and synchronization duration, copies, observed memory, top
+APIs/functions/kernels, and recent events. Press `p` to pause file consumption
+and `q` to exit. Both live dashboards honor `--refresh SECONDS`, which accepts
+values from 0.05 to 5.0. Follow mode requires an interactive terminal of at
+least 80 columns by 18 rows on both stdin and stdout; use `--snapshot` for
+redirected terminal output.
+
+Serve the same live model as a responsive browser dashboard:
+
+```sh
+/usr/bin/python3 -m metagross view \
+  --web --summary /tmp/summary.json \
+  /tmp/events.jsonl
+```
+
+Open the printed `http://127.0.0.1:8765/` URL. The server listens only on the
+local loopback interface, reads the trace and summary in a bounded background
+follower, and needs no TTY, root, BCC, CUDA, GPU, JavaScript packages, or
+external network access. Choose another port with `--port PORT`; use `--port 0`
+to let the OS select a free one. The timeline-first workspace groups CUDA driver
+API events by attributed project function and provides API/function/kernel
+search, API-family filters, 1x–16x zoom, drag-to-pan navigation, synchronized
+timeline and event-table selection, and a source/detail inspector. Compute-style
+summary sections retain allocation history and top APIs, functions, and kernels.
+Clipped timeline labels expose their full event summary on pointer hover or
+keyboard focus. Events View rows support Enter and Space selection; narrow
+layouts keep report and refresh controls visible while containing timeline and
+table scrolling within their panels.
+Timeline bars show observed CPU-side CUDA API call duration; they do not claim
+GPU kernel execution timing. Stop the server with Ctrl-C.
+
+The live status moves from `WAITING` to `LIVE`, then reconciles to `COMPLETE`,
+`INCOMPLETE`, or `MISMATCH` when the final summary appears. An empty summary
+file is pending while capture runs; a non-empty invalid summary produces a
+visible warning and is retried when it changes. Valid traces containing malformed
+lines retain the final status with a ` / MALFORMED` suffix.
+
+All viewer modes tolerate malformed lines when valid records remain, report
+their count, sanitize control characters, and bound line, summary, aggregate,
+and recent-event storage. The live terminal and browser modes hold partial JSONL
+records until their newline arrives and reset safely when the trace is truncated
+or replaced.
 
 ## Traced API table
 
@@ -281,6 +389,10 @@ Target exit statuses from 0 through 255 are preserved. A target signal returns
 dependency, privilege, probe, compile, attach, transport, or cleanup
 failures, and 2 for invalid command-line syntax. A broken trace output stops
 rendering but lets the target finish and preserves its status.
+For direct dashboard delivery, a failed startup handshake returns 1 without
+executing the target. A delivery failure after the startup barrier has released
+only warns and marks the in-memory capture incomplete; the target continues and
+its status remains authoritative.
 
 ## Verification
 

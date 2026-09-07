@@ -1,7 +1,9 @@
 # metagross/__init__.py
 """Metagross: eBPF GPU-call tracing for one Python script."""
+
 from __future__ import annotations
 
+import contextlib
 import ctypes as ct
 import dataclasses
 import fcntl
@@ -37,6 +39,7 @@ class Config:
     summary_output_path: str | None = None
     python_attribution: bool = True
     trace_families: frozenset[str] | None = None
+    dashboard_port: int | None = None
     script: str | None = None
     script_args: list[str] = dataclasses.field(default_factory=list)
 
@@ -56,9 +59,10 @@ _USAGE = (
     "usage: sudo /usr/bin/python3 -m metagross [--json] [--output FILE]\n"
     "           [--stats] [--summary-output FILE] [--project-root DIR]\n"
     "           [--trace FAMILIES] [--no-attribution]\n"
-    "           script.py [script arguments...]\n"
+    "           [--dashboard-port PORT] script.py [script arguments...]\n"
     "       /usr/bin/python3 -m metagross [--trace FAMILIES] --ebpf\n"
-    "       /usr/bin/python3 -m metagross view --snapshot TRACE.jsonl\n"
+    "       /usr/bin/python3 -m metagross view (--snapshot|--follow|--web) TRACE.jsonl\n"
+    "       /usr/bin/python3 -m metagross view --web --receive [--port PORT]\n"
 )
 
 
@@ -75,8 +79,18 @@ def _parse_trace_families(value: str) -> frozenset[str] | None:
     if unknown:
         supported = ", ".join(sorted(_TRACE_FAMILIES))
         raise UsageError(
-            f"unknown trace family {sorted(unknown)[0]!r}; supported: {supported}")
+            f"unknown trace family {sorted(unknown)[0]!r}; supported: {supported}"
+        )
     return selected
+
+def _parse_dashboard_port(value: str) -> int:
+    try:
+        port = int(value)
+    except ValueError:
+        raise UsageError("--dashboard-port must be an integer") from None
+    if not 1 <= port <= 65_535:
+        raise UsageError("--dashboard-port must be between 1 and 65535")
+    return port
 
 
 def parse_args(argv: list[str]) -> Config:
@@ -86,17 +100,25 @@ def parse_args(argv: list[str]) -> Config:
         arg = argv[i]
         if not arg.startswith("--"):
             cfg.script = arg
-            cfg.script_args = list(argv[i + 1:])
+            cfg.script_args = list(argv[i + 1 :])
             return cfg
         if arg == "--json":
             cfg.json_output = True
         elif arg == "--ebpf":
+            if cfg.dashboard_port is not None:
+                raise UsageError("--dashboard-port cannot be combined with --ebpf")
             cfg.dump_ebpf = True
         elif arg == "--stats":
             cfg.show_stats = True
         elif arg == "--no-attribution":
             cfg.python_attribution = False
-        elif arg in ("--output", "--summary-output", "--project-root", "--trace"):
+        elif arg in (
+            "--output",
+            "--summary-output",
+            "--project-root",
+            "--trace",
+            "--dashboard-port",
+        ):
             if i + 1 >= len(argv):
                 raise UsageError(f"{arg} requires a value")
             value = argv[i + 1]
@@ -107,8 +129,14 @@ def parse_args(argv: list[str]) -> Config:
                 cfg.summary_output_path = value
             elif arg == "--project-root":
                 cfg.project_root = value
-            else:
+            elif arg == "--trace":
                 cfg.trace_families = _parse_trace_families(value)
+            else:
+                if cfg.dump_ebpf:
+                    raise UsageError(
+                        "--dashboard-port cannot be combined with --ebpf"
+                    )
+                cfg.dashboard_port = _parse_dashboard_port(value)
         else:
             raise UsageError(f"unknown option: {arg}")
         i += 1
@@ -123,8 +151,9 @@ def validate_sudo(environ, invoker_lookup) -> Credentials | None:
     if not present:
         return None
     if len(present) != len(keys):
-        raise MetagrossError("incomplete sudo metadata: "
-                             + ", ".join(sorted(set(keys) - set(present))))
+        raise MetagrossError(
+            "incomplete sudo metadata: " + ", ".join(sorted(set(keys) - set(present)))
+        )
     try:
         uid, gid = int(environ["SUDO_UID"]), int(environ["SUDO_GID"])
     except ValueError as exc:
@@ -139,7 +168,8 @@ def validate_sudo(environ, invoker_lookup) -> Credentials | None:
     if pw.pw_uid != uid or pw.pw_gid != gid:
         raise MetagrossError(
             f"sudo metadata mismatch for {user!r}: "
-            f"env {uid}:{gid} vs passwd {pw.pw_uid}:{pw.pw_gid}")
+            f"env {uid}:{gid} vs passwd {pw.pw_uid}:{pw.pw_gid}"
+        )
     return Credentials(uid, gid, user, pw.pw_dir)
 
 
@@ -149,33 +179,119 @@ def exit_status_from_wait(status: int) -> int:
     return os.WEXITSTATUS(status)
 
 
-def open_trace_output(path: str, uid: int, gid: int):
+def _open_output_parent(path: str, uid: int) -> int:
+    """Pin an absolute output parent without traversing untrusted links or owners."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    fd = os.open(os.path.sep, flags)
     try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        os.chown(path, uid, gid)
-        return os.fdopen(fd, "wb")
-    except FileExistsError:
-        pass
-    except OSError as exc:
-        raise MetagrossError(f"cannot create output {path!r}: {exc}") from None
-    info = os.lstat(path)
-    if not stat.S_ISREG(info.st_mode):
-        raise MetagrossError(f"output {path!r} is not a regular file")
-    if info.st_uid != uid:
-        raise MetagrossError(f"output {path!r} is not owned by uid {uid}")
+        parent = os.path.dirname(path)
+        # The leading empty component validates the already-open root.
+        for component in parent.rstrip(os.path.sep).split(os.path.sep):
+            if component:
+                next_fd = os.open(component, flags, dir_fd=fd)
+                os.close(fd)
+                fd = next_fd
+            info = os.fstat(fd)
+            if info.st_uid not in (0, uid):
+                raise MetagrossError(f"output {path!r} has an untrusted parent owner")
+            if (info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                    and not info.st_mode & stat.S_ISVTX):
+                raise MetagrossError(
+                    f"output {path!r} has a writable non-sticky parent directory"
+                )
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def open_trace_output(path: str, uid: int, gid: int, *, truncate: bool = True):
+    """Open and validate the actual inode before any ownership or size change."""
+    parent_fd = path_fd = fd = None
     try:
-        fd = os.open(path, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
+        absolute_path = os.path.join(os.getcwd(), path)
+        name = os.path.basename(absolute_path)
+        if name in ("", os.curdir, os.pardir):
+            raise MetagrossError(f"output {path!r} must name a file")
+        parent_fd = _open_output_parent(absolute_path, uid)
+        flags = os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+        try:
+            fd = os.open(name, flags | os.O_CREAT | os.O_EXCL, 0o600,
+                         dir_fd=parent_fd)
+            created = True
+        except FileExistsError:
+            path_fd = os.open(name, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC,
+                              dir_fd=parent_fd)
+            info = os.fstat(path_fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise MetagrossError(f"output {path!r} is not a regular file")
+            if info.st_uid != uid:
+                raise MetagrossError(f"output {path!r} is not owned by uid {uid}")
+            # Reopen the pinned regular inode, even if its pathname changes.
+            fd = os.open(f"/proc/self/fd/{path_fd}", flags & ~os.O_NOFOLLOW)
+            created = False
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise MetagrossError(f"output {path!r} is not a regular file")
+        if created:
+            os.fchown(fd, uid, gid)
+        elif info.st_uid != uid:
+            raise MetagrossError(f"output {path!r} is not owned by uid {uid}")
+        if truncate:
+            os.ftruncate(fd, 0)
+        stream = os.fdopen(fd, "wb")
+        fd = None  # The stream owns the descriptor from this point on.
+        return stream
     except OSError as exc:
         raise MetagrossError(f"cannot open output {path!r}: {exc}") from None
-    return os.fdopen(fd, "wb")
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if path_fd is not None:
+            os.close(path_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
 
 
-def _validate_output_paths(output_path: str | None,
-                           summary_output_path: str | None) -> None:
+def _validate_output_paths(
+    output_path: str | None, summary_output_path: str | None
+) -> None:
     if output_path is None or summary_output_path is None:
         return
     if os.path.realpath(output_path) == os.path.realpath(summary_output_path):
         raise MetagrossError("trace output and summary output must be different files")
+
+
+def _open_output_streams(output_path, summary_output_path, uid, gid):
+    """Validate both sinks before truncation and transfer their open streams."""
+    _validate_output_paths(output_path, summary_output_path)
+    try:
+        with contextlib.ExitStack() as opened:
+            streams = []
+            for path in (output_path, summary_output_path):
+                if not path:
+                    streams.append(None)
+                    continue
+                binary = opened.enter_context(
+                    open_trace_output(path, uid, gid, truncate=False)
+                )
+                streams.append(opened.enter_context(
+                    io.TextIOWrapper(binary, encoding="utf-8")
+                ))
+            trace, summary = streams
+            if trace is not None and summary is not None:
+                if os.path.samestat(os.fstat(trace.fileno()),
+                                    os.fstat(summary.fileno())):
+                    raise MetagrossError(
+                        "trace output and summary output must be different files"
+                    )
+            for stream in streams:
+                if stream is not None:
+                    os.ftruncate(stream.fileno(), 0)
+            opened.pop_all()
+            return trace if trace is not None else sys.stderr, summary
+    except OSError as exc:
+        raise MetagrossError(f"cannot prepare output files: {exc}") from None
 
 
 def _validate_script(script: str, project_root: str) -> str:
@@ -191,7 +307,8 @@ def _validate_script(script: str, project_root: str) -> str:
     root_prefix = root if root.endswith(os.sep) else root + os.sep
     if not real.startswith(root_prefix):
         raise MetagrossError(
-            f"target {script!r} resolves outside project root {root!r}")
+            f"target {script!r} resolves outside project root {root!r}"
+        )
     return real
 
 
@@ -206,10 +323,12 @@ def _exit_flushed(code: int) -> NoReturn:
     os._exit(code)
 
 
-def _child_main(script, script_args, creds, barrier_r, profile_w,
-                project_root, python_attribution) -> NoReturn:
+def _child_main(
+    script, script_args, creds, barrier_r, profile_w, project_root, python_attribution
+) -> NoReturn:
     """Run post-fork in the traced child. Never returns to the caller."""
     from metagross import _profile
+    os.environ.pop("METAGROSS_DASHBOARD_TOKEN", None)
 
     if creds is not None:
         os.setgroups(os.getgrouplist(creds.user, creds.gid))
@@ -255,6 +374,15 @@ def run_live(cfg: Config) -> int:
     # 1. Root check; validate sudo metadata, or warn and run as root.
     if os.geteuid() != 0:
         raise MetagrossError("must run as root (use sudo)")
+    publisher = None
+    dashboard_token = None
+    if cfg.dashboard_port is not None:
+        from metagross import _publish
+
+        try:
+            dashboard_token = _publish.take_dashboard_token(os.environ)
+        except _publish.DashboardPublishError as exc:
+            raise MetagrossError(str(exc)) from None
     creds = validate_sudo(os.environ, pwd.getpwnam)
     if creds is None:
         print("metagross: running target as root", file=sys.stderr)
@@ -265,35 +393,21 @@ def run_live(cfg: Config) -> int:
     # 2. Validate the target, resolve libcuda, and load bcc (lazily, since
     # it is a privileged/optional dependency unneeded by unprivileged paths).
     from metagross import _bpf
+
     script = _validate_script(cfg.script, cfg.project_root)
     lib_path = _bpf.find_libcuda()
     try:
         from bcc import BPF
     except ImportError as exc:
         raise MetagrossError(
-            "bcc (BPF Compiler Collection) not available; "
-            f"install python3-bpfcc: {exc}") from None
+            f"bcc (BPF Compiler Collection) not available; install python3-bpfcc: {exc}"
+        ) from None
 
-    # 3. Clock anchor and the trace output stream. Renderer writes str;
-    # open_trace_output returns a binary file, so the wrapper is mandatory.
+    # 3. Validate both output inodes before truncating either existing file.
     wall_minus_mono_ns = time.time_ns() - time.monotonic_ns()
-    _validate_output_paths(cfg.output_path, cfg.summary_output_path)
-    if cfg.output_path:
-        stream = io.TextIOWrapper(
-            open_trace_output(cfg.output_path, uid, gid), encoding="utf-8")
-    else:
-        stream = sys.stderr
-    if cfg.summary_output_path:
-        try:
-            summary_stream = io.TextIOWrapper(
-                open_trace_output(cfg.summary_output_path, uid, gid),
-                encoding="utf-8")
-        except BaseException:
-            if stream is not sys.stderr:
-                stream.close()
-            raise
-    else:
-        summary_stream = None
+    stream, summary_stream = _open_output_streams(
+        cfg.output_path, cfg.summary_output_path, uid, gid
+    )
 
     # 4. Pipes: profiling records (child -> parent) and the post-attach
     # barrier (parent -> child).
@@ -315,8 +429,15 @@ def run_live(cfg: Config) -> int:
         os.close(profile_r)
         os.close(barrier_w)
         try:
-            _child_main(script, cfg.script_args, creds, barrier_r, profile_w,
-                        cfg.project_root, cfg.python_attribution)
+            _child_main(
+                script,
+                cfg.script_args,
+                creds,
+                barrier_r,
+                profile_w,
+                cfg.project_root,
+                cfg.python_attribution,
+            )
         except BaseException:
             traceback.print_exc()
         finally:
@@ -325,8 +446,43 @@ def run_live(cfg: Config) -> int:
     os.close(barrier_r)
     os.set_blocking(profile_r, False)
 
+    b = None
+
+    def _cleanup_before_release() -> None:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            os.waitpid(pid, 0)
+        except (ChildProcessError, OSError):
+            pass
+        for fd in (barrier_w, profile_r):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if b is not None:
+            try:
+                b.cleanup()
+            except BaseException:
+                pass
+        if publisher is not None:
+            publisher.close()
+        if summary_stream is not None:
+            try:
+                summary_stream.close()
+            except BaseException:
+                pass
+        if stream is not sys.stderr:
+            try:
+                stream.close()
+            except BaseException:
+                pass
+
     # 6. Attach probes filtered to the child's exact TGID.
     from metagross import _events, _profile
+
     try:
         selected_apis = _bpf.select_apis(cfg.trace_families)
         b = BPF(text=_bpf.build_source(pid, selected_apis))
@@ -335,39 +491,63 @@ def run_live(cfg: Config) -> int:
         if not attachments:
             raise MetagrossError("no symbols found for selected trace families")
         for att in attachments:
-            b.attach_uprobe(name=lib_path, sym=att.symbol,
-                            fn_name=f"enter_{att.api.base}", pid=pid)
-            b.attach_uretprobe(name=lib_path, sym=att.symbol,
-                               fn_name=f"exit_{att.api.base}", pid=pid)
-    except Exception as exc:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except OSError:
-            pass
-        os.waitpid(pid, 0)
-        os.close(barrier_w)
+            b.attach_uprobe(
+                name=lib_path, sym=att.symbol, fn_name=f"enter_{att.api.base}", pid=pid
+            )
+            b.attach_uretprobe(
+                name=lib_path, sym=att.symbol, fn_name=f"exit_{att.api.base}", pid=pid
+            )
+    except BaseException as exc:
+        _cleanup_before_release()
+        if isinstance(exc, KeyboardInterrupt):
+            raise
         raise MetagrossError(f"failed to attach probes: {exc}") from exc
 
-    # 7. Release the barrier; the child starts running the target script.
+    if cfg.dashboard_port is not None:
+        try:
+            publisher = _publish.DashboardPublisher(
+                cfg.dashboard_port,
+                dashboard_token,
+                os.path.basename(script),
+            )
+            publisher.start()
+        except BaseException as exc:
+            _cleanup_before_release()
+            if isinstance(exc, KeyboardInterrupt):
+                raise
+            raise MetagrossError(f"cannot start dashboard delivery: {exc}") from exc
+
+    # 7. Release the barrier only after probes and dashboard delivery are ready.
     try:
         os.write(barrier_w, b"\x01")
     except OSError:
-        os.waitpid(pid, 0)
+        if publisher is not None:
+            publisher.abort("target exited before tracing began")
+        _cleanup_before_release()
         raise MetagrossError("target exited before tracing began") from None
     os.close(barrier_w)
 
     # 8. Event loop: drain GPU events and profiling records, attribute,
     # render, and watch for the child's exit.
     joiner = _events.Joiner()
-    renderer = _events.Renderer(
-        stream, cfg.json_output, wall_minus_mono_ns, pid
-    )
+    renderer = _events.Renderer(stream, cfg.json_output, wall_minus_mono_ns, pid)
     stats = (
         _events.CaptureStats()
-        if cfg.show_stats or summary_stream is not None else None
+        if cfg.show_stats or summary_stream is not None or publisher is not None
+        else None
     )
     render_broken = False
     trace_failed = False
+    publisher_error_reported = False
+
+    def _report_publisher_error(message: str | None = None) -> None:
+        nonlocal publisher_error_reported
+        if publisher is None or publisher_error_reported:
+            return
+        error = message if message is not None else publisher.pop_error()
+        if error is not None:
+            print(f"metagross: {error}", file=sys.stderr)
+            publisher_error_reported = True
 
     def _emit_all(events):
         nonlocal render_broken
@@ -376,6 +556,17 @@ def run_live(cfg: Config) -> int:
             enriched = joiner.enrich(event)
             if stats is not None:
                 stats.observe(enriched)
+            if publisher is not None:
+                try:
+                    publisher.offer(
+                        _events.event_record(enriched, wall_minus_mono_ns, pid)
+                    )
+                except Exception as exc:
+                    publisher.drop_event(
+                        "dashboard event normalization failed: "
+                        f"{type(exc).__name__}"
+                    )
+                _report_publisher_error()
             if render_broken:
                 continue
             try:
@@ -500,8 +691,7 @@ def run_live(cfg: Config) -> int:
         lost = b["counters"][ct.c_int(0)].value
         dropped = b["counters"][ct.c_int(1)].value
         if lost:
-            print(f"metagross: lost {lost} events (ring buffer full)",
-                 file=sys.stderr)
+            print(f"metagross: lost {lost} events (ring buffer full)", file=sys.stderr)
         if dropped:
             print(f"metagross: dropped {dropped} nested calls", file=sys.stderr)
     except Exception as exc:
@@ -535,8 +725,7 @@ def run_live(cfg: Config) -> int:
             trace_failed=trace_failed,
         )
         selected_families = (
-            _TRACE_FAMILIES if cfg.trace_families is None
-            else cfg.trace_families
+            _TRACE_FAMILIES if cfg.trace_families is None else cfg.trace_families
         )
         summary["configuration"] = {
             "trace_families": sorted(selected_families),
@@ -574,6 +763,17 @@ def run_live(cfg: Config) -> int:
                     summary_stream.close()
                 except OSError as exc:
                     print(f"metagross: {exc}", file=sys.stderr)
+        if publisher is not None:
+            try:
+                result = publisher.finish(summary)
+                _report_publisher_error(result.error)
+            except Exception as exc:
+                publisher.abort("dashboard finalization failed")
+                _report_publisher_error(
+                    f"dashboard finalization failed: {type(exc).__name__}"
+                )
+            finally:
+                publisher.close()
 
     # 10. Forward the target's exit status.
     return target_exit_status
@@ -583,6 +783,7 @@ def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if argv and argv[0] == "view":
         from metagross import _viewer
+
         return _viewer.main(argv[1:])
     try:
         cfg = parse_args(argv)
@@ -591,6 +792,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if cfg.dump_ebpf:
         from metagross import _bpf
+
         print(_bpf.build_source(0, _bpf.select_apis(cfg.trace_families)))
         return 0
     # 11. Route to the live launcher; report tracer failures as exit 1.

@@ -393,6 +393,30 @@ _COLUMNS = (("TIME", 12), ("FUNCTION", 18), ("LOCATION", 20),
             ("API", 16), ("RET", 5), ("DURATION", 9))
 
 
+def event_record(
+    event: EnrichedEvent, wall_minus_mono_ns: int, pid: int
+) -> dict:
+    """Return the stable JSON event record shared by all machine sinks."""
+    kernel = event.kernel
+    if kernel is not None and kernel.startswith("kernel@"):
+        kernel = None
+    wall_ns = event.raw.ts + wall_minus_mono_ns
+    moment = datetime.datetime.fromtimestamp(wall_ns / 1e9).astimezone()
+    return {
+        "timestamp": moment.isoformat(),
+        "pid": pid,
+        "tid": event.raw.tid,
+        "function": event.frame.function if event.frame else None,
+        "file": event.frame.file if event.frame else None,
+        "line": event.frame.line if event.frame else None,
+        "api": event.api.base,
+        "kernel": kernel,
+        "return_code": event.raw.ret,
+        "duration_ns": event.raw.dur,
+        "details": event.details,
+    }
+
+
 class Renderer:
     def __init__(self, stream, json_output, wall_minus_mono_ns, pid):
         self.stream = stream
@@ -406,28 +430,13 @@ class Renderer:
             self.flush()
 
     def emit(self, ev: EnrichedEvent) -> None:
-        kernel, details = ev.kernel, ev.details
-        wall_ns = ev.raw.ts + self.wall_minus_mono_ns
-        moment = datetime.datetime.fromtimestamp(
-            wall_ns / 1e9).astimezone()
         if self.json_output:
-            if kernel is not None and kernel.startswith("kernel@"):
-                kernel = None
-            record = {
-                "timestamp": moment.isoformat(),
-                "pid": self.pid,
-                "tid": ev.raw.tid,
-                "function": ev.frame.function if ev.frame else None,
-                "file": ev.frame.file if ev.frame else None,
-                "line": ev.frame.line if ev.frame else None,
-                "api": ev.api.base,
-                "kernel": kernel,
-                "return_code": ev.raw.ret,
-                "duration_ns": ev.raw.dur,
-                "details": details,
-            }
+            record = event_record(ev, self.wall_minus_mono_ns, self.pid)
             self._write(_json.dumps(record, separators=(",", ":")) + "\n")
             return
+        kernel, details = ev.kernel, ev.details
+        wall_ns = ev.raw.ts + self.wall_minus_mono_ns
+        moment = datetime.datetime.fromtimestamp(wall_ns / 1e9).astimezone()
         if kernel is not None:
             details = {"kernel": kernel, **details}
             details.pop("function_handle", None)

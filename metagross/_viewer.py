@@ -1,5 +1,6 @@
 # metagross/_viewer.py
-"""Unprivileged streaming trace viewer and static terminal dashboard."""
+"""Unprivileged streaming trace model and terminal dashboards."""
+
 from __future__ import annotations
 
 import argparse
@@ -8,6 +9,7 @@ import dataclasses
 import json
 import os
 import shutil
+import stat
 import sys
 import unicodedata
 from pathlib import Path
@@ -22,6 +24,7 @@ _MAX_APIS = 512
 _MAX_FUNCTIONS = 4096
 _MAX_KERNELS = 4096
 _MAX_MEMORY_SAMPLES = 2000
+_MAX_RECENT = 10_000
 _DEFAULT_RECENT = 500
 
 
@@ -74,13 +77,14 @@ class TraceModel:
     last_timestamp: str | None = None
     summary: dict | None = None
     summary_mismatch: bool = False
+    summary_expected_events: int | None = None
 
     def __post_init__(self) -> None:
         self.recent: collections.deque[ViewerEvent] = collections.deque(
             maxlen=self.recent_limit
         )
-        self.memory_samples: collections.deque[tuple[str, int]] = (
-            collections.deque(maxlen=_MAX_MEMORY_SAMPLES)
+        self.memory_samples: collections.deque[tuple[str, int]] = collections.deque(
+            maxlen=_MAX_MEMORY_SAMPLES
         )
         self.apis: dict[str, Aggregate] = {}
         self.functions: dict[tuple[str, str, int], Aggregate] = {}
@@ -108,16 +112,20 @@ class TraceModel:
         if event.function is not None:
             function_key = (event.function, event.file or "", event.line or 0)
             self._group(
-                self.functions, function_key, _MAX_FUNCTIONS,
+                self.functions,
+                function_key,
+                _MAX_FUNCTIONS,
                 ("<other>", "", 0),
             ).observe(event)
         if event.kernel is not None:
-            self._group(
-                self.kernels, event.kernel, _MAX_KERNELS, "<other>"
-            ).observe(event)
+            self._group(self.kernels, event.kernel, _MAX_KERNELS, "<other>").observe(
+                event
+            )
 
         if event.api in (
-            "cuStreamSynchronize", "cuCtxSynchronize", "cuEventSynchronize"
+            "cuStreamSynchronize",
+            "cuCtxSynchronize",
+            "cuEventSynchronize",
         ):
             self.synchronization_duration_ns += event.duration_ns
         if event.api.startswith("cuMemcpy") and event.return_code == 0:
@@ -129,29 +137,52 @@ class TraceModel:
             self.observed_outstanding_bytes = gpu_total
             self.observed_peak_bytes = max(self.observed_peak_bytes, gpu_total)
             self.memory_samples.append((event.timestamp, gpu_total))
+        if self.summary_expected_events is not None:
+            self.summary_mismatch = self.summary_expected_events != self.events
+
+    def clear_summary(self) -> None:
+        self.summary = None
+        self.summary_expected_events = None
+        self.summary_mismatch = False
 
     def load_summary(self, summary: dict) -> None:
         if not isinstance(summary, dict):
             raise ViewerError("summary root must be a JSON object")
-        if summary.get("schema_version") != 1:
-            raise ViewerError(
-                f"unsupported summary schema: {summary.get('schema_version')!r}"
-            )
+        schema_version = summary.get("schema_version")
+        if not _is_int(schema_version) or schema_version != 1:
+            raise ViewerError(f"unsupported summary schema: {schema_version!r}")
         capture = summary.get("capture")
-        if not isinstance(capture, dict) or not _is_int(capture.get("events")):
-            raise ViewerError("summary capture.events must be an integer")
+        events = capture.get("events") if isinstance(capture, dict) else None
+        if not _is_int(events) or events < 0:
+            raise ViewerError("summary capture.events must be a non-negative integer")
+        delivery_dropped = capture.get("delivery_dropped", 0)
+        if (
+            not _is_int(delivery_dropped)
+            or delivery_dropped < 0
+            or delivery_dropped > events
+        ):
+            raise ViewerError(
+                "summary capture.delivery_dropped must be between zero and events"
+            )
         self.summary = summary
-        self.summary_mismatch = capture["events"] != self.events
+        self.summary_expected_events = events - delivery_dropped
+        self.summary_mismatch = self.summary_expected_events != self.events
 
     @property
     def status(self) -> str:
-        if self.malformed_lines:
-            return "MALFORMED"
-        if self.summary_mismatch:
-            return "MISMATCH"
         if self.summary is None:
-            return "EVENTS ONLY"
-        return "COMPLETE" if self.summary.get("complete") is True else "INCOMPLETE"
+            return "MALFORMED" if self.malformed_lines else "EVENTS ONLY"
+        if self.summary_mismatch:
+            status = "MISMATCH"
+        elif self.summary_capture("delivery_dropped") > 0:
+            status = "INCOMPLETE"
+        elif self.summary.get("complete") is True:
+            status = "COMPLETE"
+        else:
+            status = "INCOMPLETE"
+        if self.malformed_lines:
+            status += " / MALFORMED"
+        return status
 
     def summary_capture(self, name: str, default=0):
         if self.summary is None:
@@ -159,6 +190,30 @@ class TraceModel:
         capture = self.summary.get("capture", {})
         value = capture.get(name, default) if isinstance(capture, dict) else default
         return value if _is_int(value) or isinstance(value, bool) else default
+
+
+def live_status(
+    model: TraceModel,
+    *,
+    waiting: bool = False,
+    paused: bool = False,
+    summary_error: str | None = None,
+    error: str | None = None,
+) -> str:
+    """Return the shared status label for live terminal and web dashboards."""
+    if error:
+        return "ERROR"
+    if paused:
+        return "PAUSED"
+    if waiting:
+        return "WAITING"
+    if summary_error:
+        return "LIVE / SUMMARY ERROR"
+    if model.summary is not None:
+        return model.status
+    if model.malformed_lines:
+        return "LIVE / MALFORMED"
+    return "LIVE"
 
 
 def _is_int(value) -> bool:
@@ -240,41 +295,73 @@ def parse_event(record) -> ViewerEvent:
     )
 
 
+def observe_raw_line(model: TraceModel, raw: bytes) -> bool:
+    """Validate and aggregate one bounded JSONL record."""
+    try:
+        record = json.loads(raw.decode("utf-8"))
+        model.observe(parse_event(record))
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        model.malformed_lines += 1
+        return False
+    return True
+
+
+def _open_regular_binary(path: Path, label: str):
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError as exc:
+        raise ViewerError(f"cannot open {label} {str(path)!r}: {exc}") from None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ViewerError(f"{label} {str(path)!r} is not a regular file")
+        return os.fdopen(fd, "rb")
+    except ViewerError:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+    except OSError as exc:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise ViewerError(f"cannot open {label} {str(path)!r}: {exc}") from None
+
+
 def load_trace(path: Path, recent_limit: int = _DEFAULT_RECENT) -> TraceModel:
     model = TraceModel(recent_limit=recent_limit)
     try:
-        stream = path.open("rb")
+        with _open_regular_binary(path, "trace") as stream:
+            while True:
+                raw = stream.readline(_MAX_LINE_BYTES + 1)
+                if not raw:
+                    break
+                if len(raw) > _MAX_LINE_BYTES:
+                    if not raw.endswith(b"\n"):
+                        while raw and not raw.endswith(b"\n"):
+                            raw = stream.readline(_MAX_LINE_BYTES + 1)
+                    model.malformed_lines += 1
+                    continue
+                observe_raw_line(model, raw)
+    except ViewerError:
+        raise
     except OSError as exc:
-        raise ViewerError(f"cannot open trace {str(path)!r}: {exc}") from None
-    with stream:
-        while True:
-            raw = stream.readline(_MAX_LINE_BYTES + 1)
-            if not raw:
-                break
-            if len(raw) > _MAX_LINE_BYTES:
-                if not raw.endswith(b"\n"):
-                    while raw and not raw.endswith(b"\n"):
-                        raw = stream.readline(_MAX_LINE_BYTES + 1)
-                model.malformed_lines += 1
-                continue
-            try:
-                record = json.loads(raw.decode("utf-8"))
-                model.observe(parse_event(record))
-            except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
-                model.malformed_lines += 1
+        raise ViewerError(f"cannot read trace {str(path)!r}: {exc}") from None
     if model.events == 0 and model.malformed_lines:
-        raise ViewerError(
-            f"trace {str(path)!r} contains no valid event records"
-        )
+        raise ViewerError(f"trace {str(path)!r} contains no valid event records")
     return model
 
 
 def load_summary(path: Path) -> dict:
     try:
-        with path.open("rb") as stream:
+        with _open_regular_binary(path, "summary") as stream:
             raw = stream.read(_MAX_SUMMARY_BYTES + 1)
+    except ViewerError:
+        raise
     except OSError as exc:
-        raise ViewerError(f"cannot open summary {str(path)!r}: {exc}") from None
+        raise ViewerError(f"cannot read summary {str(path)!r}: {exc}") from None
     if len(raw) > _MAX_SUMMARY_BYTES:
         raise ViewerError(f"summary {str(path)!r} exceeds 4 MiB")
     try:
@@ -306,8 +393,24 @@ def _bytes(value: int) -> str:
 def _fit(value, width: int) -> str:
     text = sanitize_text(str(value))
     if len(text) > width:
-        return text[:max(0, width - 1)] + "~"
+        return text[: max(0, width - 1)] + "~"
     return text
+
+
+def _wrap_fields(fields: list[str], width: int) -> list[str]:
+    lines = []
+    current = ""
+    for field in fields:
+        fitted = _fit(field, width)
+        candidate = fitted if not current else f"{current}  {fitted}"
+        if current and len(candidate) > width:
+            lines.append(current)
+            current = fitted
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return lines
 
 
 def _heading(title: str, width: int) -> str:
@@ -318,9 +421,7 @@ def _heading(title: str, width: int) -> str:
 def _top(groups: dict, limit: int = 8):
     return sorted(
         groups.items(),
-        key=lambda item: (
-            -item[1].count, -item[1].total_duration_ns, item[0]
-        ),
+        key=lambda item: (-item[1].count, -item[1].total_duration_ns, item[0]),
     )[:limit]
 
 
@@ -344,36 +445,45 @@ def render_snapshot(model: TraceModel, width: int = 120) -> list[str]:
     )
     lost = model.summary_capture("lost_events")
     dropped = model.summary_capture("dropped_nested_calls")
-    lines.append(
-        _fit(
-            f"Events {model.events:,}  Attributed {attributed_percent:.1f}%  "
-            f"CUDA errors {model.cuda_errors:,}  Lost {lost}  Dropped {dropped}  "
-            f"Malformed {model.malformed_lines}",
+    lines.extend(
+        _wrap_fields(
+            [
+                f"Events {model.events:,}",
+                f"Attributed {attributed_percent:.1f}%",
+                f"CUDA errors {model.cuda_errors:,}",
+                f"Lost {lost}",
+                f"Dropped {dropped}",
+                f"Malformed {model.malformed_lines}",
+            ],
             width,
         )
     )
-    lines.append(
-        _fit(
-            f"CPU API {_duration(model.total_api_duration_ns)}  "
-            f"Synchronization {_duration(model.synchronization_duration_ns)}  "
-            f"Copied {_bytes(model.successful_copy_bytes)}  "
-            f"Peak observed {_bytes(model.observed_peak_bytes)}  "
-            f"Outstanding {_bytes(model.observed_outstanding_bytes)}",
+    lines.extend(
+        _wrap_fields(
+            [
+                f"CPU API {_duration(model.total_api_duration_ns)}",
+                f"Synchronization {_duration(model.synchronization_duration_ns)}",
+                f"Copied {_bytes(model.successful_copy_bytes)}",
+                f"Peak observed {_bytes(model.observed_peak_bytes)}",
+                f"Outstanding {_bytes(model.observed_outstanding_bytes)}",
+            ],
             width,
         )
     )
     if model.summary_mismatch and model.summary is not None:
         expected = model.summary["capture"]["events"]
-        lines.append(_fit(
-            f"WARNING: summary reports {expected} events but trace contains "
-            f"{model.events}", width
-        ))
+        lines.append(
+            _fit(
+                f"WARNING: summary reports {expected} events but trace contains "
+                f"{model.events}",
+                width,
+            )
+        )
 
     lines.extend(("", _heading("TOP APIS (CPU duration)", width)))
-    api_width = max(18, width - 45)
+    api_width = width - 41
     lines.append(
-        f"{'API':<{api_width}} {'CALLS':>8} {'ERRORS':>7} "
-        f"{'TOTAL':>12} {'MAX':>10}"
+        f"{'API':<{api_width}} {'CALLS':>8} {'ERRORS':>7} {'TOTAL':>12} {'MAX':>10}"
     )
     for api, aggregate in _top(model.apis):
         lines.append(
@@ -386,26 +496,27 @@ def render_snapshot(model: TraceModel, width: int = 120) -> list[str]:
         lines.append("<no events>")
 
     lines.extend(("", _heading("TOP FUNCTIONS", width)))
-    name_width = max(16, width - 55)
+    function_columns = width - 23
+    location_width = min(24, max(16, function_columns // 2))
+    name_width = function_columns - location_width
     lines.append(
-        f"{'FUNCTION':<{name_width}} {'LOCATION':<24} "
+        f"{'FUNCTION':<{name_width}} {'LOCATION':<{location_width}} "
         f"{'CALLS':>8} {'TOTAL CPU':>12}"
     )
     for (function, file, line), aggregate in _top(model.functions, 6):
         location = f"{os.path.basename(file)}:{line}" if file else "<unknown>"
         lines.append(
             f"{_fit(function, name_width):<{name_width}} "
-            f"{_fit(location, 24):<24} {aggregate.count:>8,} "
+            f"{_fit(location, location_width):<{location_width}} "
+            f"{aggregate.count:>8,} "
             f"{_duration(aggregate.total_duration_ns):>12}"
         )
     if not model.functions:
         lines.append("<no attributed functions>")
 
     lines.extend(("", _heading("TOP KERNELS", width)))
-    kernel_width = max(18, width - 33)
-    lines.append(
-        f"{'KERNEL':<{kernel_width}} {'LAUNCHES':>10} {'TOTAL CPU':>12}"
-    )
+    kernel_width = width - 24
+    lines.append(f"{'KERNEL':<{kernel_width}} {'LAUNCHES':>10} {'TOTAL CPU':>12}")
     for kernel, aggregate in _top(model.kernels, 6):
         lines.append(
             f"{_fit(kernel, kernel_width):<{kernel_width}} "
@@ -416,8 +527,9 @@ def render_snapshot(model: TraceModel, width: int = 120) -> list[str]:
         lines.append("<no resolved kernels>")
 
     lines.extend(("", _heading("RECENT EVENTS", width)))
-    function_width = 20
-    api_width = max(18, width - 59)
+    text_width = width - 31
+    function_width = max(12, text_width // 2)
+    api_width = text_width - function_width
     lines.append(
         f"{'TIME':<12} {'FUNCTION':<{function_width}} "
         f"{'API':<{api_width}} {'RET':>5} {'CPU':>10}"
@@ -449,19 +561,79 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _recent_limit(value: str) -> int:
+    parsed = _positive_int(value)
+    if parsed > _MAX_RECENT:
+        raise argparse.ArgumentTypeError(f"must not exceed {_MAX_RECENT}")
+    return parsed
+
+
+def _snapshot_width(value: str) -> int:
+    parsed = _positive_int(value)
+    if not 60 <= parsed <= 240:
+        raise argparse.ArgumentTypeError("must be between 60 and 240 columns")
+    return parsed
+
+
+def _refresh_interval(value: str) -> float:
+    parsed = float(value)
+    if not 0.05 <= parsed <= 5.0:
+        raise argparse.ArgumentTypeError("must be between 0.05 and 5.0 seconds")
+    return parsed
+
+
+def _web_port(value: str) -> int:
+    parsed = int(value)
+    if not 0 <= parsed <= 65_535:
+        raise argparse.ArgumentTypeError("must be between 0 and 65535")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = _ViewerParser(
         prog="python3 -m metagross view",
-        description="View a Metagross JSONL trace without root, BCC, or CUDA.",
+        description="View a Metagross trace without root, BCC, or CUDA.",
     )
-    parser.add_argument("trace", type=Path)
+    parser.add_argument("trace", nargs="?", type=Path)
     parser.add_argument("--summary", type=Path)
-    parser.add_argument(
-        "--snapshot", action="store_true",
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--snapshot",
+        action="store_true",
         help="print a static terminal dashboard and exit",
     )
-    parser.add_argument("--recent", type=_positive_int, default=_DEFAULT_RECENT)
-    parser.add_argument("--width", type=_positive_int)
+    mode.add_argument(
+        "--follow",
+        action="store_true",
+        help="open a live dashboard and wait for appended events",
+    )
+    mode.add_argument(
+        "--web",
+        action="store_true",
+        help="serve a live dashboard on the local loopback interface",
+    )
+    parser.add_argument(
+        "--receive",
+        action="store_true",
+        help="receive one authenticated in-memory capture for --web",
+    )
+    parser.add_argument("--recent", type=_recent_limit, default=_DEFAULT_RECENT)
+    parser.add_argument(
+        "--width",
+        type=_snapshot_width,
+        help="snapshot width in columns (60-240)",
+    )
+    parser.add_argument(
+        "--refresh",
+        type=_refresh_interval,
+        metavar="SECONDS",
+        help="live dashboard refresh interval (default: 0.2)",
+    )
+    parser.add_argument(
+        "--port",
+        type=_web_port,
+        help="web dashboard port (default: 8765; use 0 for any free port)",
+    )
     return parser
 
 
@@ -471,14 +643,94 @@ def main(argv: list[str] | None = None) -> int:
         args = parser.parse_args(argv)
     except SystemExit as exc:
         return int(exc.code)
-    if not args.snapshot:
+    if args.receive and not args.web:
         parser.print_usage(sys.stderr)
         print(
-            "metagross view: interactive mode is not available yet; "
-            "use --snapshot",
+            "metagross view: --receive is only valid with --web",
             file=sys.stderr,
         )
         return 2
+    if not (args.snapshot or args.follow or args.web):
+        parser.print_usage(sys.stderr)
+        print(
+            "metagross view: choose --snapshot, --follow, or --web",
+            file=sys.stderr,
+        )
+        return 2
+    if args.receive and args.trace is not None:
+        parser.print_usage(sys.stderr)
+        print(
+            "metagross view: TRACE is not valid with --receive",
+            file=sys.stderr,
+        )
+        return 2
+    if args.receive and args.summary is not None:
+        parser.print_usage(sys.stderr)
+        print(
+            "metagross view: --summary is not valid with --receive",
+            file=sys.stderr,
+        )
+        return 2
+    if not args.receive and args.trace is None:
+        parser.print_usage(sys.stderr)
+        print("metagross view: TRACE is required", file=sys.stderr)
+        return 2
+    if not args.snapshot and args.width is not None:
+        parser.print_usage(sys.stderr)
+        print(
+            "metagross view: --width is only valid with --snapshot",
+            file=sys.stderr,
+        )
+        return 2
+    if args.snapshot and args.refresh is not None:
+        parser.print_usage(sys.stderr)
+        print(
+            "metagross view: --refresh is only valid with --follow or --web",
+            file=sys.stderr,
+        )
+        return 2
+    if not args.web and args.port is not None:
+        parser.print_usage(sys.stderr)
+        print(
+            "metagross view: --port is only valid with --web",
+            file=sys.stderr,
+        )
+        return 2
+    if args.web:
+        from metagross import _web
+
+        refresh_seconds = 0.2 if args.refresh is None else args.refresh
+        port = _web._DEFAULT_PORT if args.port is None else args.port
+        if args.receive:
+            from metagross import _publish
+
+            try:
+                ingest_token = _publish.take_dashboard_token(os.environ)
+            except _publish.DashboardPublishError as exc:
+                print(f"metagross view: {exc}", file=sys.stderr)
+                return 2
+            return _web.run_web_dashboard(
+                None,
+                None,
+                args.recent,
+                refresh_seconds,
+                port,
+                ingest_token=ingest_token,
+            )
+        return _web.run_web_dashboard(
+            args.trace,
+            args.summary,
+            args.recent,
+            refresh_seconds,
+            port,
+        )
+    if args.follow:
+        from metagross import _tui
+
+        refresh_seconds = 0.2 if args.refresh is None else args.refresh
+        return _tui.run_follow_dashboard(
+            args.trace, args.summary, args.recent, refresh_seconds
+        )
     try:
         model = load_trace(args.trace, recent_limit=args.recent)
         if args.summary is not None:

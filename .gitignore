@@ -3,5 +3,8 @@ __pycache__/
 *.pyc
 .ruff_cache/
 
+# Local trace artifacts can contain source paths and timing data
+traces/
+
 # SDD workspace
 .superpowers/

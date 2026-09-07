@@ -4,14 +4,19 @@ import collections
 import contextlib
 import io
 import json
+import http.server
 import os
 import runpy
 import shutil
 import stat
+import socket
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
+import threading
+import time
 
 import metagross
 from metagross import (Config, Credentials, MetagrossError, UsageError,
@@ -21,6 +26,8 @@ from metagross import (Config, Credentials, MetagrossError, UsageError,
 from metagross import _bpf
 from metagross import _events
 from metagross import _profile
+from metagross import _publish
+from metagross import _web
 
 
 INTEGRATION = os.environ.get("RUN_EBPF_INTEGRATION") == "1"
@@ -231,6 +238,26 @@ class ParseArgsTest(unittest.TestCase):
         self.assertTrue(cfg.show_stats)
         self.assertEqual(cfg.summary_output_path, "/tmp/summary.json")
 
+    def test_dashboard_port_and_target_argument_boundary(self) -> None:
+        cfg = parse_args(
+            ["--dashboard-port", "8765", "script.py", "--dashboard-port", "7"]
+        )
+        self.assertEqual(cfg.dashboard_port, 8765)
+        self.assertEqual(cfg.script_args, ["--dashboard-port", "7"])
+
+    def test_dashboard_port_rejects_bounds_and_ebpf(self) -> None:
+        for value in ("0", "65536", "not-a-port"):
+            with self.subTest(value=value), self.assertRaises(UsageError):
+                parse_args(["--dashboard-port", value, "script.py"])
+        for argv in (
+            ["--ebpf", "--dashboard-port", "8765"],
+            ["--dashboard-port", "8765", "--ebpf"],
+        ):
+            with self.subTest(argv=argv), self.assertRaisesRegex(
+                UsageError, "cannot be combined"
+            ):
+                parse_args(argv)
+
     def test_trace_all_uses_default_selection(self) -> None:
         cfg = parse_args(["--trace", "all", "script.py"])
         self.assertIsNone(cfg.trace_families)
@@ -244,7 +271,7 @@ class ParseArgsTest(unittest.TestCase):
             parse_args(["--trace", ",", "script.py"])
 
     def test_value_options_require_values(self) -> None:
-        for option in ("--trace", "--summary-output"):
+        for option in ("--trace", "--summary-output", "--dashboard-port"):
             with self.subTest(option=option):
                 with self.assertRaisesRegex(UsageError, "requires a value"):
                     parse_args([option])
@@ -388,6 +415,37 @@ class OutputSafetyTest(unittest.TestCase):
         with open(path, "rb") as f:
             self.assertEqual(f.read(), b"n")
 
+    def test_invalid_final_path_components_preserve_file(self):
+        path = self._path("trace")
+        for suffix in ("/", "/.", "/.."):
+            with self.subTest(suffix=suffix):
+                with open(path, "wb") as handle:
+                    handle.write(b"keep this capture")
+                with self.assertRaises(MetagrossError):
+                    with open_trace_output(path + suffix, self.uid, self.gid):
+                        pass
+                with open(path, "rb") as handle:
+                    self.assertEqual(handle.read(), b"keep this capture")
+
+    def test_symlink_parent_before_dot_dot_preserves_both_destinations(self):
+        directory, elsewhere = self._path("directory"), self._path("elsewhere")
+        for parent in (directory, elsewhere, os.path.join(elsewhere, "child")):
+            os.mkdir(parent, 0o700)
+        link = os.path.join(directory, "link")
+        os.symlink(os.path.join(elsewhere, "child"), link)
+        destinations = (os.path.join(directory, "trace"),
+                        os.path.join(elsewhere, "trace"))
+        for destination in destinations:
+            with open(destination, "wb") as handle:
+                handle.write(b"keep this capture")
+        path = os.path.join(link, "..", "trace")
+        with self.assertRaises(MetagrossError):
+            with open_trace_output(path, self.uid, self.gid):
+                pass
+        for destination in destinations:
+            with open(destination, "rb") as handle:
+                self.assertEqual(handle.read(), b"keep this capture")
+
     def test_symlink_rejected(self):
         target = self._path("real")
         open(target, "wb").close()
@@ -411,6 +469,317 @@ class OutputSafetyTest(unittest.TestCase):
         with self.assertRaisesRegex(MetagrossError, "must be different"):
             _validate_output_paths(trace, os.path.join(self.dir.name, ".", "trace.jsonl"))
         _validate_output_paths(trace, self._path("summary.json"))
+
+    def test_replaced_inode_is_validated_before_truncation(self):
+        path = self._path("out.jsonl")
+        victim = self._path("protected")
+        with open(path, "wb") as handle:
+            handle.write(b"old trace")
+        with open(victim, "wb") as handle:
+            handle.write(b"protected content")
+        victim_inode = os.stat(victim).st_ino
+        real_open, real_fstat = os.open, os.fstat
+        writable_opens = []
+
+        def replace_before_open(name, flags, *args, **kwargs):
+            if flags & (os.O_PATH | os.O_WRONLY) and not flags & os.O_CREAT:
+                os.replace(victim, path)
+            fd = real_open(name, flags, *args, **kwargs)
+            if flags & os.O_WRONLY:
+                writable_opens.append(name)
+            return fd
+
+        def foreign_owner(fd):
+            info = real_fstat(fd)
+            if info.st_ino == victim_inode:
+                values = list(info)
+                values[4] = self.uid + 1
+                return os.stat_result(values)
+            return info
+
+        # Only ownership needs a stand-in in this unprivileged test. The
+        # pathname replacement, opened inode, and file contents are real.
+        with mock.patch("metagross.os.open", side_effect=replace_before_open), \
+                mock.patch("metagross.os.fstat", side_effect=foreign_owner):
+            with self.assertRaisesRegex(MetagrossError, "not owned by uid"):
+                with open_trace_output(path, self.uid, self.gid):
+                    pass
+        self.assertEqual(writable_opens, [])
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read(), b"protected content")
+
+    def test_character_device_is_rejected_before_any_writable_open(self):
+        real_open = os.open
+        writable_opens = []
+
+        def record_open(name, flags, *args, **kwargs):
+            fd = real_open(name, flags, *args, **kwargs)
+            if flags & os.O_ACCMODE in (os.O_WRONLY, os.O_RDWR):
+                writable_opens.append(name)
+            return fd
+
+        with mock.patch("metagross.os.open", side_effect=record_open):
+            with self.assertRaisesRegex(MetagrossError, "not a regular file"):
+                with open_trace_output("/dev/null", self.uid, self.gid):
+                    pass
+        self.assertEqual(writable_opens, [])
+
+    def test_existing_file_reopen_failure_closes_descriptors(self):
+        path = self._path("trace")
+        with open(path, "wb") as handle:
+            handle.write(b"keep this capture")
+        real_open = os.open
+        descriptors = []
+
+        def fail_reopen(name, flags, *args, **kwargs):
+            if str(name).startswith("/proc/self/fd/"):
+                raise OSError("injected reopen failure")
+            fd = real_open(name, flags, *args, **kwargs)
+            descriptors.append(fd)
+            return fd
+
+        with mock.patch("metagross.os.open", side_effect=fail_reopen):
+            with self.assertRaisesRegex(MetagrossError, "injected reopen failure"):
+                with open_trace_output(path, self.uid, self.gid):
+                    pass
+        for fd in descriptors:
+            with self.assertRaises(OSError):
+                os.fstat(fd)
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read(), b"keep this capture")
+
+    def test_existing_file_reopen_keeps_the_pinned_inode(self):
+        path, moved = self._path("trace"), self._path("moved")
+        victim = self._path("protected")
+        with open(path, "wb") as handle:
+            handle.write(b"old trace")
+        with open(victim, "wb") as handle:
+            handle.write(b"protected content")
+        real_open = os.open
+
+        def replace_before_reopen(name, flags, *args, **kwargs):
+            if flags & os.O_WRONLY and not flags & os.O_CREAT:
+                os.rename(path, moved)
+                os.replace(victim, path)
+            return real_open(name, flags, *args, **kwargs)
+
+        with mock.patch("metagross.os.open", side_effect=replace_before_reopen):
+            with open_trace_output(path, self.uid, self.gid) as handle:
+                handle.write(b"new trace")
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read(), b"protected content")
+        with open(moved, "rb") as handle:
+            self.assertEqual(handle.read(), b"new trace")
+
+    def test_output_failures_close_opened_descriptors(self):
+        real_open, real_fstat = os.open, os.fstat
+        for operation in ("fstat", "fchown", "ftruncate", "fdopen"):
+            with self.subTest(operation=operation):
+                path = self._path(operation)
+                descriptors = []
+
+                def record_open(*args, **kwargs):
+                    fd = real_open(*args, **kwargs)
+                    descriptors.append(fd)
+                    return fd
+
+                def fail_on_file(fd, *args, **kwargs):
+                    if stat.S_ISDIR(real_fstat(fd).st_mode):
+                        return real_fstat(fd)
+                    raise OSError("injected output failure")
+
+                with mock.patch("metagross.os.open", side_effect=record_open), \
+                        mock.patch("metagross.os." + operation,
+                                   side_effect=fail_on_file):
+                    with self.assertRaises(MetagrossError):
+                        with open_trace_output(path, self.uid, self.gid):
+                            pass
+                for fd in descriptors:
+                    with self.assertRaises(OSError):
+                        real_fstat(fd)
+
+    def test_unsafe_parent_directories_are_rejected(self):
+        directory = self._path("directory")
+        os.mkdir(directory)
+        alias = self._path("alias")
+        os.symlink(directory, alias)
+        with self.assertRaises(MetagrossError):
+            with open_trace_output(os.path.join(alias, "trace"),
+                                   self.uid, self.gid):
+                pass
+        self.assertFalse(os.path.exists(os.path.join(directory, "trace")))
+        os.chmod(directory, 0o777)
+        with self.assertRaises(MetagrossError):
+            with open_trace_output(os.path.join(directory, "trace"),
+                                   self.uid, self.gid):
+                pass
+        self.assertFalse(os.path.exists(os.path.join(directory, "trace")))
+
+    def test_owned_sticky_parent_is_supported(self):
+        directory = self._path("sticky")
+        os.mkdir(directory)
+        os.chmod(directory, 0o1777)
+        path = os.path.join(directory, "trace")
+        with open_trace_output(path, self.uid, self.gid) as handle:
+            handle.write(b"trace")
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read(), b"trace")
+
+    def test_fifo_is_rejected_without_waiting_for_a_reader(self):
+        path = self._path("fifo")
+        os.mkfifo(path)
+        result = subprocess.run(
+            [sys.executable, "-B", "-c",
+             "import sys, metagross\n"
+             "try:\n"
+             "    metagross.open_trace_output(sys.argv[1], int(sys.argv[2]), "
+             "int(sys.argv[3]))\n"
+             "except metagross.MetagrossError as exc:\n"
+             "    assert 'not a regular file' in str(exc), str(exc)\n"
+             "    raise SystemExit(0)\n"
+             "raise SystemExit(1)\n", path, str(self.uid), str(self.gid)],
+            capture_output=True, text=True, timeout=5,
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_empty_output_paths_keep_the_default_streams(self):
+        for trace_name, summary_name in (("", None), (None, ""),
+                                         ("", "summary"), ("trace", "")):
+            with self.subTest(trace=trace_name, summary=summary_name):
+                trace = self._path(trace_name) if trace_name else trace_name
+                summary = self._path(summary_name) if summary_name else summary_name
+                with contextlib.ExitStack() as opened:
+                    stderr = opened.enter_context(
+                        contextlib.redirect_stderr(io.StringIO())
+                    )
+                    try:
+                        trace_stream, summary_stream = metagross._open_output_streams(
+                            trace, summary, self.uid, self.gid
+                        )
+                    except MetagrossError as exc:
+                        self.fail(f"empty output path must use the default: {exc}")
+                    if trace:
+                        opened.enter_context(trace_stream).write("trace")
+                    else:
+                        self.assertIs(trace_stream, stderr)
+                    if summary:
+                        opened.enter_context(summary_stream).write("summary")
+                    else:
+                        self.assertIsNone(summary_stream)
+                for path, expected in ((trace, "trace"), (summary, "summary")):
+                    if path:
+                        with open(path, encoding="utf-8") as handle:
+                            self.assertEqual(handle.read(), expected)
+
+    def _run_with_outputs(self, trace, summary, expected_error):
+        cfg = Config(script=__file__, project_root=os.path.dirname(__file__),
+                     output_path=trace, summary_output_path=summary)
+        creds = Credentials(self.uid, self.gid, "fixture", self.dir.name)
+        with mock.patch("metagross.os.geteuid", return_value=0), \
+                mock.patch("metagross.validate_sudo", return_value=creds), \
+                mock.patch("metagross._bpf.find_libcuda", return_value="/unused"), \
+                mock.patch.dict("sys.modules", {"bcc": mock.Mock(BPF=object)}), \
+                mock.patch("metagross.os.fork",
+                           side_effect=AssertionError("target must not start")):
+            with self.assertRaisesRegex(MetagrossError, expected_error):
+                metagross.run_live(cfg)
+
+    def test_hard_linked_outputs_are_rejected_without_truncation(self):
+        trace, summary = self._path("trace"), self._path("summary")
+        with open(trace, "wb") as handle:
+            handle.write(b"keep this capture")
+        os.link(trace, summary)
+        self._run_with_outputs(trace, summary, "must be different files")
+        with open(trace, "rb") as handle:
+            self.assertEqual(handle.read(), b"keep this capture")
+
+    def test_output_alias_introduced_during_open_is_rejected(self):
+        trace, summary = self._path("trace"), self._path("summary")
+        with open(trace, "wb") as handle:
+            handle.write(b"keep this capture")
+        real_open_output = open_trace_output
+
+        def alias_summary(path, *args, **kwargs):
+            if path == summary:
+                os.link(trace, summary)
+            return real_open_output(path, *args, **kwargs)
+
+        with mock.patch("metagross.open_trace_output", side_effect=alias_summary):
+            self._run_with_outputs(trace, summary, "must be different files")
+        with open(trace, "rb") as handle:
+            self.assertEqual(handle.read(), b"keep this capture")
+
+    def test_invalid_summary_preserves_existing_trace(self):
+        trace = self._path("trace")
+        with open(trace, "wb") as handle:
+            handle.write(b"keep this capture")
+        self._run_with_outputs(trace, self.dir.name,
+                               "not a regular file|Is a directory")
+        with open(trace, "rb") as handle:
+            self.assertEqual(handle.read(), b"keep this capture")
+
+    @unittest.skipUnless(os.geteuid() == 0, "needs root for real output ownership")
+    def test_real_foreign_inode_swap_preserves_contents(self):
+        trace, victim = self._path("trace"), self._path("protected")
+        with open(trace, "wb") as handle:
+            handle.write(b"old trace")
+        os.chown(trace, 1000, 1000)
+        with open(victim, "wb") as handle:
+            handle.write(b"protected content")
+        os.chmod(victim, 0o600)
+        real_open = os.open
+
+        def replace_before_open(name, flags, *args, **kwargs):
+            if flags & (os.O_PATH | os.O_WRONLY) and not flags & os.O_CREAT:
+                os.replace(victim, trace)
+            return real_open(name, flags, *args, **kwargs)
+
+        with mock.patch("metagross.os.open", side_effect=replace_before_open):
+            with self.assertRaises(MetagrossError):
+                with open_trace_output(trace, 1000, 1000):
+                    pass
+        self.assertEqual(os.stat(trace).st_uid, 0)
+        with open(trace, "rb") as handle:
+            self.assertEqual(handle.read(), b"protected content")
+
+    @unittest.skipUnless(os.geteuid() == 0, "needs root for real output ownership")
+    def test_new_file_chown_cannot_follow_a_replacement_symlink(self):
+        trace, moved = self._path("trace"), self._path("moved")
+        victim = self._path("protected")
+        with open(victim, "wb") as handle:
+            handle.write(b"protected content")
+        os.chmod(victim, 0o600)
+        real_open = os.open
+
+        def replace_after_create(name, flags, *args, **kwargs):
+            fd = real_open(name, flags, *args, **kwargs)
+            if flags & os.O_CREAT:
+                os.rename(trace, moved)
+                os.symlink(victim, trace)
+            return fd
+
+        with mock.patch("metagross.os.open", side_effect=replace_after_create):
+            with open_trace_output(trace, 1000, 1000) as handle:
+                handle.write(b"new trace")
+        self.assertEqual((os.stat(victim).st_uid, os.stat(victim).st_gid), (0, 0))
+        self.assertEqual((os.stat(moved).st_uid, os.stat(moved).st_gid), (1000, 1000))
+        self.assertEqual(stat.S_IMODE(os.stat(moved).st_mode), 0o600)
+        with open(victim, "rb") as handle:
+            self.assertEqual(handle.read(), b"protected content")
+        with open(moved, "rb") as handle:
+            self.assertEqual(handle.read(), b"new trace")
+
+    @unittest.skipUnless(os.geteuid() == 0, "needs root for real output ownership")
+    def test_foreign_owned_parent_is_rejected(self):
+        directory = self._path("foreign")
+        os.mkdir(directory)
+        os.chown(directory, 2000, 2000)
+        path = os.path.join(directory, "trace")
+        with self.assertRaises(MetagrossError):
+            with open_trace_output(path, 1000, 1000):
+                pass
+        self.assertFalse(os.path.exists(path))
 
 
 class SymbolResolutionTest(unittest.TestCase):
@@ -792,6 +1161,17 @@ class RendererTest(unittest.TestCase):
         self.assertEqual(rec["tid"], 5)
         self.assertEqual(rec["duration_ns"], 20_000)
         self.assertEqual(rec["details"]["grid"], "256,1,1")
+        joiner = _events.Joiner()
+        joiner.registry.observe(
+            _bpf.API_BY_ID[18],
+            _raw(18, out=0xF00, name=b"vec_add"),
+        )
+        canonical = _events.event_record(
+            joiner.enrich(ev),
+            wall_minus_mono_ns=0,
+            pid=1234,
+        )
+        self.assertEqual(rec, canonical)
 
     def test_json_nulls_when_unknown(self):
         raw = _raw(16, ts=1, dur=1, tid=1)
@@ -821,6 +1201,600 @@ class RendererTest(unittest.TestCase):
         self.assertEqual(stream.flush_count, 0)
         renderer.flush()
         self.assertEqual(stream.flush_count, 1)
+
+
+class DashboardPublisherTest(unittest.TestCase):
+    TOKEN = "dashboard-token-" + ("x" * 32)
+
+    @staticmethod
+    def _record(**changes):
+        record = {
+            "timestamp": "2026-08-30T12:10:03.410000+00:00",
+            "pid": 1234,
+            "tid": 1234,
+            "function": "compute",
+            "file": "/project/train.py",
+            "line": 10,
+            "api": "cuLaunchKernel",
+            "kernel": "vector_add",
+            "return_code": 0,
+            "duration_ns": 50_000,
+            "details": {"grid": "8,1,1"},
+        }
+        record.update(changes)
+        return record
+
+    @staticmethod
+    def _summary(events):
+        return {
+            "schema_version": 1,
+            "complete": True,
+            "capture": {
+                "events": events,
+                "lost_events": 0,
+                "dropped_nested_calls": 0,
+            },
+        }
+
+    def _start_ingest_server(self, token=None):
+        state = _web.IngestDashboardState(recent_limit=50, refresh_seconds=0.2)
+        server = _web._DashboardServer(
+            ("127.0.0.1", 0),
+            _web._DashboardRequestHandler,
+        )
+        server.dashboard_state = state
+        server.ingest_token = self.TOKEN if token is None else token
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        def stop_server():
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        self.addCleanup(stop_server)
+        return state, server
+
+    def _start_recording_server(self, responder):
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, _format, *_args):
+                return
+
+            def do_POST(self):
+                length = int(self.headers["Content-Length"])
+                body = self.rfile.read(length)
+                status, response = responder(self.path, body, self.headers)
+                encoded = json.dumps(response, separators=(",", ":")).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        def stop_server():
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        self.addCleanup(stop_server)
+        return server
+
+    def test_token_is_validated_and_removed(self):
+        environment = {"METAGROSS_DASHBOARD_TOKEN": self.TOKEN, "KEEP": "yes"}
+        self.assertEqual(_publish.take_dashboard_token(environment), self.TOKEN)
+        self.assertEqual(environment, {"KEEP": "yes"})
+
+        invalid = (None, "", "x" * 31, "x" * 129, "has space" * 4, "é" * 32)
+        for token in invalid:
+            environment = {}
+            if token is not None:
+                environment["METAGROSS_DASHBOARD_TOKEN"] = token
+            with self.subTest(token=token), self.assertRaises(
+                _publish.DashboardPublishError
+            ):
+                _publish.take_dashboard_token(environment)
+            self.assertNotIn("METAGROSS_DASHBOARD_TOKEN", environment)
+
+    def test_real_ingest_lifecycle_preserves_local_summary(self):
+        state, server = self._start_ingest_server()
+        publisher = _publish.DashboardPublisher(
+            server.server_port,
+            self.TOKEN,
+            "workload.py",
+        )
+        self.addCleanup(publisher.close)
+        publisher.start()
+        publisher.offer(self._record())
+        publisher.offer(
+            self._record(
+                timestamp="2026-08-30T12:10:04+00:00",
+                api="cuMemcpyHtoD",
+                kernel=None,
+                details={"bytes": 4096},
+            )
+        )
+        local_summary = self._summary(2)
+
+        result = publisher.finish(local_summary)
+        payload = state.payload()
+
+        self.assertEqual(result, _publish.PublishResult(0, None))
+        self.assertEqual(payload["status"], "COMPLETE")
+        self.assertEqual(payload["metrics"]["events"], 2)
+        self.assertEqual(payload["metrics"]["delivery_dropped"], 0)
+        self.assertEqual(payload["trace_name"], "workload.py")
+        self.assertNotIn("delivery_dropped", local_summary["capture"])
+        self.assertTrue(local_summary["complete"])
+
+    def test_retry_reuses_identical_batch_and_finishes_in_order(self):
+        requests = []
+        event_attempts = 0
+
+        def respond(path, body, headers):
+            nonlocal event_attempts
+            request = json.loads(body)
+            requests.append((path, body, headers["Authorization"]))
+            base = {
+                "schema_version": 1,
+                "capture_id": request["capture_id"],
+            }
+            if path == "/api/capture/start":
+                return 200, {**base, "status": "live"}
+            if path == "/api/capture/events":
+                event_attempts += 1
+                if event_attempts == 1:
+                    return 503, {"error": "retry"}
+                return 200, {**base, "next_sequence": request["sequence"] + 1}
+            if path == "/api/capture/finish":
+                return 200, {
+                    **base,
+                    "next_sequence": request["sequence"],
+                    "status": "finished",
+                }
+            return 200, {**base, "status": "aborted"}
+
+        server = self._start_recording_server(respond)
+        publisher = _publish.DashboardPublisher(
+            server.server_port,
+            self.TOKEN,
+            "workload.py",
+        )
+        self.addCleanup(publisher.close)
+        with mock.patch.dict(
+            os.environ,
+            {"HTTP_PROXY": "http://127.0.0.1:1"},
+            clear=False,
+        ):
+            publisher.start()
+            publisher.offer(self._record())
+            result = publisher.finish(self._summary(1))
+
+        event_bodies = [body for path, body, _auth in requests if path.endswith("events")]
+        self.assertEqual(result.dropped_events, 0)
+        self.assertEqual(len(event_bodies), 2)
+        self.assertEqual(event_bodies[0], event_bodies[1])
+        self.assertEqual(
+            [path for path, _body, _auth in requests],
+            [
+                "/api/capture/start",
+                "/api/capture/events",
+                "/api/capture/events",
+                "/api/capture/finish",
+            ],
+        )
+        self.assertTrue(
+            all(auth == f"Bearer {self.TOKEN}" for _path, _body, auth in requests)
+        )
+
+    def test_queue_overflow_is_declared_only_in_remote_summary(self):
+        event_started = threading.Event()
+        release_event = threading.Event()
+        delivered = []
+        finished = []
+        publisher = _publish.DashboardPublisher(
+            1,
+            self.TOKEN,
+            "workload.py",
+            queue_size=1,
+        )
+
+        def post(path, body):
+            request = json.loads(body)
+            base = {
+                "schema_version": 1,
+                "capture_id": request["capture_id"],
+            }
+            if path.endswith("start"):
+                return {**base, "status": "live"}
+            if path.endswith("events"):
+                event_started.set()
+                release_event.wait(timeout=2)
+                delivered.extend(request["events"])
+                return {**base, "next_sequence": request["sequence"] + 1}
+            if path.endswith("finish"):
+                finished.append(request["summary"])
+                return {
+                    **base,
+                    "next_sequence": request["sequence"],
+                    "status": "finished",
+                }
+            return {**base, "status": "aborted"}
+
+        with mock.patch.object(publisher, "_post", side_effect=post):
+            publisher.start()
+            publisher.offer(self._record(tid=1))
+            self.assertTrue(event_started.wait(timeout=2))
+            publisher.offer(self._record(tid=2))
+            publisher.offer(self._record(tid=3))
+            release_event.set()
+            local_summary = self._summary(3)
+            result = publisher.finish(local_summary)
+        publisher.close()
+
+        self.assertEqual(len(delivered), 2)
+        self.assertEqual(result.dropped_events, 1)
+        self.assertEqual(finished[0]["capture"]["delivery_dropped"], 1)
+        self.assertFalse(finished[0]["complete"])
+        self.assertNotIn("delivery_dropped", local_summary["capture"])
+        self.assertIsNotNone(publisher.pop_error())
+        self.assertIsNone(publisher.pop_error())
+
+    def test_failed_sequence_counts_inflight_queued_and_future_events(self):
+        event_started = threading.Event()
+        release_event = threading.Event()
+        aborted = threading.Event()
+        paths = []
+        publisher = _publish.DashboardPublisher(
+            1,
+            self.TOKEN,
+            "workload.py",
+            queue_size=2,
+        )
+
+        def post(path, body):
+            request = json.loads(body)
+            paths.append(path)
+            base = {
+                "schema_version": 1,
+                "capture_id": request["capture_id"],
+            }
+            if path.endswith("start"):
+                return {**base, "status": "live"}
+            if path.endswith("events"):
+                event_started.set()
+                release_event.wait(timeout=2)
+                raise _publish.DashboardPublishError("unacknowledged sequence")
+            if path.endswith("abort"):
+                aborted.set()
+                return {**base, "status": "aborted"}
+            raise AssertionError("publisher continued after failed sequence")
+
+        with mock.patch.object(publisher, "_post", side_effect=post):
+            publisher.start()
+            publisher.offer(self._record(tid=1))
+            self.assertTrue(event_started.wait(timeout=2))
+            publisher.offer(self._record(tid=2))
+            publisher.offer(self._record(tid=3))
+            release_event.set()
+            self.assertTrue(aborted.wait(timeout=2))
+            publisher.offer(self._record(tid=4))
+            diagnostic = publisher.pop_error()
+            result = publisher.finish(self._summary(4))
+        publisher.close()
+
+        self.assertEqual(result.dropped_events, 4)
+        self.assertIn("unacknowledged sequence", diagnostic)
+        self.assertIsNone(publisher.pop_error())
+        self.assertEqual(paths.count("/api/capture/events"), 1)
+        self.assertNotIn("/api/capture/finish", paths)
+
+    def test_oversized_record_is_dropped_without_an_event_request(self):
+        paths = []
+        remote_summary = []
+        publisher = _publish.DashboardPublisher(1, self.TOKEN, "workload.py")
+
+        def post(path, body):
+            request = json.loads(body)
+            paths.append(path)
+            base = {
+                "schema_version": 1,
+                "capture_id": request["capture_id"],
+            }
+            if path.endswith("start"):
+                return {**base, "status": "live"}
+            if path.endswith("finish"):
+                remote_summary.append(request["summary"])
+                return {
+                    **base,
+                    "next_sequence": request["sequence"],
+                    "status": "finished",
+                }
+            return {**base, "status": "aborted"}
+
+        with mock.patch.object(publisher, "_post", side_effect=post):
+            publisher.start()
+            publisher.offer(self._record(details={"value": "x" * (64 << 10)}))
+            result = publisher.finish(self._summary(1))
+        publisher.close()
+
+        self.assertEqual(result.dropped_events, 1)
+        self.assertNotIn("/api/capture/events", paths)
+        self.assertEqual(remote_summary[0]["capture"]["delivery_dropped"], 1)
+        self.assertFalse(remote_summary[0]["complete"])
+
+    def test_shutdown_timeout_is_bounded_and_aborts(self):
+        event_started = threading.Event()
+        release_event = threading.Event()
+        paths = []
+        publisher = _publish.DashboardPublisher(
+            1,
+            self.TOKEN,
+            "workload.py",
+            shutdown_timeout_s=0.05,
+        )
+
+        def post(path, body):
+            request = json.loads(body)
+            paths.append(path)
+            base = {
+                "schema_version": 1,
+                "capture_id": request["capture_id"],
+            }
+            if path.endswith("start"):
+                return {**base, "status": "live"}
+            if path.endswith("events"):
+                event_started.set()
+                release_event.wait(timeout=2)
+                return {**base, "next_sequence": request["sequence"] + 1}
+            if path.endswith("abort"):
+                return {**base, "status": "aborted"}
+            raise AssertionError("timed-out publisher tried to finish")
+
+        with mock.patch.object(publisher, "_post", side_effect=post):
+            publisher.start()
+            publisher.offer(self._record())
+            self.assertTrue(event_started.wait(timeout=2))
+            started = time.monotonic()
+            result = publisher.finish(self._summary(1))
+            elapsed = time.monotonic() - started
+            release_event.set()
+            publisher.close()
+
+        self.assertLess(elapsed, 0.5)
+        self.assertEqual(result.dropped_events, 1)
+        self.assertIn("/api/capture/abort", paths)
+
+    def test_wrong_token_fails_start_without_mutating_receiver(self):
+        state, server = self._start_ingest_server()
+        publisher = _publish.DashboardPublisher(
+            server.server_port,
+            "wrong-token-" + ("z" * 32),
+            "workload.py",
+        )
+        self.addCleanup(publisher.close)
+
+        with self.assertRaisesRegex(
+            _publish.DashboardPublishError,
+            "HTTP 401",
+        ):
+            publisher.start()
+
+        self.assertEqual(state.payload()["status"], "WAITING")
+        self.assertEqual(state.payload()["metrics"]["events"], 0)
+
+
+    def test_ambiguous_event_retry_is_deduplicated_by_real_receiver(self):
+        state = _web.IngestDashboardState(recent_limit=50, refresh_seconds=0.05)
+
+        class DropFirstEventAck(_web._DashboardRequestHandler):
+            dropped = False
+
+            def _send_ack(self, value):
+                if self.path == "/api/capture/events" and not type(self).dropped:
+                    type(self).dropped = True
+                    self.close_connection = True
+                    try:
+                        self.connection.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                    return
+                super()._send_ack(value)
+        server = _web._DashboardServer(("127.0.0.1", 0), DropFirstEventAck)
+        server.dashboard_state = state
+        server.ingest_token = self.TOKEN
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        def stop_server():
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        self.addCleanup(stop_server)
+        publisher = _publish.DashboardPublisher(
+            server.server_port,
+            self.TOKEN,
+            "workload.py",
+        )
+        self.addCleanup(publisher.close)
+        publisher.start()
+        publisher.offer(self._record())
+        result = publisher.finish(self._summary(1))
+
+        self.assertEqual(result.dropped_events, 0)
+        self.assertTrue(DropFirstEventAck.dropped)
+        self.assertEqual(state.payload()["metrics"]["events"], 1)
+        self.assertEqual(state.payload()["status"], "COMPLETE")
+
+    def test_batches_are_ordered_and_limited_to_128_events(self):
+        event_started = threading.Event()
+        release_event = threading.Event()
+        event_requests = []
+        publisher = _publish.DashboardPublisher(
+            1,
+            self.TOKEN,
+            "workload.py",
+            queue_size=300,
+        )
+
+        def post(path, body):
+            request = json.loads(body)
+            base = {
+                "schema_version": 1,
+                "capture_id": request["capture_id"],
+            }
+            if path.endswith("start"):
+                return {**base, "status": "live"}
+            if path.endswith("events"):
+                event_requests.append((body, request))
+                if len(event_requests) == 1:
+                    event_started.set()
+                    release_event.wait(timeout=2)
+                return {**base, "next_sequence": request["sequence"] + 1}
+            if path.endswith("finish"):
+                return {
+                    **base,
+                    "next_sequence": request["sequence"],
+                    "status": "finished",
+                }
+            return {**base, "status": "aborted"}
+
+        with mock.patch.object(publisher, "_post", side_effect=post):
+            publisher.start()
+            publisher.offer(self._record(tid=0))
+            self.assertTrue(event_started.wait(timeout=2))
+            for tid in range(1, 260):
+                publisher.offer(self._record(tid=tid))
+            release_event.set()
+            result = publisher.finish(self._summary(260))
+        publisher.close()
+
+        requests = [request for _body, request in event_requests]
+        tids = [
+            event["tid"]
+            for request in requests
+            for event in request["events"]
+        ]
+        self.assertEqual(result.dropped_events, 0)
+        self.assertEqual(tids, list(range(260)))
+        self.assertTrue(all(len(request["events"]) <= 128 for request in requests))
+        self.assertEqual(
+            [request["sequence"] for request in requests],
+            list(range(len(requests))),
+        )
+        self.assertTrue(
+            all(len(body) <= _publish._MAX_BATCH_BYTES for body, _request in event_requests)
+        )
+
+    def test_complete_batch_envelopes_stay_below_one_mibibyte(self):
+        event_started = threading.Event()
+        release_event = threading.Event()
+        event_bodies = []
+        publisher = _publish.DashboardPublisher(
+            1,
+            self.TOKEN,
+            "workload.py",
+            queue_size=32,
+        )
+
+        def post(path, body):
+            request = json.loads(body)
+            base = {
+                "schema_version": 1,
+                "capture_id": request["capture_id"],
+            }
+            if path.endswith("start"):
+                return {**base, "status": "live"}
+            if path.endswith("events"):
+                event_bodies.append(body)
+                if len(event_bodies) == 1:
+                    event_started.set()
+                    release_event.wait(timeout=2)
+                return {**base, "next_sequence": request["sequence"] + 1}
+            if path.endswith("finish"):
+                return {
+                    **base,
+                    "next_sequence": request["sequence"],
+                    "status": "finished",
+                }
+            return {**base, "status": "aborted"}
+
+        with mock.patch.object(publisher, "_post", side_effect=post):
+            publisher.start()
+            publisher.offer(self._record(tid=0, details={"value": "x" * 60_000}))
+            self.assertTrue(event_started.wait(timeout=2))
+            for tid in range(1, 20):
+                publisher.offer(
+                    self._record(tid=tid, details={"value": "x" * 60_000})
+                )
+            release_event.set()
+            result = publisher.finish(self._summary(20))
+        publisher.close()
+
+        self.assertEqual(result.dropped_events, 0)
+        self.assertGreaterEqual(len(event_bodies), 3)
+        self.assertTrue(
+            all(len(body) <= _publish._MAX_BATCH_BYTES for body in event_bodies)
+        )
+
+    def test_start_rejects_redirect_large_or_nonexact_acknowledgements(self):
+        cases = (
+            (
+                "redirect",
+                302,
+                lambda base: base,
+                "HTTP 302",
+            ),
+            (
+                "oversized",
+                200,
+                lambda base: {**base, "status": "live", "padding": "x" * 5000},
+                "too large",
+            ),
+            (
+                "extra field",
+                200,
+                lambda base: {**base, "status": "live", "extra": True},
+                "did not match",
+            ),
+        )
+        for name, start_status, response_builder, message in cases:
+            paths = []
+
+            def respond(path, body, _headers):
+                request = json.loads(body)
+                paths.append(path)
+                base = {
+                    "schema_version": 1,
+                    "capture_id": request["capture_id"],
+                }
+                if path.endswith("abort"):
+                    return 200, {**base, "status": "aborted"}
+                return start_status, response_builder(base)
+
+            with self.subTest(name=name):
+                server = self._start_recording_server(respond)
+                publisher = _publish.DashboardPublisher(
+                    server.server_port,
+                    self.TOKEN,
+                    "workload.py",
+                )
+                with self.assertRaisesRegex(
+                    _publish.DashboardPublishError,
+                    message,
+                ):
+                    publisher.start()
+                publisher.close()
+                self.assertEqual(
+                    paths,
+                    ["/api/capture/start", "/api/capture/abort"],
+                )
 
 
 class ValidateScriptTest(unittest.TestCase):
@@ -884,6 +1858,25 @@ class MainRoutingTest(unittest.TestCase):
 @unittest.skipUnless(INTEGRATION and os.geteuid() == 0,
                      "needs RUN_EBPF_INTEGRATION=1 and root")
 class LiveTraceTest(unittest.TestCase):
+    def _start_dashboard_receiver(self, token):
+        state = _web.IngestDashboardState(recent_limit=500, refresh_seconds=0.05)
+        server = _web._DashboardServer(
+            ("127.0.0.1", 0),
+            _web._DashboardRequestHandler,
+        )
+        server.dashboard_state = state
+        server.ingest_token = token
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        def stop_server():
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        self.addCleanup(stop_server)
+        return state, server
+
     def test_cudart_caller_visible(self):
         nvcc = shutil.which("nvcc") or "/usr/local/cuda/bin/nvcc"
         if not os.path.exists(nvcc):
@@ -1041,6 +2034,122 @@ class LiveTraceTest(unittest.TestCase):
         after = subprocess.run(["bpftool", "prog", "list"],
                                capture_output=True, text=True).stdout
         self.assertLessEqual(len(after.splitlines()), len(before.splitlines()) + 1)
+
+    def test_direct_dashboard_delivery_is_fileless_and_preserves_target_io(self):
+        token = "live-dashboard-token-" + ("x" * 32)
+        state, server = self._start_dashboard_receiver(token)
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        os.chown(
+            directory,
+            int(os.environ.get("SUDO_UID", os.getuid())),
+            int(os.environ.get("SUDO_GID", os.getgid())),
+        )
+        script = os.path.join(directory, "direct_demo.py")
+        with open("examples/gpu_demo.py", encoding="utf-8") as source:
+            workload = source.read()
+        with open(script, "w", encoding="utf-8") as target:
+            target.write(
+                workload
+                + "\nimport os, sys\n"
+                + "print('target stderr sentinel', file=sys.stderr)\n"
+                + "print('dashboard token present', "
+                + "'METAGROSS_DASHBOARD_TOKEN' in os.environ, file=sys.stderr)\n"
+            )
+        environment = os.environ.copy()
+        environment["METAGROSS_DASHBOARD_TOKEN"] = token
+
+        proc = subprocess.run(
+            [
+                "/usr/bin/python3",
+                "-B",
+                "-m",
+                "metagross",
+                "--dashboard-port",
+                str(server.server_port),
+                "--project-root",
+                directory,
+                script,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=environment,
+        )
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("vec_add ok", proc.stdout)
+        self.assertIn("target stderr sentinel", proc.stderr)
+        self.assertIn("dashboard token present False", proc.stderr)
+        self.assertNotIn(token, proc.stderr)
+        payload = state.payload()
+        self.assertEqual(payload["status"], "COMPLETE")
+        self.assertEqual(payload["metrics"]["delivery_dropped"], 0)
+        with state._lock:
+            apis = set(state.model.apis)
+            functions = {key[0] for key in state.model.functions}
+            kernels = set(state.model.kernels)
+            summary = state.model.summary
+            event_count = state.model.events
+        self.assertTrue(any(api.startswith("cuLaunchKernel") for api in apis))
+        self.assertTrue(any(api.startswith("cuMemcpyHtoD") for api in apis))
+        self.assertTrue(any(api.startswith("cuMemcpyDtoH") for api in apis))
+        self.assertTrue(any(api.startswith("cuMemAlloc") for api in apis))
+        self.assertTrue(any(api.startswith("cuStreamSynchronize") for api in apis))
+        self.assertTrue({"upload", "compute", "download_and_check"} <= functions)
+        self.assertIn("vec_add", kernels)
+        self.assertEqual(summary["capture"]["events"], event_count)
+        self.assertEqual(summary["capture"]["delivery_dropped"], 0)
+        self.assertEqual(summary["target"]["exit_status"], 0)
+        self.assertEqual(os.listdir(directory), ["direct_demo.py"])
+
+    def test_wrong_dashboard_token_never_releases_target_barrier(self):
+        receiver_token = "receiver-live-token-" + ("r" * 32)
+        state, server = self._start_dashboard_receiver(receiver_token)
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        os.chown(
+            directory,
+            int(os.environ.get("SUDO_UID", os.getuid())),
+            int(os.environ.get("SUDO_GID", os.getgid())),
+        )
+        sentinel = os.path.join(directory, "target-ran")
+        script = os.path.join(directory, "must_not_run.py")
+        with open(script, "w", encoding="utf-8") as target:
+            target.write(
+                "from pathlib import Path\n"
+                f"Path({sentinel!r}).write_text('ran')\n"
+                "print('target executed')\n"
+            )
+        wrong_token = "wrong-live-token-" + ("w" * 32)
+        environment = os.environ.copy()
+        environment["METAGROSS_DASHBOARD_TOKEN"] = wrong_token
+
+        proc = subprocess.run(
+            [
+                "/usr/bin/python3",
+                "-B",
+                "-m",
+                "metagross",
+                "--dashboard-port",
+                str(server.server_port),
+                "--project-root",
+                directory,
+                script,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=environment,
+        )
+
+        self.assertEqual(proc.returncode, 1)
+        self.assertFalse(os.path.exists(sentinel))
+        self.assertNotIn("target executed", proc.stdout)
+        self.assertIn("cannot start dashboard delivery", proc.stderr)
+        self.assertNotIn(receiver_token, proc.stderr)
+        self.assertNotIn(wrong_token, proc.stderr)
+        self.assertEqual(state.payload()["status"], "WAITING")
 
 
 def _torch_available():
