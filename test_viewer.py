@@ -22,6 +22,7 @@ import threading
 import time
 import urllib.request
 import unittest
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from unittest import mock
 
@@ -1515,6 +1516,7 @@ class WebDashboardTest(unittest.TestCase):
         self.assertIn("METAGROSS", html)
         self.assertIn("/app.css", html)
         self.assertIn("/app.js", html)
+        self.assertIn('src="/logo.svg" width="32" height="32" alt=""', html)
         self.assertIn("CUDA API timeline", html)
         self.assertIn('id="metric-delivery-dropped"', html)
         self.assertIn('aria-pressed="false">Pause', html)
@@ -1525,6 +1527,7 @@ class WebDashboardTest(unittest.TestCase):
         with urllib.request.urlopen(base + "/app.css", timeout=2) as response:
             stylesheet = response.read().decode()
             self.assertIn("--dim: #969696", stylesheet)
+            self.assertIn("--signal: #8ac926", stylesheet)
             self.assertIn(".timeline-tooltip", stylesheet)
             self.assertIn(".scroll-hint", stylesheet)
 
@@ -1538,11 +1541,22 @@ class WebDashboardTest(unittest.TestCase):
             self.assertIn('setAttribute("aria-selected"', script)
             self.assertIn("timelineSignature", script)
 
-        with urllib.request.urlopen(base + "/favicon.svg", timeout=2) as response:
-            self.assertEqual(
-                response.headers["Content-Type"], "image/svg+xml; charset=utf-8"
-            )
-            self.assertIn("#76b900", response.read().decode())
+        master = Path(__file__).parent / "assets/logo-mark.svg"
+        path_tag = "{http://www.w3.org/2000/svg}path"
+        expected_paths = [node.attrib["d"] for node in ET.parse(master).iter(path_tag)]
+        for route in ("/logo.svg", "/favicon.svg"):
+            with self.subTest(route=route):
+                with urllib.request.urlopen(base + route, timeout=2) as response:
+                    self.assertEqual(
+                        response.headers["Content-Type"], "image/svg+xml; charset=utf-8"
+                    )
+                    self.assertEqual(response.headers["Cache-Control"], "no-store")
+                    artwork = response.read().decode()
+                self.assertIn("#8ac926", artwork)
+                self.assertEqual(
+                    [node.attrib["d"] for node in ET.fromstring(artwork).iter(path_tag)],
+                    expected_paths,
+                )
 
         with urllib.request.urlopen(base + "/api/state", timeout=2) as response:
             self.assertEqual(

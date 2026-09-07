@@ -6,5 +6,8 @@ __pycache__/
 # Local trace artifacts can contain source paths and timing data
 traces/
 
+# Full branding kits stay local; only application logo assets belong in Git.
+/assets/branding/
+
 # SDD workspace
 .superpowers/

@@ -26,11 +26,22 @@ _MAX_EVENT_BODY = 1 << 20
 _MAX_FINISH_BODY = _viewer._MAX_SUMMARY_BYTES + (64 << 10)
 _MAX_RESPONSE_BODY = 4 << 10
 _MAX_BATCH_EVENTS = 128
-_FAVICON_SVG = b"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
-<rect width="32" height="32" rx="3" fill="#202020"/>
-<path d="M7 7h7v7H7zm11 0h7v7h-7zM7 18h7v7H7zm11 0h7v7h-7z" fill="#76b900"/>
-</svg>
-"""
+# Keep these paths aligned with assets/logo-mark.svg.
+# Embed the artwork so copied packages and Docker images need no asset tree.
+_LOGO_PATHS = b"""<path d="M303.46 50.83 L224.23 132.30 L287.77 196.58 L344.57 145.00 L415.58 215.26 L415.58 241.42 L372.98 284.03 L438.00 350.55 L512.00 276.55 L512.00 167.43 L396.15 50.83 Z"/>
+<path d="M28.40 0.00 L28.40 42.60 L458.93 480.61 L458.93 412.59 L178.64 123.33 L214.52 85.96 L129.31 0.00 Z"/>
+<path d="M84.46 241.42 L0.75 325.14 L0.75 390.17 L119.59 512.00 L202.56 512.00 L276.55 436.51 L214.52 372.98 L169.67 417.82 L162.20 417.82 L98.66 354.29 L98.66 346.07 L143.51 299.73 Z"/>
+<path d="M29.90 80.72 L29.90 148.74 L387.18 512.00 L452.95 512.00 Z"/>"""
+_LOGO_SVG = (
+    b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">'
+    b'<title>Metagross</title><g fill="#8ac926">' + _LOGO_PATHS + b'</g></svg>'
+)
+_FAVICON_SVG = (
+    b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">'
+    b'<title>Metagross</title><rect width="512" height="512" fill="#202020"/>'
+    b'<g transform="translate(24 24) scale(0.90625)" fill="#8ac926">'
+    + _LOGO_PATHS + b'</g></svg>'
+)
 
 _INDEX_HTML = b"""<!doctype html>
 <html lang="en">
@@ -46,7 +57,7 @@ _INDEX_HTML = b"""<!doctype html>
   <a class="skip-link" href="#workspace">Skip to trace workspace</a>
   <header class="app-header">
     <div class="brand">
-      <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+      <img class="brand-mark" src="/logo.svg" width="32" height="32" alt="">
       <span class="brand-name">METAGROSS</span>
       <span class="brand-separator"></span>
       <span class="brand-product">Trace Analysis</span>
@@ -277,9 +288,9 @@ _APP_CSS = b""":root {
   --text: #f0f0f0;
   --muted: #b3b3b3;
   --dim: #969696;
-  --signal: #76b900;
+  --signal: #8ac926;
   --signal-soft: #9bc95c;
-  --launch: #76b900;
+  --launch: #8ac926;
   --copy: #c96e62;
   --memory: #6293b8;
   --sync: #c79d55;
@@ -346,20 +357,20 @@ button { color: inherit; }
 }
 .brand, .header-actions, .header-trace { display: flex; align-items: center; }
 .brand { gap: 9px; }
-.brand-name { font-size: 12px; font-weight: 700; letter-spacing: 0.12em; }
+.brand-name {
+  font-family: "DejaVu Sans", var(--sans);
+  font-size: 12px;
+  font-weight: 400;
+  letter-spacing: 0.18em;
+}
 .brand-product { color: var(--muted); font-size: 11px; }
 .brand-separator { width: 1px; height: 18px; margin: 0 3px; background: var(--line); }
 .brand-mark {
-  display: grid;
-  grid-template-columns: repeat(2, 5px);
-  grid-template-rows: repeat(2, 5px);
-  gap: 2px;
-  padding: 4px;
-  border: 1px solid #578a00;
-  background: #273500;
+  display: block;
+  width: 32px;
+  height: 32px;
+  flex: none;
 }
-.brand-mark i { display: block; background: var(--signal); }
-.brand-mark i:nth-child(2), .brand-mark i:nth-child(3) { opacity: 0.45; }
 .header-trace { justify-content: center; gap: 9px; min-width: 0; }
 .header-trace strong {
   max-width: 360px;
@@ -1806,6 +1817,8 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
             self._send(_APP_JS, "text/javascript; charset=utf-8")
         elif path == "/api/state":
             self._send_json(self.server.dashboard_state.payload())
+        elif path == "/logo.svg":
+            self._send(_LOGO_SVG, "image/svg+xml; charset=utf-8")
         elif path == "/favicon.svg":
             self._send(_FAVICON_SVG, "image/svg+xml; charset=utf-8")
         else:
