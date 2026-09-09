@@ -11,6 +11,7 @@ import json
 import os
 import pty
 import select
+import shutil
 import struct
 import signal
 import subprocess
@@ -20,6 +21,7 @@ import tempfile
 import termios
 import threading
 import time
+import urllib.parse
 import urllib.request
 import unittest
 import xml.etree.ElementTree as ET
@@ -777,6 +779,175 @@ class WebDashboardTest(unittest.TestCase):
             body = stream.read(length)
         return int(status_line.split()[1]), headers, body
 
+    def test_state_rejects_missing_wrong_and_duplicate_viewer_credentials(self):
+        state, server = self._start_ingest_server()
+        state.start_capture("a" * 32, "private-trace.py")
+        # A missing auth check or accepting the first duplicate leaks trace data.
+        token = server.viewer_token
+        for method in ("GET", "HEAD"):
+            for credentials in ([], ["wrong"], [self.TOKEN], [token, token],
+                                [token, "wrong"], ["wrong", token],
+                                [f"{token}, Bearer {token}"]):
+                with self.subTest(method=method, credentials=credentials):
+                    authorization = "".join(
+                        f"Authorization: Bearer {value}\r\n"
+                        for value in credentials
+                    )
+                    status, headers, body = self._raw_http(
+                        server,
+                        (f"{method} /api/state HTTP/1.1\r\n"
+                         f"Host: 127.0.0.1:{server.server_port}\r\n"
+                         f"{authorization}Connection: close\r\n\r\n").encode(),
+                    )
+                    self.assertEqual(status, 401)
+                    self.assertEqual(headers["www-authenticate"], "Bearer")
+                    self.assertNotIn(b"private-trace.py", body)
+                    self.assertNotIn(token.encode(), body)
+                    self.assertNotIn(self.TOKEN.encode(), body)
+
+    def test_viewer_token_reads_state_but_cannot_publish_or_leak_into_assets(self):
+        state, server = self._start_ingest_server()
+        token = server.viewer_token
+        self.assertNotEqual(token, self.TOKEN)
+        state.start_capture("a" * 32, "private-trace.py")
+        base = f"http://127.0.0.1:{server.server_port}"
+        request = urllib.request.Request(
+            base + "/api/state", headers={"Authorization": f"Bearer {token}"}
+        )
+        with urllib.request.urlopen(request, timeout=2) as response:
+            body = response.read()
+            self.assertEqual(json.loads(body)["trace_name"], "private-trace.py")
+            self.assertNotIn(token.encode(), body)
+            self.assertNotIn(self.TOKEN.encode(), body)
+        request = urllib.request.Request(
+            base + "/api/state", method="HEAD",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        with urllib.request.urlopen(request, timeout=2) as response:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.read(), b"")
+        for path in ("/", "/index.html", "/app.js", "/app.css",
+                     "/logo.svg", "/favicon.svg"):
+            with self.subTest(path=path):
+                with urllib.request.urlopen(base + path, timeout=2) as response:
+                    body = response.read()
+                    self.assertNotIn(b"private-trace.py", body)
+                    self.assertNotIn(token.encode(), body)
+                    self.assertNotIn(self.TOKEN.encode(), body)
+        status, _, body = self._post_json(
+            server, "/api/capture/start",
+            {"schema_version": 1, "capture_id": "b" * 32,
+             "trace_name": "unauthorized.py"}, token=token,
+        )
+        self.assertEqual(status, 401)
+        self.assertEqual(body, {"error": "unauthorized"})
+        self.assertEqual(state.payload()["trace_name"], "private-trace.py")
+
+    @unittest.skipUnless(shutil.which("node"), "browser-script check needs Node.js")
+    def test_browser_fragment_bootstrap_refresh_and_single_bearer(self):
+        # Execute the shipped script; deleting cleanup/storage/headers must fail.
+        harness = r"""
+const vm = require('node:vm');
+const fs = require('node:fs');
+const script = fs.readFileSync(0, 'utf8');
+const storage = new Map();
+async function load(fragment, blocked = false, navigation = null) {
+  let location = new URL('http://127.0.0.1:8765/?view=timeline' + fragment);
+  const requests = [];
+  const elements = new Map();
+  const listeners = new Map();
+  let nextPoll;
+  const context = {
+    URLSearchParams, Headers,
+    document: {
+      getElementById(id) {
+        if (!elements.has(id)) elements.set(id, {addEventListener() {}});
+        return elements.get(id);
+      },
+      querySelectorAll() { return []; }
+    },
+    window: {
+      get location() { return location; },
+      history: {replaceState(state, title, url) {
+        location = new URL(url, location);
+      }},
+      sessionStorage: {
+        getItem(key) { if (blocked) throw Error('blocked'); return storage.get(key) || null; },
+        setItem(key, value) { if (blocked) throw Error('blocked'); storage.set(key, value); },
+        removeItem(key) { if (blocked) throw Error('blocked'); storage.delete(key); }
+      },
+      addEventListener(name, callback) { listeners.set(name, callback); },
+      setTimeout(callback) { nextPoll = callback; return 1; },
+      clearTimeout() {}
+    },
+    fetch(path, options) {
+      requests.push({path, headers: [...new Headers(options.headers)],
+        urlAtFetch: location.href});
+      return Promise.resolve({ok: false, status: 401});
+    }
+  };
+  vm.runInNewContext(script, context);
+  await new Promise(setImmediate);
+  if (navigation !== null) {
+    requests.length = 0;
+    location.hash = navigation;
+    listeners.get('hashchange')?.();
+    if (nextPoll) nextPoll();
+    await new Promise(setImmediate);
+  }
+  return {url: location.href, stored: [...storage.values()], requests};
+}
+(async () => {
+const token = 'v'.repeat(43);
+const first = await load('#viewer_token=' + token);
+const refresh = await load('');
+const replacement = await load('#viewer_token=' + 'n'.repeat(43));
+const duplicate = await load('#viewer_token=' + token + '&viewer_token=wrong');
+storage.clear();
+const fresh = await load('');
+const blocked = await load('#viewer_token=' + token, true);
+storage.clear();
+const fromFresh = await load('', false, '#viewer_token=' + token);
+const fromOld = await load('', false, '#viewer_token=' + 'n'.repeat(43));
+const toDuplicate = await load('', false, '#viewer_token=x&viewer_token=y');
+console.log(JSON.stringify({first, refresh, replacement, duplicate, fresh, blocked,
+  fromFresh, fromOld, toDuplicate}));
+})();
+"""
+        result = subprocess.run(
+            [shutil.which("node"), "-e", harness], input=_web._APP_JS.decode(),
+            capture_output=True, text=True, timeout=5, check=True,
+        )
+        observed = json.loads(result.stdout)
+        clean_url = "http://127.0.0.1:8765/?view=timeline"
+        for name in ("first", "refresh"):
+            with self.subTest(load=name):
+                self.assertEqual(observed[name]["url"], clean_url)
+                self.assertEqual(observed[name]["stored"], ["v" * 43])
+                self.assertEqual(observed[name]["requests"], [{
+                    "path": "/api/state", "urlAtFetch": clean_url,
+                    "headers": [["authorization", "Bearer " + "v" * 43]],
+                }])
+        self.assertEqual(observed["replacement"]["stored"], ["n" * 43])
+        self.assertEqual(observed["replacement"]["requests"][0]["headers"],
+                         [["authorization", "Bearer " + "n" * 43]])
+        for name in ("duplicate", "fresh", "blocked"):
+            with self.subTest(load=name):
+                self.assertEqual(observed[name]["url"], clean_url)
+                self.assertEqual(observed[name]["requests"], [])
+        # Same-document navigation must update the running page, not reload JS.
+        for name, token in (("fromFresh", "v" * 43), ("fromOld", "n" * 43)):
+            with self.subTest(navigation=name):
+                self.assertEqual(observed[name]["url"], clean_url)
+                self.assertEqual(observed[name]["stored"], [token])
+                self.assertEqual(observed[name]["requests"], [{
+                    "path": "/api/state", "urlAtFetch": clean_url,
+                    "headers": [["authorization", "Bearer " + token]],
+                }])
+        self.assertEqual(observed["toDuplicate"]["url"], clean_url)
+        self.assertEqual(observed["toDuplicate"]["stored"], [])
+        self.assertEqual(observed["toDuplicate"]["requests"], [])
+
     def test_ingest_state_lifecycle_idempotency_and_reset(self):
         state = _web.IngestDashboardState(recent_limit=50, refresh_seconds=0.05)
         first_id = "a" * 32
@@ -1312,7 +1483,10 @@ class WebDashboardTest(unittest.TestCase):
             timeout=2,
         )
         try:
-            connection.request("GET", "/api/state")
+            connection.request(
+                "GET", "/api/state",
+                headers={"Authorization": f"Bearer {server.viewer_token}"},
+            )
             response = connection.getresponse()
             body = response.read()
         finally:
@@ -1558,7 +1732,11 @@ class WebDashboardTest(unittest.TestCase):
                     expected_paths,
                 )
 
-        with urllib.request.urlopen(base + "/api/state", timeout=2) as response:
+        request = urllib.request.Request(
+            base + "/api/state",
+            headers={"Authorization": f"Bearer {server.viewer_token}"},
+        )
+        with urllib.request.urlopen(request, timeout=2) as response:
             self.assertEqual(
                 json.loads(response.read()),
                 {"schema_version": 1, "status": "LIVE"},
@@ -1629,13 +1807,23 @@ class WebDashboardTest(unittest.TestCase):
                 break
         self.assertIsNotNone(url, "".join(output))
 
+        url, fragment = urllib.parse.urldefrag(url)
+        viewer_tokens = urllib.parse.parse_qs(fragment).get("viewer_token", [])
+        self.assertEqual(len(viewer_tokens), 1, "private URL needs a viewer fragment")
+        viewer_token = viewer_tokens[0]
+        self.assertNotIn(viewer_token, url)
+
         with urllib.request.urlopen(url, timeout=2) as response:
             self.assertIn("METAGROSS", response.read().decode())
 
         payload = None
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
-            with urllib.request.urlopen(url + "api/state", timeout=2) as response:
+            request = urllib.request.Request(
+                url + "api/state",
+                headers={"Authorization": f"Bearer {viewer_token}"},
+            )
+            with urllib.request.urlopen(request, timeout=2) as response:
                 payload = json.loads(response.read())
             if payload["metrics"]["events"] == 1:
                 break
@@ -1645,6 +1833,45 @@ class WebDashboardTest(unittest.TestCase):
         self.assertEqual(len(payload["timeline"]["events"]), 1)
         self.assertEqual(payload["timeline"]["events"][0]["lane"], "compute")
 
+        process.send_signal(signal.SIGINT)
+        self.assertEqual(process.wait(timeout=5), 130)
+
+        # A restarted process must reject the secret retained by an old tab.
+        for stream in (process.stdout, process.stderr):
+            stream.close()
+        command = list(process.args)
+        command[command.index("--port") + 1] = str(urllib.parse.urlsplit(url).port)
+        process = subprocess.Popen(
+            command, cwd=Path(__file__).resolve().parent, env=environment,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        restarted_url = None
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and process.poll() is None:
+            ready, _, _ = select.select([process.stderr], [], [], 0.1)
+            if ready:
+                line = process.stderr.readline()
+                if marker in line:
+                    restarted_url = line.split(marker, 1)[1].strip()
+                    break
+        self.assertIsNotNone(restarted_url)
+        restarted_base, fragment = urllib.parse.urldefrag(restarted_url)
+        current_token = urllib.parse.parse_qs(fragment)["viewer_token"][0]
+        self.assertEqual(restarted_base, url)
+        self.assertNotEqual(current_token, viewer_token)
+        for credential in (None, viewer_token, current_token):
+            headers = {} if credential is None else {
+                "Authorization": f"Bearer {credential}"
+            }
+            request = urllib.request.Request(url + "api/state", headers=headers)
+            if credential == current_token:
+                with urllib.request.urlopen(request, timeout=2) as response:
+                    self.assertEqual(response.status, 200)
+            else:
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    urllib.request.urlopen(request, timeout=2)
+                self.assertEqual(caught.exception.code, 401)
+                caught.exception.close()
         process.send_signal(signal.SIGINT)
         self.assertEqual(process.wait(timeout=5), 130)
 
@@ -1701,8 +1928,20 @@ class WebDashboardTest(unittest.TestCase):
                 break
         self.assertIsNotNone(url, "".join(output))
 
+        self.assertNotIn(token, "".join(output))
+        url, fragment = urllib.parse.urldefrag(url)
+        viewer_tokens = urllib.parse.parse_qs(fragment).get("viewer_token", [])
+        self.assertEqual(len(viewer_tokens), 1, "private URL needs a viewer fragment")
+        viewer_token = viewer_tokens[0]
+        self.assertNotEqual(viewer_token, token)
+        self.assertNotIn(viewer_token, url)
+
         def state_payload():
-            with urllib.request.urlopen(url + "api/state", timeout=2) as response:
+            request = urllib.request.Request(
+                url + "api/state",
+                headers={"Authorization": f"Bearer {viewer_token}"},
+            )
+            with urllib.request.urlopen(request, timeout=2) as response:
                 return json.loads(response.read())
 
         def post(name, payload):

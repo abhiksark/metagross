@@ -11,10 +11,10 @@ import io
 import json
 import os
 import pwd
-import runpy
 import selectors
 import signal
 import stat
+import subprocess
 import sys
 import time
 import traceback
@@ -31,6 +31,7 @@ class UsageError(MetagrossError):
 
 @dataclasses.dataclass
 class Config:
+    show_help: bool = False
     json_output: bool = False
     output_path: str | None = None
     project_root: str = "."
@@ -63,6 +64,7 @@ _USAGE = (
     "       /usr/bin/python3 -m metagross [--trace FAMILIES] --ebpf\n"
     "       /usr/bin/python3 -m metagross view (--snapshot|--follow|--web) TRACE.jsonl\n"
     "       /usr/bin/python3 -m metagross view --web --receive [--port PORT]\n"
+    "       /usr/bin/python3 -m metagross [-h|--help]\n"
 )
 
 
@@ -98,6 +100,9 @@ def parse_args(argv: list[str]) -> Config:
     i = 0
     while i < len(argv):
         arg = argv[i]
+        if arg in ("-h", "--help"):
+            cfg.show_help = True
+            return cfg
         if not arg.startswith("--"):
             cfg.script = arg
             cfg.script_args = list(argv[i + 1 :])
@@ -313,8 +318,8 @@ def _validate_script(script: str, project_root: str) -> str:
 
 
 def _exit_flushed(code: int) -> NoReturn:
-    # os._exit skips stdio flushing; the target's own stdout/stderr (and
-    # anything we just wrote to them) must reach the parent's pipes.
+    # Startup failures occur before exec and cannot finalize the forked
+    # controller interpreter. Preserve their diagnostics before os._exit.
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.flush()
@@ -326,8 +331,7 @@ def _exit_flushed(code: int) -> NoReturn:
 def _child_main(
     script, script_args, creds, barrier_r, profile_w, project_root, python_attribution
 ) -> NoReturn:
-    """Run post-fork in the traced child. Never returns to the caller."""
-    from metagross import _profile
+    """Drop credentials, await attachment, and exec the target interpreter."""
     os.environ.pop("METAGROSS_DASHBOARD_TOKEN", None)
 
     if creds is not None:
@@ -338,36 +342,28 @@ def _child_main(
         os.environ["USER"] = creds.user
         os.environ["LOGNAME"] = creds.user
 
-    # Close-on-exec: still usable by this process (fork already handed us
-    # the fd), but a subprocess the target execs will not inherit it.
-    flags = fcntl.fcntl(profile_w, fcntl.F_GETFD)
-    fcntl.fcntl(profile_w, fcntl.F_SETFD, flags | fcntl.FD_CLOEXEC)
-
     if os.read(barrier_r, 1) == b"":
         _exit_flushed(1)  # parent died before releasing the barrier
     os.close(barrier_r)
 
-    if python_attribution:
-        _profile.install(profile_w, project_root)
-
-    sys.argv = [script, *script_args]
-    sys.path[0] = os.path.dirname(script)
-    try:
-        runpy.run_path(script, run_name="__main__")
-    except SystemExit as exc:
-        code = exc.code
-        if code is None:
-            code = 0
-        elif not isinstance(code, int):
-            sys.stderr.write(f"{code}\n")
-            code = 1
-        _exit_flushed(code)
-    except KeyboardInterrupt:
-        _exit_flushed(130)
-    except BaseException:
-        traceback.print_exc()
-        _exit_flushed(1)
-    _exit_flushed(0)
+    # Pin the runner to this installation even when the target's working
+    # directory has no Metagross package. Credentials are already dropped.
+    package_root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    bootstrap = (
+        f"import sys; sys.path.insert(0, {package_root!r}); "
+        "from metagross._target import main; del sys.path[0]; main()"
+    )
+    # Only this exec inherits the profile pipe. The runner restores CLOEXEC
+    # before running target code so target descendants cannot retain it.
+    os.set_inheritable(profile_w, True)
+    interpreter_args = subprocess._args_from_interpreter_flags()
+    # The stdlib helper omits -u; preserve effective stream buffering too.
+    if getattr(sys.stdout, "write_through", False):
+        interpreter_args.append("-u")
+    os.execv(sys.executable, [
+        sys.executable, *interpreter_args, "-c", bootstrap, str(profile_w), project_root,
+        "1" if python_attribution else "0", script, *script_args,
+    ])
 
 
 def run_live(cfg: Config) -> int:
@@ -790,6 +786,9 @@ def main(argv: list[str] | None = None) -> int:
     except UsageError as exc:
         print(f"metagross: {exc}\n{_USAGE}", file=sys.stderr, end="")
         return 2
+    if cfg.show_help:
+        print(_USAGE, end="")
+        return 0
     if cfg.dump_ebpf:
         from metagross import _bpf
 

@@ -7,6 +7,7 @@ import datetime
 import hmac
 import http.server
 import json
+import secrets
 import sys
 import threading
 import time
@@ -765,6 +766,29 @@ th:nth-child(6), td:nth-child(6) { width: 10%; text-align: right; }
 _APP_JS = rb"""(() => {
   "use strict";
 
+  let viewerToken = "";
+  function readViewerToken() {
+    viewerToken = "";
+    try {
+      const key = "metagross-viewer-token";
+      const tokens = new URLSearchParams(window.location.hash.slice(1)).getAll("viewer_token");
+      if (tokens.length) {
+        window.history.replaceState(null, "", window.location.pathname + window.location.search);
+        window.sessionStorage.removeItem(key);
+        if (tokens.length === 1 && tokens[0]) {
+          window.sessionStorage.setItem(key, tokens[0]);
+          viewerToken = tokens[0];
+        }
+      } else {
+        viewerToken = window.sessionStorage.getItem(key) || "";
+      }
+    } catch {
+      viewerToken = "";
+    }
+  }
+  readViewerToken();
+  window.addEventListener("hashchange", readViewerToken);
+
   const byId = (id) => document.getElementById(id);
   const pauseButton = byId("pause-button");
   const refreshButton = byId("refresh-button");
@@ -1211,7 +1235,12 @@ _APP_JS = rb"""(() => {
   async function poll() {
     if (timer) window.clearTimeout(timer);
     try {
-      const response = await fetch("/api/state", {cache: "no-store"});
+      if (!viewerToken) throw new Error("Open the private dashboard URL printed in the terminal; session storage must be enabled.");
+      const response = await fetch("/api/state", {
+        cache: "no-store",
+        headers: {Authorization: `Bearer ${viewerToken}`},
+      });
+      if (response.status === 401) throw new Error("Open the current private dashboard URL printed in the terminal.");
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       render(await response.json());
     } catch (error) {
@@ -1699,6 +1728,10 @@ class _DashboardServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
+    def __init__(self, *args, **kwargs):
+        self.viewer_token = secrets.token_urlsafe(32)
+        super().__init__(*args, **kwargs)
+
 
 class _IngestRequestError(Exception):
     def __init__(self, status: int, message: str, *, authenticate: bool = False):
@@ -1816,6 +1849,13 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
         elif path == "/app.js":
             self._send(_APP_JS, "text/javascript; charset=utf-8")
         elif path == "/api/state":
+            if not self._authorized(self.server.viewer_token):
+                self._send_error(
+                    http.server.HTTPStatus.UNAUTHORIZED,
+                    "invalid bearer token",
+                    authenticate=True,
+                )
+                return
             self._send_json(self.server.dashboard_state.payload())
         elif path == "/logo.svg":
             self._send(_LOGO_SVG, "image/svg+xml; charset=utf-8")
@@ -1827,6 +1867,18 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
                 "text/plain; charset=utf-8",
                 status=http.server.HTTPStatus.NOT_FOUND,
             )
+
+    def _authorized(self, token: str | None) -> bool:
+        authorization = self.headers.get_all("Authorization", [])
+        if token is None or len(authorization) != 1:
+            return False
+        try:
+            return hmac.compare_digest(
+                authorization[0].encode("latin-1"),
+                f"Bearer {token}".encode("ascii"),
+            )
+        except UnicodeEncodeError:
+            return False
 
     def _post_preflight(self) -> tuple[str, int]:
         if not self._valid_host():
@@ -1852,18 +1904,7 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
                 "not found",
             )
 
-        authorization = self.headers.get_all("Authorization", [])
-        expected = f"Bearer {self.server.ingest_token}".encode("ascii")
-        authorized = False
-        if len(authorization) == 1:
-            try:
-                authorized = hmac.compare_digest(
-                    authorization[0].encode("latin-1"),
-                    expected,
-                )
-            except UnicodeEncodeError:
-                authorized = False
-        if not authorized:
+        if not self._authorized(self.server.ingest_token):
             raise _IngestRequestError(
                 http.server.HTTPStatus.UNAUTHORIZED,
                 "invalid bearer token",
@@ -2101,7 +2142,10 @@ def run_web_dashboard(
     server.dashboard_state = state
     server.ingest_token = ingest_token
     state.start()
-    address = f"http://127.0.0.1:{server.server_port}/"
+    address = (
+        f"http://127.0.0.1:{server.server_port}/"
+        f"#viewer_token={server.viewer_token}"
+    )
     print(f"metagross view: dashboard available at {address}", file=sys.stderr)
     try:
         server.serve_forever(poll_interval=min(0.2, refresh_seconds))
