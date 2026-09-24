@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 .ruff_cache/
+.coverage
 
 # Local trace artifacts can contain source paths and timing data
 traces/
