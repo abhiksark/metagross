@@ -10,10 +10,41 @@ permissions:
 jobs:
   unittest:
     runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.11', '3.12', '3.13']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
-      - name: Run unprivileged unit tests
+          python-version: ${{ matrix.python-version }}
+      - name: Unprivileged unit tests
         run: python -m unittest -v
+
+  coverage:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install coverage
+      - name: Coverage floor
+        run: |
+          python -m coverage run --source=metagross -m unittest
+          python -m coverage report --fail-under=79
+
+  web-js-syntax:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Extract embedded dashboard JS
+        run: python -c "from metagross import _web; open('_web_app.js', 'wb').write(_web._APP_JS)"
+      - name: Syntax-check embedded dashboard JS
+        run: node --check _web_app.js
