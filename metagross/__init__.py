@@ -328,6 +328,16 @@ def _exit_flushed(code: int) -> NoReturn:
     os._exit(code)
 
 
+def _drop_privileges(creds) -> None:
+    """Drop the process to creds' group set, gid, and uid, in that order."""
+    os.setgroups(os.getgrouplist(creds.user, creds.gid))
+    os.setgid(creds.gid)
+    os.setuid(creds.uid)
+    os.environ["HOME"] = creds.home
+    os.environ["USER"] = creds.user
+    os.environ["LOGNAME"] = creds.user
+
+
 def _child_main(
     script, script_args, creds, barrier_r, profile_w, project_root, python_attribution
 ) -> NoReturn:
@@ -335,12 +345,7 @@ def _child_main(
     os.environ.pop("METAGROSS_DASHBOARD_TOKEN", None)
 
     if creds is not None:
-        os.setgroups(os.getgrouplist(creds.user, creds.gid))
-        os.setgid(creds.gid)
-        os.setuid(creds.uid)
-        os.environ["HOME"] = creds.home
-        os.environ["USER"] = creds.user
-        os.environ["LOGNAME"] = creds.user
+        _drop_privileges(creds)
 
     if os.read(barrier_r, 1) == b"":
         _exit_flushed(1)  # parent died before releasing the barrier

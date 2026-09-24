@@ -385,6 +385,30 @@ class ValidateSudoTest(unittest.TestCase):
         self.assertIsNone(validate_sudo(env, lambda n: FakePw("root", 0, 0, "/root")))
 
 
+class DropPrivilegesTest(unittest.TestCase):
+    def test_drops_by_value_in_group_gid_uid_order(self):
+        creds = metagross.Credentials(1234, 5678, "fixture", "/home/fixture")
+        calls = []
+        env = {}
+        with mock.patch("metagross.os.getgrouplist", return_value=[5678, 27]), \
+                mock.patch("metagross.os.setgroups",
+                           side_effect=lambda g: calls.append(("setgroups", tuple(g)))), \
+                mock.patch("metagross.os.setgid",
+                           side_effect=lambda g: calls.append(("setgid", g))), \
+                mock.patch("metagross.os.setuid",
+                           side_effect=lambda u: calls.append(("setuid", u))), \
+                mock.patch.dict("metagross.os.environ", env, clear=False):
+            metagross._drop_privileges(creds)
+            # Assert HOME while the environ patch is still active: patch.dict
+            # reverts the dict on __exit__, so this must run inside the block.
+            self.assertEqual(metagross.os.environ["HOME"], "/home/fixture")
+        self.assertEqual(calls, [
+            ("setgroups", (5678, 27)),   # groups from getgrouplist(user, gid)
+            ("setgid", 5678),            # gid by value
+            ("setuid", 1234),            # uid by value, last (irreversible after)
+        ])
+
+
 class ExitStatusTest(unittest.TestCase):
     def test_exit_codes_preserved(self):
         for code in (0, 1, 42, 255):
