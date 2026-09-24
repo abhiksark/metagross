@@ -77,10 +77,10 @@ class FrameTimeline:
         _, kind, func, path, line = record
         if kind == 0:
             stack.append(FrameInfo(func, path, line))
-        elif stack and stack[-1].function == func:
+        elif stack and stack[-1] == FrameInfo(func, path, line):
             stack.pop()
-        elif stack:
-            stack.pop()  # unwind mismatch conservatively
+        # A return that does not match the top is spurious or reordered;
+        # leave the stack unchanged rather than unwinding a live frame.
 
     def on_record(self, kind, tid, ts_ns, func, path, line) -> None:
         record = (ts_ns, kind, func, path, line)

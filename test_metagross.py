@@ -1086,6 +1086,15 @@ class AttributionTest(unittest.TestCase):
         self.tl.prune(175)
         self.assertIsNone(self.tl.attribute(1, 200))
 
+    def test_mismatched_return_does_not_pop_a_live_frame(self):
+        tl = _events.FrameTimeline()
+        tl.on_record(0, 7, 10, "outer", "/proj/a.py", 1)   # call outer
+        tl.on_record(0, 7, 20, "inner", "/proj/b.py", 2)   # call inner
+        tl.on_record(1, 7, 30, "ghost", "/proj/c.py", 3)   # spurious return
+        # inner is still open; the spurious return must not unwind it.
+        self.assertEqual(tl.attribute(7, 35),
+                         _events.FrameInfo("inner", "/proj/b.py", 2))
+
 
 class JoinerTest(unittest.TestCase):
     def test_hold_then_release(self):
