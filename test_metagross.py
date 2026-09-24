@@ -1095,6 +1095,21 @@ class AttributionTest(unittest.TestCase):
         self.assertEqual(tl.attribute(7, 35),
                          _events.FrameInfo("inner", "/proj/b.py", 2))
 
+    def test_prune_bounds_history_under_long_lived_frame(self):
+        tl = _events.FrameTimeline()
+        tl.on_record(0, 3, 1, "main", "/proj/m.py", 1)   # long-lived outer frame
+        for k in range(50):
+            ts = 2 + 2 * k
+            tl.on_record(0, 3, ts, "step", "/proj/m.py", 9)
+            tl.on_record(1, 3, ts + 1, "step", "/proj/m.py", 9)
+        tl.attribute(3, 200)                              # advance the cursor
+        tl.prune(150)
+        log = tl._logs[3]
+        self.assertLessEqual(len(log), 2)                 # main + nothing still open
+        # Attribution after prune is still correct.
+        self.assertEqual(tl.attribute(3, 300),
+                         _events.FrameInfo("main", "/proj/m.py", 1))
+
 
 class JoinerTest(unittest.TestCase):
     def test_hold_then_release(self):

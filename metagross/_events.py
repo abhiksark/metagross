@@ -117,23 +117,29 @@ class FrameTimeline:
 
     def prune(self, min_ts_ns: int) -> None:
         for tid, log in self._logs.items():
-            depth = 0
             cut = 0
-            for i, (ts, kind, *_rest) in enumerate(log):
-                if ts >= min_ts_ns:
+            open_stack: list[FrameInfo] = []
+            open_indices: list[int] = []
+            for i, record in enumerate(log):
+                if record[0] >= min_ts_ns:
                     break
-                depth += 1 if kind == 0 else -1
-                if depth <= 0:
-                    depth = max(depth, 0)
-                    cut = i + 1
-            if cut:
-                del log[:cut]
-                state = self._states.get(tid)
-                if state is not None:
-                    if cut >= state.index:
-                        self._states[tid] = _ReplayState()
-                    else:
-                        state.index -= cut
+                cut = i + 1
+                before = len(open_stack)
+                self._apply(open_stack, record)
+                if len(open_stack) > before:
+                    open_indices.append(i)           # a CALL was pushed
+                elif len(open_stack) < before:
+                    open_indices.pop()               # a RETURN popped it
+            if not cut:
+                continue
+            retained = [log[i] for i in open_indices]  # still-open calls, in order
+            log[:] = retained + log[cut:]
+            state = self._states.get(tid)
+            if state is not None:
+                if state.index >= cut:
+                    state.index = len(retained) + (state.index - cut)
+                else:
+                    self._states[tid] = _ReplayState()
 
 
 @dataclasses.dataclass
