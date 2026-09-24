@@ -74,6 +74,7 @@ class FrameTimeline:
     def __init__(self):
         self._logs: dict[int, list[tuple]] = {}
         self._states: dict[int, _ReplayState] = {}
+        self._horizons: dict[int, int] = {}
 
     @staticmethod
     def _apply(stack: list[FrameInfo], record: tuple) -> None:
@@ -102,6 +103,9 @@ class FrameTimeline:
         log = self._logs.get(tid)
         if not log:
             return None
+        horizon = self._horizons.get(tid)
+        if horizon is not None and ts_ns < horizon:
+            return None  # history below the prune horizon is gone; do not guess
         state = self._states.setdefault(tid, _ReplayState())
         if ts_ns < state.last_ts_ns:
             # GPU delivery can rarely exceed the hold window. Answer an older
@@ -120,6 +124,7 @@ class FrameTimeline:
 
     def prune(self, min_ts_ns: int) -> None:
         for tid, log in self._logs.items():
+            self._horizons[tid] = min_ts_ns
             cut = 0
             open_stack: list[FrameInfo] = []
             open_indices: list[int] = []

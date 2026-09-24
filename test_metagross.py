@@ -1134,6 +1134,19 @@ class AttributionTest(unittest.TestCase):
         self.assertEqual(tl.attribute(3, 300),
                          _events.FrameInfo("main", "/proj/m.py", 1))
 
+    def test_prune_horizon_fails_closed_on_pruned_history(self):
+        tl = _events.FrameTimeline()
+        tl.on_record(0, 1, 1, "main", "/p/m.py", 1)     # main opens
+        tl.on_record(0, 1, 10, "inner", "/p/m.py", 5)   # inner opens
+        tl.on_record(1, 1, 20, "inner", "/p/m.py", 5)   # inner closes
+        tl.attribute(1, 100)                            # advance the cursor
+        tl.prune(50)                                    # inner's open/close is pruned
+        # The true answer at ts=15 was inner, now pruned away; must be None,
+        # not a confident-wrong "main".
+        self.assertIsNone(tl.attribute(1, 15))
+        self.assertEqual(tl.attribute(1, 100),
+                         _events.FrameInfo("main", "/p/m.py", 1))
+
 
 class JoinerTest(unittest.TestCase):
     def test_hold_then_release(self):
