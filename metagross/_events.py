@@ -12,6 +12,9 @@ import shlex
 from metagross import _bpf, MetagrossError
 
 
+_UNSET = object()
+
+
 class KernelRegistry:
     def __init__(self):
         self._names: dict[int, str] = {}
@@ -147,6 +150,7 @@ class AttributedEvent:
     raw: object
     api: object
     frame: FrameInfo | None
+    kernel_at_enqueue: str | None = None
 
 
 @dataclasses.dataclass
@@ -173,14 +177,19 @@ class Joiner:
         if api.category == "register":
             self.registry.observe(api, raw)
             return
-        self._pending.append((raw.ts, raw, api))
+        kernel = None
+        if api.category in ("launch", "launch_ex"):
+            handle = raw.args[0] if api.category == "launch" else raw.args[1]
+            kernel = self.registry.name(handle)
+        self._pending.append((raw.ts, raw, api, kernel))
 
     def on_profile_record(self, rec) -> None:
         self.timeline.on_record(*rec)
 
     def enrich(self, event: AttributedEvent) -> EnrichedEvent:
         kernel, details = describe(
-            event.api, event.raw, self.registry, self.allocs
+            event.api, event.raw, self.registry, self.allocs,
+            kernel_override=event.kernel_at_enqueue,
         )
         return EnrichedEvent(
             event.raw, event.api, event.frame, kernel, details
@@ -188,17 +197,19 @@ class Joiner:
 
     def flush(self, now_ns: int, force: bool = False):
         released, kept = [], []
-        for ts, raw, api in self._pending:
+        for ts, raw, api, kernel in self._pending:
             if force or now_ns - ts >= self.hold_ns:
-                released.append((ts, raw, api))
+                released.append((ts, raw, api, kernel))
             else:
-                kept.append((ts, raw, api))
+                kept.append((ts, raw, api, kernel))
         self._pending = kept
         released.sort(key=lambda item: item[0])
-        out = [AttributedEvent(raw, api, self.timeline.attribute(raw.tid, ts))
-               for ts, raw, api in released]
+        out = [AttributedEvent(raw, api, self.timeline.attribute(raw.tid, ts),
+                               kernel)
+               for ts, raw, api, kernel in released]
         if released:
-            self.timeline.prune(min(ts for ts, _, _ in kept) if kept else now_ns)
+            self.timeline.prune(
+                min(ts for ts, _, _, _ in kept) if kept else now_ns)
         return out
 
 
@@ -206,7 +217,18 @@ def _hex(v: int) -> str:
     return f"0x{v:x}"
 
 
-def describe(api, ev, registry: KernelRegistry, allocs: AllocTracker):
+def describe(api, ev, registry: KernelRegistry, allocs: AllocTracker,
+             kernel_override=_UNSET):
+    """Describe a raw CUDA event.
+
+    kernel_override distinguishes two callers for launch categories:
+    left at the default _UNSET (the direct-call path DescribeTest uses),
+    the kernel name is looked up live in registry, matching pre-existing
+    behavior. Passed explicitly (the Joiner.enrich path, always passed),
+    a str names the kernel snapshotted at enqueue time and None freezes
+    the launch to the placeholder rather than trusting a later
+    registration.
+    """
     cat = api.category
     kernel = None
     det: dict = {}
@@ -230,7 +252,10 @@ def describe(api, ev, registry: KernelRegistry, allocs: AllocTracker):
             det["block"] = f"{bx},{by},{bz}"
             det["shared"] = ev.args[5]
             det["stream"] = _hex(ev.args[6])
-        kernel = registry.name(handle) or f"kernel@{handle:#x}"
+        if kernel_override is _UNSET:
+            kernel = registry.name(handle) or f"kernel@{handle:#x}"
+        else:
+            kernel = kernel_override or f"kernel@{handle:#x}"
         det["function_handle"] = _hex(handle)
     elif cat in ("alloc", "alloc_async"):
         det["bytes"] = ev.args[1]

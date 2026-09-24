@@ -1141,6 +1141,23 @@ class JoinerTest(unittest.TestCase):
         self.assertEqual(j.flush(now_ns=10**12), [])
         self.assertEqual(j.registry.name(0xF00), "vec_add")
 
+    def test_launch_keeps_kernel_name_from_enqueue_time(self):
+        j = _events.Joiner(hold_ns=100)
+        j.on_gpu_event(_raw(18, out=0xF00, name=b"vec_add"))   # register F00 -> vec_add
+        j.on_gpu_event(_raw(1, ts=10, args=(0xF00, 1, 1, 1, 1, 1, 1, 0, 0)))  # launch F00
+        j.on_gpu_event(_raw(18, out=0xF00, name=b"other"))     # reused handle re-registered
+        out = j.flush(10_000, force=True)
+        enriched = [j.enrich(e) for e in out]
+        self.assertEqual(enriched[0].kernel, "vec_add")
+
+    def test_launch_of_unregistered_handle_freezes_to_placeholder(self):
+        j = _events.Joiner(hold_ns=100)
+        j.on_gpu_event(_raw(1, ts=10, args=(0xF00, 1, 1, 1, 1, 1, 1, 0, 0)))  # launch F00, unregistered
+        j.on_gpu_event(_raw(18, out=0xF00, name=b"late"))  # registered after enqueue
+        out = j.flush(10_000, force=True)
+        enriched = [j.enrich(e) for e in out]
+        self.assertEqual(enriched[0].kernel, "kernel@0xf00")
+
 
 class RendererTest(unittest.TestCase):
     def _emit(self, ev, json_output):
@@ -1158,7 +1175,8 @@ class RendererTest(unittest.TestCase):
         raw = _raw(1, args=(0xF00, 256, 1, 1, 128, 1, 1, 0, 0x77),
                    ts=3_600_000_000_000, dur=20_000, tid=1)
         ev = _events.AttributedEvent(raw, _bpf.API_BY_ID[1],
-                                     _events.FrameInfo("train_step", "/p/train.py", 31))
+                                     _events.FrameInfo("train_step", "/p/train.py", 31),
+                                     kernel_at_enqueue="vec_add")
         out = self._emit(ev, json_output=False)
         self.assertIn("LaunchKernel", out)
         self.assertIn("train_step", out)
@@ -1176,7 +1194,8 @@ class RendererTest(unittest.TestCase):
         raw = _raw(1, args=(0xF00, 256, 1, 1, 128, 1, 1, 0, 0x77),
                    ts=1_000_000_000, dur=20_000, tid=5)
         ev = _events.AttributedEvent(raw, _bpf.API_BY_ID[1],
-                                     _events.FrameInfo("f", "/p/a.py", 2))
+                                     _events.FrameInfo("f", "/p/a.py", 2),
+                                     kernel_at_enqueue="vec_add")
         line = self._emit(ev, json_output=True).strip()
         rec = json.loads(line)
         self.assertEqual(
