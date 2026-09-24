@@ -147,6 +147,19 @@ class ViewerModelTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "details"):
             _viewer.parse_event(_record(details=[]))
 
+    def test_parse_event_accepts_additive_span_field_with_and_without(self):
+        # Task 6 adds an ADDITIVE "span" key to the JSONL record. A record
+        # that carries it and a record that omits it (the old, pre-Task-6
+        # shape) must both still parse without error.
+        with_span = _viewer.parse_event(_record(span="forward"))
+        without_span = _viewer.parse_event(_record())
+        self.assertEqual(with_span.function, "compute")
+        self.assertEqual(without_span.function, "compute")
+
+    def test_parse_event_rejects_non_string_span(self):
+        with self.assertRaisesRegex(ValueError, "span"):
+            _viewer.parse_event(_record(span=123))
+
     def test_summary_schema_requires_nonnegative_integers(self):
         model = _viewer.TraceModel()
         with self.assertRaisesRegex(_viewer.ViewerError, "unsupported"):

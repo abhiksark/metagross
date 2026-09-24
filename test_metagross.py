@@ -192,6 +192,36 @@ class CaptureStatsTest(unittest.TestCase):
         self.assertEqual(snapshot["top_functions"][0]["function"], "step")
         self.assertEqual(snapshot["top_functions"][0]["count"], 3)
 
+    def test_snapshot_aggregates_top_spans_only_when_present(self):
+        joiner = _events.Joiner()
+        stats = _events.CaptureStats()
+        frame = _events.FrameInfo("step", "/p/train.py", 10)
+        attributed = [
+            _events.AttributedEvent(
+                _raw(3, args=(0, 1024), out=0xA, dur=10),
+                _bpf.API_BY_ID[3], frame, span="forward",
+            ),
+            _events.AttributedEvent(
+                _raw(7, args=(0xA, 0xB, 512), dur=20),
+                _bpf.API_BY_ID[7], frame, span="forward",
+            ),
+            _events.AttributedEvent(
+                _raw(9, args=(0xB, 0xA, 256), ret=1, dur=30),
+                _bpf.API_BY_ID[9], frame,  # no enclosing span
+            ),
+        ]
+        for event in attributed:
+            stats.observe(joiner.enrich(event))
+        snapshot = stats.snapshot(
+            lost_events=0,
+            dropped_nested_calls=0,
+            observed_outstanding_bytes=joiner.allocs.total_bytes,
+            render_failed=False,
+        )
+        self.assertEqual(len(snapshot["top_spans"]), 1)
+        self.assertEqual(snapshot["top_spans"][0]["span"], "forward")
+        self.assertEqual(snapshot["top_spans"][0]["count"], 2)
+
     def test_loss_or_render_failure_marks_snapshot_incomplete(self):
         stats = _events.CaptureStats()
         snapshot = stats.snapshot(
@@ -1775,6 +1805,43 @@ class JoinerTest(unittest.TestCase):
         self.assertEqual(enriched[0].kernel, "kernel@0xf00")
 
 
+class SpanJoinTest(unittest.TestCase):
+    def test_event_resolves_enclosing_span(self):
+        j = _events.Joiner(hold_ns=100)
+        j.on_profile_record(("span_begin", 1, 5, "forward"))
+        # a launch at ts=10, tid=1, inside the "forward" span
+        j.on_gpu_event(_raw(1, ts=10, tid=1,
+                            args=(0xF00, 1, 1, 1, 1, 1, 1, 0, 0)))
+        out = j.flush(10_000, force=True)
+        self.assertEqual(out[0].span, "forward")
+        enriched = j.enrich(out[0])
+        rec = _events.event_record(enriched, 0, 4242)
+        self.assertEqual(rec["span"], "forward")
+
+    def test_event_with_no_enclosing_span_is_null(self):
+        j = _events.Joiner(hold_ns=100)
+        j.on_gpu_event(_raw(1, ts=10, tid=1,
+                            args=(0xF00, 1, 1, 1, 1, 1, 1, 0, 0)))
+        out = j.flush(10_000, force=True)
+        self.assertIsNone(out[0].span)
+        enriched = j.enrich(out[0])
+        self.assertIsNone(_events.event_record(enriched, 0, 4242)["span"])
+
+    def test_flush_prunes_span_timeline_with_same_horizon_as_frame_timeline(self):
+        j = _events.Joiner(hold_ns=100)
+        j.on_profile_record(("frame", _profile.CALL, 1, 4, "f", "/p/a.py", 1))
+        j.on_profile_record(("span_begin", 1, 5, "forward"))
+        j.on_profile_record(("span_end", 1, 8))
+        j.on_gpu_event(_raw(1, ts=10, tid=1,
+                            args=(0xF00, 1, 1, 1, 1, 1, 1, 0, 0)))
+        j.flush(10_000, force=True)
+        # The closed span log is fully below the flush horizon and must be
+        # pruned away just like FrameTimeline -- the span timeline must not
+        # grow unbounded.
+        self.assertEqual(j.spans._logs.get(1, []), [])
+        self.assertEqual(j.timeline._horizons.get(1), j.spans._horizons.get(1))
+
+
 class RendererTest(unittest.TestCase):
     def _emit(self, ev, json_output):
         j = _events.Joiner()
@@ -1806,18 +1873,34 @@ class RendererTest(unittest.TestCase):
                          json_output=False)
         self.assertIn("<unknown>", out)
 
+    def test_table_row_shows_span_when_present(self):
+        raw = _raw(1, args=(0xF00, 256, 1, 1, 128, 1, 1, 0, 0x77),
+                   ts=3_600_000_000_000, dur=20_000, tid=1)
+        ev = _events.AttributedEvent(raw, _bpf.API_BY_ID[1],
+                                     _events.FrameInfo("train_step", "/p/train.py", 31),
+                                     kernel_at_enqueue="vec_add", span="forward")
+        out = self._emit(ev, json_output=False)
+        self.assertIn("span=forward", out)
+
+    def test_table_row_omits_span_when_absent(self):
+        raw = _raw(16, ts=1, dur=1, tid=1)
+        out = self._emit(_events.AttributedEvent(raw, _bpf.API_BY_ID[16], None),
+                         json_output=False)
+        self.assertNotIn("span=", out)
+
     def test_json_schema(self):
         raw = _raw(1, args=(0xF00, 256, 1, 1, 128, 1, 1, 0, 0x77),
                    ts=1_000_000_000, dur=20_000, tid=5)
         ev = _events.AttributedEvent(raw, _bpf.API_BY_ID[1],
                                      _events.FrameInfo("f", "/p/a.py", 2),
-                                     kernel_at_enqueue="vec_add")
+                                     kernel_at_enqueue="vec_add", span="forward")
         line = self._emit(ev, json_output=True).strip()
         rec = json.loads(line)
         self.assertEqual(
             sorted(rec),
             ["api", "details", "duration_ns", "file", "function", "kernel",
-             "line", "pid", "return_code", "tid", "timestamp"])
+             "line", "pid", "return_code", "span", "tid", "timestamp"])
+        self.assertEqual(rec["span"], "forward")
         self.assertEqual(rec["api"], "cuLaunchKernel")
         self.assertEqual(rec["kernel"], "vec_add")
         self.assertEqual(rec["pid"], 1234)
@@ -1845,6 +1928,7 @@ class RendererTest(unittest.TestCase):
         self.assertIsNone(rec["file"])
         self.assertIsNone(rec["line"])
         self.assertIsNone(rec["kernel"])
+        self.assertIsNone(rec["span"])
 
     def test_event_writes_are_buffered_until_batch_flush(self):
         class TrackingStream(io.StringIO):

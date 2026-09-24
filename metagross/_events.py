@@ -305,6 +305,7 @@ class AttributedEvent:
     api: object
     frame: FrameInfo | None
     kernel_at_enqueue: str | None = None
+    span: str | None = None
 
 
 @dataclasses.dataclass
@@ -314,6 +315,7 @@ class EnrichedEvent:
     frame: FrameInfo | None
     kernel: str | None
     details: dict
+    span: str | None = None
 
 
 class Joiner:
@@ -360,7 +362,7 @@ class Joiner:
             kernel_override=event.kernel_at_enqueue,
         )
         return EnrichedEvent(
-            event.raw, event.api, event.frame, kernel, details
+            event.raw, event.api, event.frame, kernel, details, event.span
         )
 
     def flush(self, now_ns: int, force: bool = False):
@@ -373,11 +375,12 @@ class Joiner:
         self._pending = kept
         released.sort(key=lambda item: item[0])
         out = [AttributedEvent(raw, api, self.timeline.attribute(raw.tid, ts),
-                               kernel)
+                               kernel, self.spans.attribute(raw.tid, ts))
                for ts, raw, api, kernel in released]
         if released:
-            self.timeline.prune(
-                min(ts for ts, _, _, _ in kept) if kept else now_ns)
+            horizon = min(ts for ts, _, _, _ in kept) if kept else now_ns
+            self.timeline.prune(horizon)
+            self.spans.prune(horizon)
         return out
 
 
@@ -494,6 +497,7 @@ class CaptureStats:
         self._api: dict[str, _Aggregate] = {}
         self._function: dict[tuple[str, str, int], _Aggregate] = {}
         self._kernel: dict[str, _Aggregate] = {}
+        self._span: dict[str, _Aggregate] = {}
         self._copy_bytes: dict[str, int] = {}
 
     def observe(self, event: EnrichedEvent) -> None:
@@ -522,6 +526,8 @@ class CaptureStats:
             self._function.setdefault(function_key, _Aggregate()).observe(event)
         if event.kernel is not None and not event.kernel.startswith("kernel@"):
             self._kernel.setdefault(event.kernel, _Aggregate()).observe(event)
+        if event.span is not None:
+            self._span.setdefault(event.span, _Aggregate()).observe(event)
 
     @staticmethod
     def _top_rows(groups: dict, field_names: tuple[str, ...]) -> list[dict]:
@@ -580,6 +586,7 @@ class CaptureStats:
                 self._function, ("function", "file", "line")
             ),
             "top_kernels": self._top_rows(self._kernel, ("kernel",)),
+            "top_spans": self._top_rows(self._span, ("span",)),
         }
 
 
@@ -616,6 +623,7 @@ def event_record(
         "return_code": event.raw.ret,
         "duration_ns": event.raw.dur,
         "details": event.details,
+        "span": event.span,
     }
 
 
@@ -642,6 +650,8 @@ class Renderer:
         if kernel is not None:
             details = {"kernel": kernel, **details}
             details.pop("function_handle", None)
+        if ev.span is not None:
+            details = {**details, "span": ev.span}
         func = ev.frame.function if ev.frame else "<unknown>"
         loc = (f"{os.path.basename(ev.frame.file)}:{ev.frame.line}"
                if ev.frame else "<unknown>")
