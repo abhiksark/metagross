@@ -513,7 +513,83 @@ def run_live(cfg: Config) -> int:
                 raise
             raise MetagrossError(f"cannot start dashboard delivery: {exc}") from exc
 
-    # 7. Release the barrier only after probes and dashboard delivery are ready.
+    # 7. Construct capture machinery: joiner/renderer/stats, the ring-buffer
+    # callback, and the profile selector. All of this must be ready before
+    # the barrier is released, and any failure here must tear down cleanly
+    # with the target still blocked, never stalled unkilled on the barrier.
+    selector = None
+    try:
+        joiner = _events.Joiner()
+        renderer = _events.Renderer(stream, cfg.json_output, wall_minus_mono_ns, pid)
+        stats = (
+            _events.CaptureStats()
+            if cfg.show_stats or summary_stream is not None or publisher is not None
+            else None
+        )
+        render_broken = False
+        trace_failed = False
+        publisher_error_reported = False
+
+        def _report_publisher_error(message: str | None = None) -> None:
+            nonlocal publisher_error_reported
+            if publisher is None or publisher_error_reported:
+                return
+            error = message if message is not None else publisher.pop_error()
+            if error is not None:
+                print(f"metagross: {error}", file=sys.stderr)
+                publisher_error_reported = True
+
+        def _emit_all(events):
+            nonlocal render_broken
+            emitted = False
+            for event in events:
+                enriched = joiner.enrich(event)
+                if stats is not None:
+                    stats.observe(enriched)
+                if publisher is not None:
+                    try:
+                        publisher.offer(
+                            _events.event_record(enriched, wall_minus_mono_ns, pid)
+                        )
+                    except Exception as exc:
+                        publisher.drop_event(
+                            "dashboard event normalization failed: "
+                            f"{type(exc).__name__}"
+                        )
+                    _report_publisher_error()
+                if render_broken:
+                    continue
+                try:
+                    renderer.emit(enriched)
+                    emitted = True
+                except MetagrossError as exc:
+                    print(f"metagross: {exc}", file=sys.stderr)
+                    render_broken = True
+            if emitted and not render_broken:
+                try:
+                    renderer.flush()
+                except MetagrossError as exc:
+                    print(f"metagross: {exc}", file=sys.stderr)
+                    render_broken = True
+
+        def _on_ring_event(_ctx, data, size):
+            joiner.on_gpu_event(_bpf.decode_event(ct.string_at(data, size)))
+
+        reader = _profile.RecordReader()
+
+        b["events"].open_ring_buffer(_on_ring_event)
+        selector = selectors.DefaultSelector()
+        selector.register(profile_r, selectors.EVENT_READ)
+    except BaseException as exc:
+        if selector is not None:
+            selector.close()
+        _cleanup_before_release()
+        if isinstance(exc, KeyboardInterrupt):
+            raise
+        raise MetagrossError(f"failed to open ring buffer: {exc}") from exc
+
+    # 8. Release the barrier only after probes, dashboard delivery, the ring
+    # buffer, and the profile selector are all ready.
     try:
         os.write(barrier_w, b"\x01")
     except OSError:
@@ -523,70 +599,8 @@ def run_live(cfg: Config) -> int:
         raise MetagrossError("target exited before tracing began") from None
     os.close(barrier_w)
 
-    # 8. Event loop: drain GPU events and profiling records, attribute,
+    # 9. Event loop: drain GPU events and profiling records, attribute,
     # render, and watch for the child's exit.
-    joiner = _events.Joiner()
-    renderer = _events.Renderer(stream, cfg.json_output, wall_minus_mono_ns, pid)
-    stats = (
-        _events.CaptureStats()
-        if cfg.show_stats or summary_stream is not None or publisher is not None
-        else None
-    )
-    render_broken = False
-    trace_failed = False
-    publisher_error_reported = False
-
-    def _report_publisher_error(message: str | None = None) -> None:
-        nonlocal publisher_error_reported
-        if publisher is None or publisher_error_reported:
-            return
-        error = message if message is not None else publisher.pop_error()
-        if error is not None:
-            print(f"metagross: {error}", file=sys.stderr)
-            publisher_error_reported = True
-
-    def _emit_all(events):
-        nonlocal render_broken
-        emitted = False
-        for event in events:
-            enriched = joiner.enrich(event)
-            if stats is not None:
-                stats.observe(enriched)
-            if publisher is not None:
-                try:
-                    publisher.offer(
-                        _events.event_record(enriched, wall_minus_mono_ns, pid)
-                    )
-                except Exception as exc:
-                    publisher.drop_event(
-                        "dashboard event normalization failed: "
-                        f"{type(exc).__name__}"
-                    )
-                _report_publisher_error()
-            if render_broken:
-                continue
-            try:
-                renderer.emit(enriched)
-                emitted = True
-            except MetagrossError as exc:
-                print(f"metagross: {exc}", file=sys.stderr)
-                render_broken = True
-        if emitted and not render_broken:
-            try:
-                renderer.flush()
-            except MetagrossError as exc:
-                print(f"metagross: {exc}", file=sys.stderr)
-                render_broken = True
-
-    def _on_ring_event(_ctx, data, size):
-        joiner.on_gpu_event(_bpf.decode_event(ct.string_at(data, size)))
-
-    b["events"].open_ring_buffer(_on_ring_event)
-
-    reader = _profile.RecordReader()
-    selector = selectors.DefaultSelector()
-    selector.register(profile_r, selectors.EVENT_READ)
-
     def _read_available_profile_records(fd, max_reads=None):
         """Drain profile data fairly; return True when the fd reaches EOF."""
         reads = 0

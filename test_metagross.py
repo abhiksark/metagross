@@ -54,6 +54,10 @@ def _raw(api_id, *, args=(), out=0, name=b"", ret=0, ts=0, dur=0, tid=1):
     return ev
 
 
+def _stub_attachment():
+    return _bpf.Attachment(api=_bpf.API_BY_ID[1], symbol="cuLaunchKernel")
+
+
 class KernelRegistryTest(unittest.TestCase):
     def test_module_get_function_registers(self):
         reg = _events.KernelRegistry()
@@ -1853,6 +1857,54 @@ class MainRoutingTest(unittest.TestCase):
             rc = metagross.main(["examples/gpu_demo.py"])
         self.assertEqual(rc, 1)
         self.assertIn("root", err.getvalue())
+
+
+class RunLiveInitFailureTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+
+    def _run(self, bpf_factory):
+        cfg = Config(script=__file__, project_root=os.path.dirname(__file__))
+        creds = Credentials(os.getuid(), os.getgid(), "fixture", self.dir.name)
+        killed, reaped, writes = [], [], []
+
+        def fake_write(fd, data):
+            writes.append(fd)
+            return len(data)
+
+        with mock.patch("metagross.os.geteuid", return_value=0), \
+                mock.patch("metagross.validate_sudo", return_value=creds), \
+                mock.patch("metagross._bpf.find_libcuda", return_value="/unused"), \
+                mock.patch.dict("sys.modules", {"bcc": mock.Mock(BPF=bpf_factory)}), \
+                mock.patch("metagross._bpf.dlsym_resolver", return_value=lambda s: 1), \
+                mock.patch("metagross._bpf.resolve_attachments",
+                           return_value=[_stub_attachment()]), \
+                mock.patch("metagross._child_main",
+                           side_effect=AssertionError("child path must not run")), \
+                mock.patch("metagross.os.fork", return_value=4242), \
+                mock.patch("metagross.os.kill", side_effect=lambda p, s: killed.append(p)), \
+                mock.patch("metagross.os.waitpid",
+                           side_effect=lambda p, f=0: reaped.append(p) or (p, 0)), \
+                mock.patch("metagross.os.write", side_effect=fake_write):
+            with self.assertRaisesRegex(MetagrossError, "ring buffer"):
+                metagross.run_live(cfg)
+        return killed, reaped, writes
+
+    def test_ring_open_failure_kills_child_before_release(self):
+        class FakeBPF:
+            def __init__(self, *a, **k): self._maps = {"events": self}
+            def __getitem__(self, key): return self
+            def attach_uprobe(self, **k): pass
+            def attach_uretprobe(self, **k): pass
+            def open_ring_buffer(self, cb): raise RuntimeError("ring buffer open failed")
+            def cleanup(self): FakeBPF.cleaned = True
+        FakeBPF.cleaned = False
+        killed, reaped, writes = self._run(FakeBPF)
+        self.assertIn(4242, killed)          # child was signalled
+        self.assertIn(4242, reaped)          # and reaped
+        self.assertTrue(FakeBPF.cleaned)     # BPF object torn down
+        self.assertEqual(writes, [])         # barrier was never written to
 
 
 @unittest.skipUnless(INTEGRATION and os.geteuid() == 0,
