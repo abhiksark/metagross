@@ -9,8 +9,15 @@ that made it:
 Or run it bare (no tracing, no root) to check it works:
 
     /usr/bin/python3 examples/quicklook.py
+
+`run_kernel()` also runs inside `metagross.span("compute")`: traced, its
+calls carry `"compute"` in their `span` field (table details and JSONL
+alike) on top of the usual per-function attribution. `metagross.span()` is a
+no-op when the script runs bare, so nothing changes for the untraced run.
 """
 import ctypes
+
+import metagross
 
 N = 256
 # Minimal PTX kernel: c[i] = a[i] + b[i].
@@ -116,7 +123,8 @@ def fetch_result(buffers):
 def main():
     context, module, func = start_gpu()
     buffers = send_inputs()
-    run_kernel(func, buffers)
+    with metagross.span("compute"):
+        run_kernel(func, buffers)
     fetch_result(buffers)
     check(cuda.cuModuleUnload(module), "cuModuleUnload")
     check(cuda.cuCtxDestroy_v2(context), "cuCtxDestroy")

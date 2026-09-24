@@ -116,6 +116,31 @@ project frame is active are attributed as unknown rather than suppressed.
 Events are held for 100 ms to tolerate cross-CPU and cross-stream delivery
 ordering. Long API calls appear after they complete.
 
+### Op spans
+
+`metagross.span("name")` is a public context manager the target script can
+call to mark a named region of its own code:
+
+```python
+import metagross
+
+with metagross.span("forward"):
+    model(inputs)
+```
+
+Every CUDA API call attributed while a span is open on the calling thread
+carries that span's name in its `span` field, alongside its usual project
+function attribution. Spans nest: the innermost open span on a thread is the
+one recorded, and closing one (`__exit__`) always closes the innermost still
+open on that thread, mirroring ordinary Python `with`-block nesting. A
+`metagross.span()` call outside a running trace (the script run bare, without
+`sudo /usr/bin/python3 -m metagross`) is a no-op — the `with` block still
+runs its body normally, so instrumented scripts stay runnable unmodified.
+Spans use the same profile pipe and interning writer as project-function
+attribution (see [Overhead and limits](#overhead-and-limits)) and fail closed
+the same way: a span left open across a lost or gapped record resolves to no
+span (`null`) rather than a guessed one.
+
 ## Output
 
 The table begins with this illustrative shape (timings vary):
@@ -131,7 +156,7 @@ stream did not contain enough matching data for safe attribution.
 JSONL records use this exact top-level schema:
 
 ```json
-{"timestamp":"2026-08-24T12:10:03.410000+05:30","pid":1234,"tid":1234,"function":"compute","file":"/workspace/examples/gpu_demo.py","line":86,"api":"cuLaunchKernel","kernel":"vec_add","return_code":0,"duration_ns":50000,"details":{"grid":"8,1,1","block":"128,1,1","shared":0,"stream":"0x0","function_handle":"0xf00"}}
+{"timestamp":"2026-08-24T12:10:03.410000+05:30","pid":1234,"tid":1234,"function":"compute","file":"/workspace/examples/gpu_demo.py","line":86,"api":"cuLaunchKernel","kernel":"vec_add","return_code":0,"duration_ns":50000,"details":{"grid":"8,1,1","block":"128,1,1","shared":0,"stream":"0x0","function_handle":"0xf00"},"span":"compute"}
 ```
 
 `function`, `file`, and `line` are `null` when attribution is unknown. `file` is
@@ -139,7 +164,9 @@ the path reported by the Python code object and is normally absolute; table
 output displays only its basename. `line` is the function definition line.
 `return_code` is the signed raw CUDA driver `CUresult`. Timestamps are local ISO
 8601 values derived from the API call's monotonic start time and the parent
-startup wall-clock offset.
+startup wall-clock offset. `span` is the name of the innermost
+[`metagross.span()`](#op-spans) region active at API entry on the same thread,
+or `null` when no span was active; it is additive and always present.
 
 For a launch with a resolved name, `kernel` contains that name. For non-launch
 events it is `null`. An unresolved launch is shown as `kernel@0x...` in table
@@ -171,10 +198,10 @@ sudo /usr/bin/python3 -m metagross \
 
 Summary schema version 1 has top-level `schema_version`, `complete`, `capture`,
 `timing`, `memory`, `copies`, `apis`, `top_functions`, `top_kernels`,
-`configuration`, and `target` fields. `complete` is false if BPF events were
-lost, nested calls were dropped, profile records were lost, event rendering
-failed, or the tracing loop failed. Unknown Python attribution does not by
-itself make capture incomplete. Allocation and byte totals describe
+`top_spans`, `configuration`, and `target` fields. `complete` is false if BPF
+events were lost, nested calls were dropped, profile records were lost, event
+rendering failed, or the tracing loop failed. Unknown Python attribution does
+not by itself make capture incomplete. Allocation and byte totals describe
 successfully observed driver calls, not physical GPU usage or
 framework-level tensor allocations.
 
@@ -190,11 +217,14 @@ Summary nested fields are:
 | `target` | `pid`, `script`, `exit_status` |
 
 The `apis` array identifies rows by `api`; `top_functions` identifies rows by
-`function`, `file`, and `line`; `top_kernels` identifies rows by `kernel`.
+`function`, `file`, and `line`; `top_kernels` identifies rows by `kernel`;
+`top_spans` identifies rows by `span`, mirroring `top_kernels`, and is
+populated only from events attributed to a `metagross.span()` region.
 Every aggregate row contains `count`, `errors`, `total_duration_ns`,
-`max_duration_ns`, and `successful_bytes`. Function and kernel lists retain the
-top 20 groups ordered by count, then total duration, then identity. Counts and
-durations are integers; failure indicators and `complete` are booleans.
+`max_duration_ns`, and `successful_bytes`. Function, kernel, and span lists
+retain the top 20 groups ordered by count, then total duration, then
+identity. Counts and durations are integers; failure indicators and
+`complete` are booleans.
 The [sanitized summary fixture](../examples/captures/basic-summary.json) is a
 complete example. `capture.delivery_dropped` exists only in direct-delivery
 summaries, as described below.

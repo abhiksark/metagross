@@ -24,6 +24,9 @@ without changing normal target stdout; trace rows go to stderr by default.
   driver calls.
 - A function-grouped timeline, event details, and aggregate rankings without
   workload source instrumentation.
+- Optional named regions via `metagross.span("name")`, an opt-in context
+  manager that groups events by a script-chosen label alongside function
+  attribution; a no-op when the script runs outside a trace.
 - Optional stable JSONL and final summary files for durable captures.
 
 <a id="quick-start"></a>
@@ -99,6 +102,12 @@ One launched Python process is traced; there is no existing-PID attach,
 subprocess capture, or `python -m` target form. See the
 [complete CLI and interpreter contract](docs/reference.md#usage) or the
 [prepared-container route](examples/docker/README.md).
+
+Optionally mark named regions of your own code with `import metagross` and
+`with metagross.span("step"): ...`; every CUDA call attributed inside that
+block carries `"step"` in its `span` field, in table output and JSONL alike.
+See [op spans](docs/reference.md#op-spans) and the annotated
+[`examples/quicklook.py`](examples/quicklook.py).
 
 ## What the dashboard shows
 
