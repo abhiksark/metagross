@@ -11,7 +11,6 @@ import io
 import json
 import os
 import pwd
-import selectors
 import signal
 import stat
 import subprocess
@@ -445,7 +444,7 @@ def run_live(cfg: Config) -> int:
             _exit_flushed(1)
     os.close(profile_w)
     os.close(barrier_r)
-    os.set_blocking(profile_r, False)
+    os.set_blocking(profile_r, True)
 
     b = None
 
@@ -519,10 +518,9 @@ def run_live(cfg: Config) -> int:
             raise MetagrossError(f"cannot start dashboard delivery: {exc}") from exc
 
     # 7. Construct capture machinery: joiner/renderer/stats, the ring-buffer
-    # callback, and the profile selector. All of this must be ready before
+    # callback, and the profile reader. All of this must be ready before
     # the barrier is released, and any failure here must tear down cleanly
     # with the target still blocked, never stalled unkilled on the barrier.
-    selector = None
     try:
         joiner = _events.Joiner()
         renderer = _events.Renderer(stream, cfg.json_output, wall_minus_mono_ns, pid)
@@ -580,21 +578,18 @@ def run_live(cfg: Config) -> int:
         def _on_ring_event(_ctx, data, size):
             joiner.on_gpu_event(_bpf.decode_event(ct.string_at(data, size)))
 
-        reader = _profile.RecordReader()
-
         b["events"].open_ring_buffer(_on_ring_event)
-        selector = selectors.DefaultSelector()
-        selector.register(profile_r, selectors.EVENT_READ)
+        # Pre-barrier: dup profile_r into a private fd the reader thread owns.
+        # A failed os.dup() still runs _cleanup_before_release() below.
+        profile_reader = _profile.ProfileReader(profile_r)
     except BaseException as exc:
-        if selector is not None:
-            selector.close()
         _cleanup_before_release()
         if isinstance(exc, KeyboardInterrupt):
             raise
         raise MetagrossError(f"failed to open ring buffer: {exc}") from exc
 
     # 8. Release the barrier only after probes, dashboard delivery, the ring
-    # buffer, and the profile selector are all ready.
+    # buffer, and the profile reader are all ready.
     try:
         os.write(barrier_w, b"\x01")
     except OSError:
@@ -603,47 +598,15 @@ def run_live(cfg: Config) -> int:
         _cleanup_before_release()
         raise MetagrossError("target exited before tracing began") from None
     os.close(barrier_w)
+    # This ordering is required: once the reader thread is blocked in
+    # os.read, a pre-barrier _cleanup_before_release() that closes profile_r
+    # would be closing an fd under a blocked read, which is undefined.
+    # Starting only after the barrier guarantees the cleanup path above can
+    # never run against a live reader thread.
+    profile_reader.start()
 
     # 9. Event loop: drain GPU events and profiling records, attribute,
     # render, and watch for the child's exit.
-    def _read_available_profile_records(fd, max_reads=None):
-        """Drain profile data fairly; return True when the fd reaches EOF."""
-        reads = 0
-        while max_reads is None or reads < max_reads:
-            try:
-                data = os.read(fd, 65536)
-            except BlockingIOError:
-                return False
-            if not data:
-                return True
-            reads += 1
-            for rec in reader.feed(data):
-                joiner.on_profile_record(rec)
-        return False
-
-    def _drain_profile(drain_to_eof=False):
-        if drain_to_eof:
-            # Post-exit: normally the write end is already closed (the
-            # child that held it is gone) and this reaches EOF (b"")
-            # quickly. But a grandchild the target forked without exec
-            # could still hold profile_w open, so this must never block
-            # forever: bound the wait with a wall-clock deadline and stop
-            # on EOF or timeout, whichever comes first.
-            deadline = time.monotonic() + _FINAL_DRAIN_TIMEOUT_S
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                ready = selector.select(remaining)
-                for key, _mask in ready:
-                    if _read_available_profile_records(key.fd):
-                        return  # EOF: pipe fully drained
-            return
-        for key, _mask in selector.select(0):
-            # One MiB per loop matches the requested pipe capacity while
-            # returning promptly enough to keep draining the BPF ring.
-            _read_available_profile_records(key.fd, max_reads=16)
-
     def _reap_and_capture():
         """Ensure the child is dead and reaped; return its wait status."""
         nonlocal status, reaped
@@ -668,7 +631,8 @@ def run_live(cfg: Config) -> int:
             try:
                 if not reaped:
                     b.ring_buffer_poll(50)
-                    _drain_profile()
+                    for rec in profile_reader.poll():
+                        joiner.on_profile_record(rec)
                     _emit_all(joiner.flush(time.monotonic_ns()))
                     wpid, status = os.waitpid(pid, os.WNOHANG)
                     reaped = wpid == pid
@@ -683,7 +647,15 @@ def run_live(cfg: Config) -> int:
                         b.ring_buffer_consume()
                     except AttributeError:
                         b.ring_buffer_poll(0)
-                    _drain_profile(drain_to_eof=True)
+                    # Normally the write end is already closed (the child
+                    # that held it is gone) and this reaches EOF quickly.
+                    # But a grandchild the target forked without exec could
+                    # still hold profile_w open, so this must never block
+                    # forever: bound the wait with a wall-clock deadline and
+                    # stop on EOF or timeout, whichever comes first.
+                    deadline = time.monotonic() + _FINAL_DRAIN_TIMEOUT_S
+                    for rec in profile_reader.drain_to_eof(deadline):
+                        joiner.on_profile_record(rec)
                     _emit_all(joiner.flush(time.monotonic_ns(), force=True))
                     break
             except KeyboardInterrupt:
@@ -717,7 +689,6 @@ def run_live(cfg: Config) -> int:
         status = _reap_and_capture()
         print(f"metagross: {exc}", file=sys.stderr)
     finally:
-        selector.close()
         os.close(profile_r)
         b.cleanup()
         if stream is not sys.stderr:

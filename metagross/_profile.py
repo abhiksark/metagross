@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import queue
 import struct
 import sys
 import threading
@@ -41,6 +42,80 @@ class RecordReader:
             path = self._buf[_HEADER.size + fl:total].decode("utf-8", "replace")
             self._buf = self._buf[total:]
             out.append((kind, tid, ts, func, path, line))
+        return out
+
+
+class ProfileReader:
+    """Drain the profile pipe on a background thread; decode on the caller.
+
+    The thread does nothing but blocking os.read into a queue, so the pipe
+    empties as fast as the kernel delivers. RecordReader and every consumer
+    stay single-threaded on the caller (the main event loop).
+    """
+
+    def __init__(self, fd: int):
+        # Own a PRIVATE dup of the read end. The main thread may close the
+        # original profile_r (e.g. _cleanup_before_release); closing an fd
+        # under a blocked os.read is undefined, and the number could be
+        # reused. The dup shares the pipe's open file description, so it still
+        # sees EOF when the child closes the write end, and the reader thread
+        # closes only its own dup.
+        self._fd = os.dup(fd)
+        self._q: queue.SimpleQueue = queue.SimpleQueue()
+        self._reader = RecordReader()
+        self._thread = threading.Thread(target=self._run, name="metagross-profile",
+                                        daemon=True)
+        self.at_eof = False
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _run(self) -> None:
+        try:
+            while True:
+                data = os.read(self._fd, 65536)  # blocking
+                self._q.put(data)
+                if not data:
+                    break  # EOF: write end closed
+        except OSError:
+            self._q.put(b"")  # surface as EOF; never raise off-thread
+        finally:
+            try:
+                os.close(self._fd)  # close our own dup only
+            except OSError:
+                pass
+    # If a grandchild the target forked keeps the write end open past the
+    # final-drain deadline, this thread stays blocked in os.read on its dup;
+    # the daemon thread and its dup are reclaimed at process exit, which is
+    # imminent once run_live returns. Do not close the dup from another thread.
+
+    def _consume(self, item) -> list:
+        if not item:
+            self.at_eof = True
+            return []
+        return self._reader.feed(item)
+
+    def poll(self) -> list:
+        out = []
+        while not self.at_eof:
+            try:
+                item = self._q.get_nowait()
+            except queue.Empty:
+                break
+            out.extend(self._consume(item))
+        return out
+
+    def drain_to_eof(self, deadline: float) -> list:
+        out = []
+        while not self.at_eof:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                item = self._q.get(timeout=remaining)
+            except queue.Empty:
+                break
+            out.extend(self._consume(item))
         return out
 
 

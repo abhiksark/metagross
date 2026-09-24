@@ -979,6 +979,26 @@ class RecordCodecTest(unittest.TestCase):
         self.assertTrue(records[0][4].endswith("�"))
 
 
+class ProfileReaderTest(unittest.TestCase):
+    def test_reads_records_across_threads_and_reaches_eof(self):
+        r, w = os.pipe()
+        os.set_blocking(r, True)
+        reader = _profile.ProfileReader(r)
+        reader.start()
+        os.write(w, _profile.encode_record(_profile.CALL, 7, 100, "run", "/p/a.py", 3))
+        deadline = time.monotonic() + 2.0
+        got = []
+        while not got and time.monotonic() < deadline:
+            got.extend(reader.poll())
+            time.sleep(0.005)
+        self.assertEqual(got, [(_profile.CALL, 7, 100, "run", "/p/a.py", 3)])
+        os.close(w)  # child gone -> EOF
+        tail = reader.drain_to_eof(time.monotonic() + 2.0)
+        self.assertEqual(tail, [])
+        self.assertTrue(reader.at_eof)
+        os.close(r)
+
+
 class ProjectFileTest(unittest.TestCase):
     def test_inside_root(self):
         self.assertTrue(_profile.is_project_file("/p/x/y.py", "/p"))
