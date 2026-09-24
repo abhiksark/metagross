@@ -209,6 +209,29 @@ class CaptureStatsTest(unittest.TestCase):
         )
         self.assertFalse(snapshot["complete"])
 
+    def test_lost_profile_records_surfaces_in_capture_and_marks_incomplete(self):
+        stats = _events.CaptureStats()
+        snapshot = stats.snapshot(
+            lost_events=0,
+            dropped_nested_calls=0,
+            observed_outstanding_bytes=0,
+            render_failed=False,
+            lost_profile_records=3,
+        )
+        self.assertFalse(snapshot["complete"])
+        self.assertEqual(snapshot["capture"]["lost_profile_records"], 3)
+
+    def test_lost_profile_records_defaults_to_zero_and_stays_complete(self):
+        stats = _events.CaptureStats()
+        snapshot = stats.snapshot(
+            lost_events=0,
+            dropped_nested_calls=0,
+            observed_outstanding_bytes=0,
+            render_failed=False,
+        )
+        self.assertTrue(snapshot["complete"])
+        self.assertEqual(snapshot["capture"]["lost_profile_records"], 0)
+
 
 class ParseArgsTest(unittest.TestCase):
     def test_minimal(self) -> None:
@@ -1024,12 +1047,14 @@ class RecordCodecTest(unittest.TestCase):
         # record (even at its own seq 0) is treated as a gap rather than a
         # silently trusted unannounced stream. With frame interning, the
         # very first wire record for any frame is its FRAME_DEF, which
-        # carries no ts_ns field -- so the gap this reveals has an unknown
-        # ts (None) rather than the CALL's ts, per the wire spec ("or None
-        # if not yet known").
+        # carries no ts_ns field -- so the gap is held pending rather than
+        # fired with an unknown ts, and is reported with the ts of the
+        # next record that DOES carry a real one: here, the CALL's ts=5.
+        # (If the stream had ended before any real-ts record arrived, it
+        # would fall back to ("gap", None) via RecordReader.finalize().)
         blob = _profile.encode_frame(_profile.CALL, 1, 5, "f", "/p/a.py", 1)
         out = _profile.RecordReader().feed(blob)
-        self.assertEqual(out[0], ("gap", None))
+        self.assertEqual(out[0], ("gap", 5))
         self.assertEqual(out[1], ("frame", _profile.CALL, 1, 5, "f", "/p/a.py", 1))
 
     def test_record_type_reads_rtype_byte(self):
@@ -1104,6 +1129,78 @@ class FrameInterningTest(unittest.TestCase):
         self.assertEqual(frames[1][4:], ("run", "/p/a.py", 1))
 
 
+class ProfileDropTest(unittest.TestCase):
+    def setUp(self):
+        _profile._reset_seq()
+
+    def test_current_emitter_is_none_when_profiling_is_not_installed(self):
+        # install() only ever runs in a forked, exec'd target child; the
+        # test process itself never calls it, so current_emitter() must
+        # not resolve to some leftover module-level state.
+        self.assertIsNone(_profile.current_emitter())
+
+    def test_frame_def_never_drops_but_calls_do(self):
+        seen = []
+
+        def fake_write(fd, data):
+            if _profile.record_type(data) == _profile._FRAME_CALL_RTYPE:
+                raise BlockingIOError()   # pipe full for ordinary records
+            seen.append(_profile.record_type(data))  # DEF must reach here
+            return len(data)
+
+        writer = _profile._DropCountWriter(7, os_write=fake_write)
+        emitter = _profile._FrameEmitter(writer.write)
+        emitter.emit(_profile.CALL, 1, 10, "f", "/p/a.py", 1)
+        self.assertEqual(writer.dropped, 1)               # the CALL dropped
+        self.assertIn(_profile.FRAME_DEF, seen)            # the DEF survived
+
+    def test_frame_def_retries_through_blocking_io_error_until_it_fits(self):
+        attempts = []
+
+        def flaky_write(fd, data):
+            attempts.append(1)
+            if len(attempts) < 3:
+                raise BlockingIOError()
+            return len(data)
+
+        writer = _profile._DropCountWriter(7, os_write=flaky_write)
+        emitter = _profile._FrameEmitter(writer.write)
+        emitter.emit(_profile.CALL, 1, 10, "f", "/p/a.py", 1)
+        # The FRAME_DEF retried until it fit (3 attempts); the CALL then
+        # succeeds on the fd's first (4th overall) try.
+        self.assertEqual(len(attempts), 4)
+        self.assertEqual(writer.dropped, 0)
+
+    def test_other_oserror_on_frame_def_is_swallowed_not_dropped_or_raised(self):
+        def broken_write(fd, data):
+            raise OSError("broken pipe")
+
+        writer = _profile._DropCountWriter(7, os_write=broken_write)
+        emitter = _profile._FrameEmitter(writer.write)
+        emitter.emit(_profile.CALL, 1, 10, "f", "/p/a.py", 1)  # must not raise
+        self.assertEqual(writer.dropped, 0)  # OSError is swallowed, not counted
+
+    def test_reader_counts_dropped_records_as_lost(self):
+        written = []
+        emitter = _profile._FrameEmitter(written.append)
+        emitter.emit(_profile.CALL, 7, 10, "a", "/p/a.py", 1)
+        emitter.emit(_profile.CALL, 7, 20, "b", "/p/a.py", 2)  # DEF b, CALL b
+        emitter.emit(_profile.CALL, 7, 30, "c", "/p/a.py", 3)
+        # Drop the CALL-b record only (index 3: DEF a, CALL a, DEF b, CALL b,
+        # DEF c, CALL c). record_type() returns the wire rtype, which for a
+        # CALL frame reference is `_FRAME_CALL_RTYPE`, not the kind constant
+        # `CALL` (that constant is 0 and collides with the HELLO rtype).
+        kept = [b for i, b in enumerate(written)
+                if not (i == 3 and
+                        _profile.record_type(b) == _profile._FRAME_CALL_RTYPE)]
+        reader = _profile.RecordReader()
+        recs = []
+        for b in kept:
+            recs += reader.feed(b)
+        self.assertEqual(reader.lost_records, 1)
+        self.assertIn("gap", [r[0] for r in recs])
+
+
 class ProfileReaderTest(unittest.TestCase):
     def setUp(self):
         _profile._reset_seq()
@@ -1125,6 +1222,49 @@ class ProfileReaderTest(unittest.TestCase):
         tail = reader.drain_to_eof(time.monotonic() + 2.0)
         self.assertEqual(tail, [])
         self.assertTrue(reader.at_eof)
+        os.close(r)
+
+    def test_lost_records_passthrough(self):
+        # ProfileReader.lost_records() surfaces the inner RecordReader's
+        # count -- the authoritative loss number for the summary.
+        r, w = os.pipe()
+        os.set_blocking(r, True)
+        reader = _profile.ProfileReader(r)
+        reader.start()
+        os.write(w, _profile.encode_hello(pid=1, start_ns=0))
+        os.write(w, _profile._encode_frame_def(0, "a", "/p/a.py", 1))
+        os.write(w, _profile._encode_frame_ref(_profile.CALL, 7, 10, 0))
+        _profile._next_seq()  # consume a seq without writing it: a real drop
+        os.write(w, _profile._encode_frame_ref(_profile.CALL, 7, 20, 0))
+        deadline = time.monotonic() + 2.0
+        got = []
+        while len(got) < 2 and time.monotonic() < deadline:
+            got.extend(reader.poll())
+            time.sleep(0.005)
+        os.close(w)
+        self.assertEqual(reader.lost_records(), 1)
+
+    def test_drain_to_eof_flushes_pending_gap_on_timeout(self):
+        # A grandchild the target forked without exec can hold the write
+        # end open past the final-drain deadline, so EOF may never arrive.
+        # A gap first revealed on a no-ts record (pending, waiting for a
+        # later real-ts record) must still be flushed once the deadline
+        # expires -- this is the terminal drain before the joiner's final
+        # forced flush, so a pending gap left unflushed here would let
+        # that flush attribute against stale pre-gap state.
+        r, w = os.pipe()
+        os.set_blocking(r, True)
+        reader = _profile.ProfileReader(r)
+        reader.start()
+        os.write(w, _profile.encode_hello(pid=1, start_ns=0))
+        os.write(w, _profile._encode_frame_def(0, "a", "/p/a.py", 1))
+        _profile._next_seq()  # a real dropped record, never written
+        os.write(w, _profile._encode_frame_def(1, "b", "/p/a.py", 2))
+        # No later real-ts record follows, and w is never closed.
+        out = reader.drain_to_eof(time.monotonic() + 0.2)
+        self.assertIn(("gap", None), out)
+        self.assertFalse(reader.at_eof)
+        os.close(w)
         os.close(r)
 
 
@@ -1360,6 +1500,38 @@ class GapHandlingTest(unittest.TestCase):
         # can prune/reset before trusting the record that follows.
         gap_index = [rec[0] for rec in out].index("gap")
         self.assertEqual(out[gap_index + 1][0], "frame")
+
+    def test_gap_first_revealed_on_frame_def_carries_next_real_ts(self):
+        # A gap revealed on a FRAME_DEF (no ts_ns of its own) must not be
+        # reported with an unknown ts: it is held pending and reported with
+        # the ts of the next record that DOES carry a real one (the tighter
+        # horizon Task 2 intended), not left for the Joiner's much wider
+        # "now at decode time" monotonic fallback.
+        reader = _profile.RecordReader()
+        out = reader.feed(_profile.encode_hello(pid=1, start_ns=1))
+        out += reader.feed(_profile._encode_frame_def(0, "a", "/p/a.py", 1))
+        _profile._next_seq()  # a real dropped record: consumes a seq, never fed
+        # The gap is first revealed here, on a FRAME_DEF -- no ts_ns yet.
+        out += reader.feed(_profile._encode_frame_def(1, "b", "/p/a.py", 2))
+        self.assertNotIn("gap", [rec[0] for rec in out])  # deferred, not fired
+        out += reader.feed(_profile._encode_frame_ref(_profile.CALL, 7, 42, 1))
+        gap_recs = [rec for rec in out if rec[0] == "gap"]
+        self.assertEqual(gap_recs, [("gap", 42)])  # the CALL's real ts, not None
+
+    def test_gap_pending_on_no_ts_record_flushes_as_none_at_eof(self):
+        # If the stream ends before a real-ts record ever follows the
+        # no-ts record that first revealed the gap, the pending gap must
+        # still surface -- as the ("gap", None) shape the Joiner already
+        # falls back to its own monotonic clock for -- rather than
+        # silently vanishing.
+        reader = _profile.RecordReader()
+        reader.feed(_profile.encode_hello(pid=1, start_ns=1))
+        reader.feed(_profile._encode_frame_def(0, "a", "/p/a.py", 1))
+        _profile._next_seq()  # a real dropped record, never fed
+        out = reader.feed(_profile._encode_frame_def(1, "b", "/p/a.py", 2))
+        self.assertEqual(out, [])  # deferred, not fired yet
+        self.assertEqual(reader.finalize(), [("gap", None)])
+        self.assertEqual(reader.finalize(), [])  # nothing left to flush twice
 
     def test_frame_timeline_gap_fails_closed(self):
         tl = _events.FrameTimeline()

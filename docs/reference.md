@@ -172,16 +172,17 @@ sudo /usr/bin/python3 -m metagross \
 Summary schema version 1 has top-level `schema_version`, `complete`, `capture`,
 `timing`, `memory`, `copies`, `apis`, `top_functions`, `top_kernels`,
 `configuration`, and `target` fields. `complete` is false if BPF events were
-lost, nested calls were dropped, event rendering failed, or the tracing loop
-failed. Unknown Python attribution does not by itself make capture incomplete.
-Allocation and byte totals describe successfully observed driver calls, not
-physical GPU usage or framework-level tensor allocations.
+lost, nested calls were dropped, profile records were lost, event rendering
+failed, or the tracing loop failed. Unknown Python attribution does not by
+itself make capture incomplete. Allocation and byte totals describe
+successfully observed driver calls, not physical GPU usage or
+framework-level tensor allocations.
 
 Summary nested fields are:
 
 | Object | Fields |
 |--------|--------|
-| `capture` | `events`, `attributed`, `unknown_attribution`, `cuda_errors`, `lost_events`, `dropped_nested_calls`, `render_failed`, `trace_failed` |
+| `capture` | `events`, `attributed`, `unknown_attribution`, `cuda_errors`, `lost_events`, `dropped_nested_calls`, `render_failed`, `trace_failed`, `lost_profile_records` |
 | `timing` | `total_api_duration_ns`, `synchronization_duration_ns` |
 | `memory` | `successful_allocation_bytes`, `observed_peak_bytes`, `observed_outstanding_bytes` |
 | `copies` | `successful_bytes_by_api`, mapping normalized API names to byte counts |

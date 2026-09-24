@@ -625,6 +625,7 @@ def run_live(cfg: Config) -> int:
     reaped = False
     lost = 0
     dropped = 0
+    lost_profile = 0
     try:
         renderer.header()
         while True:
@@ -677,10 +678,14 @@ def run_live(cfg: Config) -> int:
         # 9. Report loss counters as warnings and detach probes.
         lost = b["counters"][ct.c_int(0)].value
         dropped = b["counters"][ct.c_int(1)].value
+        lost_profile = profile_reader.lost_records()
         if lost:
             print(f"metagross: lost {lost} events (ring buffer full)", file=sys.stderr)
         if dropped:
             print(f"metagross: dropped {dropped} nested calls", file=sys.stderr)
+        if lost_profile:
+            print(f"metagross: lost {lost_profile} profile records "
+                  "(writer overrun)", file=sys.stderr)
     except Exception as exc:
         trace_failed = True
         # Any unexpected failure here must not lose the target's exit
@@ -709,6 +714,7 @@ def run_live(cfg: Config) -> int:
             observed_outstanding_bytes=joiner.allocs.total_bytes,
             render_failed=render_broken,
             trace_failed=trace_failed,
+            lost_profile_records=lost_profile,
         )
         selected_families = (
             _TRACE_FAMILIES if cfg.trace_families is None else cfg.trace_families
@@ -734,6 +740,7 @@ def run_live(cfg: Config) -> int:
                 f"errors={capture['cuda_errors']} "
                 f"lost={capture['lost_events']} "
                 f"dropped={capture['dropped_nested_calls']} "
+                f"lost_profile={capture['lost_profile_records']} "
                 f"complete={str(summary['complete']).lower()}",
                 file=sys.stderr,
             )

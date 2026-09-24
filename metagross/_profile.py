@@ -139,6 +139,51 @@ class _FrameEmitter:
         self._write(_encode_frame_ref(kind, tid, ts, frame_id))
 
 
+class _DropCountWriter:
+    """Write profile records through a non-blocking fd; drop-and-count
+    ordinary records under pipe overrun, but never a FRAME_DEF.
+
+    A FRAME_DEF assigns the frame_id later CALL/RETURN records reference;
+    dropping one would desync the reader's intern map forever (a CALL for
+    an id the reader never saw defined), so it is retried until it fits.
+    That can briefly block the target -- accepted, since definitions are
+    rare and small and the alternative (a permanently wrong frame_id) is
+    far worse. Every other record type is best-effort: on `BlockingIOError`
+    (EAGAIN, pipe full) it is dropped and counted rather than blocking the
+    target's own thread on tracer backpressure.
+    """
+
+    def __init__(self, fd: int, os_write=os.write):
+        self._fd = fd
+        self._os_write = os_write
+        self.dropped = 0
+
+    def write(self, data: bytes) -> None:
+        # Every record is well under PIPE_BUF (the largest, a FRAME_DEF,
+        # is at most ~6 + 16 + 2*_MAX_STR bytes), so a successful os.write
+        # on a pipe is always atomic here: the return value is never a
+        # partial write that would itself desync the reader's byte stream.
+        if record_type(data) == FRAME_DEF:
+            self._write_never_dropping(data)
+            return
+        try:
+            self._os_write(self._fd, data)
+        except BlockingIOError:
+            self.dropped += 1
+        except OSError:
+            pass  # broken trace pipe must never kill the target
+
+    def _write_never_dropping(self, data: bytes) -> None:
+        while True:
+            try:
+                self._os_write(self._fd, data)
+                return
+            except BlockingIOError:
+                continue  # pipe momentarily full: retry until it drains
+            except OSError:
+                return  # broken trace pipe must never kill the target
+
+
 def encode_span_begin(tid, ts_ns, name) -> bytes:
     name_bytes = name.encode("utf-8", "replace")[:_MAX_STR]
     seq = _next_seq()
@@ -169,13 +214,24 @@ class RecordReader:
         self._expected = None
         self.version = None
         # frame_id -> (func, path, line). Never cleared, including on a
-        # gap: FRAME_DEF is never dropped (Task 4 makes it undroppable), so
-        # a definition always precedes its use and ids never desync.
+        # gap: FRAME_DEF is never dropped (_DropCountWriter makes it
+        # undroppable), so a definition always precedes its use and ids
+        # never desync.
         self._frames: dict[int, tuple] = {}
-        # Defensive-only counter: a CALL/RETURN whose frame_id is somehow
-        # unknown is dropped rather than guessing a frame. This should not
-        # happen once Task 4 lands (FRAME_DEF cannot itself be lost).
+        # Total records lost to gaps: the sum of seq deltas across every
+        # detected gap, plus the (should-not-happen) defensive drops below.
+        # This is the authoritative loss count surfaced in the summary --
+        # the writer's own `_DropCountWriter.dropped` exists only for
+        # testing the writer in isolation, because the child cannot
+        # reliably flush a final count once its pipe is overrunning.
         self.lost_records = 0
+        # A gap revealed on a record with no ts_ns of its own (FRAME_DEF,
+        # HELLO) is not reported immediately: it is held here and emitted
+        # with the ts of the next record that DOES carry a real ts_ns, so
+        # the Joiner's fail-closed horizon is as tight as possible instead
+        # of falling back to "now" at decode time. `finalize()` flushes it
+        # as `("gap", None)` if the stream ends before that happens.
+        self._pending_gap = False
 
     def feed(self, data: bytes) -> list[tuple]:
         self._buf += data
@@ -262,9 +318,29 @@ class RecordReader:
         return out
 
     def _note_seq(self, seq: int, out: list, ts_ns) -> None:
-        if self._expected is None or seq != self._expected:
+        mismatch = self._expected is None or seq != self._expected
+        if mismatch:
+            if self._expected is not None:
+                self.lost_records += (seq - self._expected) % _SEQ_MOD
+            self._pending_gap = True
+        if self._pending_gap and ts_ns is not None:
             out.append(("gap", ts_ns))
+            self._pending_gap = False
         self._expected = (seq + 1) % _SEQ_MOD
+
+    def finalize(self) -> list:
+        """Flush an unresolved pending gap once the stream ends.
+
+        A gap first revealed on a no-ts record is normally reported with
+        the ts of the next real-ts record (see `_note_seq`). If the
+        stream ends (EOF) before one arrives, that tighter horizon never
+        materializes; fall back to the `("gap", None)` shape so the
+        Joiner still fails closed via its own monotonic clock.
+        """
+        if not self._pending_gap:
+            return []
+        self._pending_gap = False
+        return [("gap", None)]
 
 
 class ProfileReader:
@@ -314,8 +390,17 @@ class ProfileReader:
     def _consume(self, item) -> list:
         if not item:
             self.at_eof = True
-            return []
+            return self._reader.finalize()
         return self._reader.feed(item)
+
+    def lost_records(self) -> int:
+        """Return the reader's total lost-record count (sum of gap deltas).
+
+        This is the authoritative loss count for the summary: the writer's
+        own dropped-count exists only for unit-testing the writer in
+        isolation (see `_DropCountWriter`).
+        """
+        return self._reader.lost_records
 
     def poll(self) -> list:
         out = []
@@ -338,6 +423,15 @@ class ProfileReader:
             except queue.Empty:
                 break
             out.extend(self._consume(item))
+        if not self.at_eof:
+            # Timed out waiting for real EOF (e.g. a forked grandchild
+            # still holds the write end open past the final-drain
+            # deadline). This is still the terminal drain call before the
+            # joiner's final forced flush, so a gap still pending -- one
+            # revealed on a no-ts record with no later real-ts record to
+            # resolve it -- must be flushed now rather than left to
+            # silently vanish (fail-closed).
+            out.extend(self._reader.finalize())
         return out
 
 
@@ -395,20 +489,38 @@ def is_project_file(path: str, project_root: str) -> bool:
     return _ProjectClassifier(project_root).includes(path)
 
 
+_current_emitter: "_FrameEmitter | None" = None
+
+
+def current_emitter() -> "_FrameEmitter | None":
+    """Return the installed `_FrameEmitter`, or `None` if profiling is not
+    installed (or has been disabled, e.g. in a forked child).
+
+    Task 5's `span()` context manager emits SPAN_BEGIN/SPAN_END through
+    this same interning, drop-counting emitter rather than opening a
+    second path to the pipe.
+    """
+    return _current_emitter
+
+
 def install(write_fd: int, project_root: str) -> None:
+    global _current_emitter
     local = threading.local()
     classifier = _ProjectClassifier(project_root)
     lock = threading.Lock()
 
-    def _write(record: bytes) -> None:
-        try:
-            os.write(write_fd, record)
-        except OSError:
-            pass  # broken trace pipe must never kill the target
+    try:
+        os.write(write_fd, encode_hello(os.getpid(), time.monotonic_ns()))
+    except OSError:
+        pass  # broken trace pipe must never kill the target
 
-    emitter = _FrameEmitter(_write)
-
-    _write(encode_hello(os.getpid(), time.monotonic_ns()))
+    # Only after HELLO is safely on the wire does the fd go non-blocking:
+    # an EAGAIN on HELLO itself would desync the reader's very first
+    # expected seq before anything downstream can recover from it.
+    os.set_blocking(write_fd, False)
+    writer = _DropCountWriter(write_fd)
+    emitter = _FrameEmitter(writer.write)
+    _current_emitter = emitter
 
     def hook(frame, event, arg):
         if event == "call":
@@ -456,6 +568,8 @@ def install(write_fd: int, project_root: str) -> None:
         # would deadlock right here.
         sys.setprofile(None)
         threading.setprofile(None)
+        global _current_emitter
+        _current_emitter = None
         # AGENTS.md: be conservative with inherited file descriptors. A
         # long-lived non-exec worker holding the write end open would
         # otherwise delay the parent's EOF until the final-drain deadline.

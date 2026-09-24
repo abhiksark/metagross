@@ -406,9 +406,11 @@ class CaptureStats:
 
     def snapshot(self, *, lost_events: int, dropped_nested_calls: int,
                  observed_outstanding_bytes: int, render_failed: bool,
-                 trace_failed: bool = False) -> dict:
+                 trace_failed: bool = False,
+                 lost_profile_records: int = 0) -> dict:
         complete = not any((lost_events, dropped_nested_calls,
-                            render_failed, trace_failed))
+                            render_failed, trace_failed,
+                            lost_profile_records))
         return {
             "schema_version": 1,
             "complete": complete,
@@ -421,6 +423,7 @@ class CaptureStats:
                 "dropped_nested_calls": dropped_nested_calls,
                 "render_failed": render_failed,
                 "trace_failed": trace_failed,
+                "lost_profile_records": lost_profile_records,
             },
             "timing": {
                 "total_api_duration_ns": self.total_api_duration_ns,
