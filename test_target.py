@@ -93,8 +93,9 @@ class TargetExecutionTest(unittest.TestCase):
                 self.assertEqual(stdout, "main done\nthread done\natexit buffered")
                 self.assertEqual(stderr, "atexit stderr")
                 if attribution:
-                    self.assertIn("finish", [record[3] for record in records])
-                    self.assertIn("worker", [record[3] for record in records])
+                    funcs = [rec[4] for rec in records if rec[0] == "frame"]
+                    self.assertIn("finish", funcs)
+                    self.assertIn("worker", funcs)
                 else:
                     self.assertEqual(records, [])
 

@@ -137,6 +137,39 @@ Rules:
   Python.
 - Never assume a kernel/function handle has a name. Kernel names are best-effort.
 
+## Profile wire-format changes
+
+The profile pipe (`metagross/_profile.py`) uses a versioned record format: a
+6-byte common header (`rtype`, per-child `seq`, reserved byte) followed by a
+per-`rtype` body. `RecordReader.feed` decodes it into tagged tuples that
+`Joiner.on_profile_record` dispatches on. When adding or changing a profile
+record type, update all relevant pieces together:
+
+1. The `rtype` constant and its body `struct.Struct` in `_profile.py`.
+2. The encoder (e.g. `encode_frame`, `encode_span_begin`) that packs the
+   common header plus the body.
+3. `RecordReader.feed`'s dispatch: parse-or-wait-for-more-bytes, advance the
+   buffer only once the whole record is present, run it through the seq/gap
+   check, and yield the tagged tuple (or nothing, for records like `HELLO`
+   that the reader consumes internally).
+4. `Joiner.on_profile_record`'s tag handling for the new tuple shape.
+5. A `RecordCodecTest` case covering the encode/decode round trip (and a
+   split-feed case if the body has variable-length fields).
+
+Rules:
+
+- Every record's `seq` must flow through `RecordReader`'s gap check
+  (`_note_seq`) exactly once, even for record types the reader currently
+  discards (e.g. `FRAME_DEF` bodies before a consumer for it exists);
+  skipping it desynchronizes gap detection from the rest of the stream.
+- A record type without a self-describing length (fixed-size body, or a body
+  whose prefix carries the length of what follows) cannot be safely decoded;
+  the reader has no way to resynchronize past bytes it cannot parse, so it
+  drops the buffer and fails closed (`("gap", None)`) instead of guessing.
+- Multi-threaded emitters (the profiling hook runs on every target thread)
+  must assign the record's `seq` and write its bytes under the same lock, or
+  the pipe can carry seqs out of order and manufacture false gaps.
+
 ## Attribution rules
 
 - Use native thread IDs and monotonic nanoseconds for joins.

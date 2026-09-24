@@ -8,6 +8,7 @@ import datetime
 import json as _json
 import os
 import shlex
+import time
 
 from metagross import _bpf, MetagrossError
 
@@ -122,9 +123,29 @@ class FrameTimeline:
         state.last_ts_ns = ts_ns
         return state.stack[-1] if state.stack else None
 
+    def on_gap(self, ts_ns: int) -> None:
+        # Drop ALL pre-gap records, including still-open CALLs -- not just
+        # closed history the way prune() does. A CALL whose matching RETURN
+        # was the very record the gap dropped looks indistinguishable from a
+        # genuinely still-open CALL: prune-and-retain would keep it, and
+        # because `_apply` only pops on an exact top-of-stack match, that
+        # leaked frame would never clear and every top-level-idle query
+        # at/after the gap would confidently (and wrongly) attribute to it
+        # forever. Dropping everything below the gap forces post-gap queries
+        # to <unknown> until a real CALL re-establishes the stack.
+        for tid, log in self._logs.items():
+            log[:] = [record for record in log if record[0] >= ts_ns]
+            self._horizons[tid] = max(self._horizons.get(tid, ts_ns), ts_ns)
+            self._states[tid] = _ReplayState()
+
     def prune(self, min_ts_ns: int) -> None:
         for tid, log in self._logs.items():
-            self._horizons[tid] = min_ts_ns
+            # A horizon only ever moves forward: history a prior gap or
+            # prune already put out of reach must not become trusted again
+            # just because a later prune call happens to pass a lower
+            # min_ts_ns (e.g. Joiner.flush pruning to the oldest still-held
+            # event after on_gap raised the horizon on a dropped record).
+            self._horizons[tid] = max(self._horizons.get(tid, min_ts_ns), min_ts_ns)
             cut = 0
             open_stack: list[FrameInfo] = []
             open_indices: list[int] = []
@@ -189,7 +210,14 @@ class Joiner:
         self._pending.append((raw.ts, raw, api, kernel))
 
     def on_profile_record(self, rec) -> None:
-        self.timeline.on_record(*rec)
+        tag = rec[0]
+        if tag == "frame":
+            _, kind, tid, ts, func, path, line = rec
+            self.timeline.on_record(kind, tid, ts, func, path, line)
+        elif tag == "gap":
+            self.timeline.on_gap(rec[1] if rec[1] is not None else time.monotonic_ns())
+        # span tags ("span_begin"/"span_end") are decoded already but land
+        # in the timeline in Task 5.
 
     def enrich(self, event: AttributedEvent) -> EnrichedEvent:
         kernel, details = describe(

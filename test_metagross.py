@@ -943,55 +943,127 @@ class BpfSourceTest(unittest.TestCase):
 
 
 class RecordCodecTest(unittest.TestCase):
-    def test_roundtrip_single(self):
-        blob = _profile.encode_record(_profile.CALL, 7, 123456789,
-                                      "train_step", "/p/train.py", 31)
+    def setUp(self):
+        _profile._reset_seq()
+
+    def _reader_after_hello(self):
+        """A RecordReader past its HELLO, so plain frame assertions below
+        do not have to account for the reader's own gap bookkeeping."""
         reader = _profile.RecordReader()
+        self.assertEqual(reader.feed(_profile.encode_hello(pid=1, start_ns=0)), [])
+        return reader
+
+    def test_roundtrip_single(self):
+        reader = self._reader_after_hello()
+        blob = _profile.encode_frame(_profile.CALL, 7, 123456789,
+                                     "train_step", "/p/train.py", 31)
         self.assertEqual(reader.feed(blob),
-                         [(_profile.CALL, 7, 123456789, "train_step",
+                         [("frame", _profile.CALL, 7, 123456789, "train_step",
                            "/p/train.py", 31)])
 
     def test_split_feed(self):
-        blob = _profile.encode_record(_profile.RETURN, 7, 99, "f", "/p/a.py", 2)
-        reader = _profile.RecordReader()
+        # Split inside the 6-byte common header: feed() must not even try
+        # to unpack rtype/seq yet.
+        reader = self._reader_after_hello()
+        blob = _profile.encode_frame(_profile.RETURN, 7, 99, "f", "/p/a.py", 2)
         self.assertEqual(reader.feed(blob[:5]), [])
         self.assertEqual(reader.feed(blob[5:]),
-                         [(_profile.RETURN, 7, 99, "f", "/p/a.py", 2)])
+                         [("frame", _profile.RETURN, 7, 99, "f", "/p/a.py", 2)])
+
+    def test_split_feed_inside_variable_length_body(self):
+        # Split after the header and fixed prefix (whose seq is now known)
+        # but before the func/path bytes finish arriving. The seq check
+        # must not fire on the first, incomplete feed -- only once the
+        # whole record is present -- or a slow/chunked write would
+        # manufacture a spurious gap on its own record.
+        reader = self._reader_after_hello()
+        blob = _profile.encode_frame(_profile.RETURN, 7, 99,
+                                     "somewhat_longer_func_name",
+                                     "/p/a/longer/path.py", 2)
+        split = 6 + 20  # common header + frame prefix; strings incomplete
+        self.assertLess(split, len(blob))
+        self.assertEqual(reader.feed(blob[:split]), [])
+        self.assertEqual(reader.feed(blob[split:]),
+                         [("frame", _profile.RETURN, 7, 99,
+                           "somewhat_longer_func_name",
+                           "/p/a/longer/path.py", 2)])
 
     def test_multiple_records_one_feed(self):
-        blob = (_profile.encode_record(0, 1, 1, "a", "/p/a.py", 1)
-                + _profile.encode_record(1, 1, 2, "a", "/p/a.py", 1))
-        self.assertEqual(len(_profile.RecordReader().feed(blob)), 2)
+        reader = self._reader_after_hello()
+        blob = (_profile.encode_frame(_profile.CALL, 1, 1, "a", "/p/a.py", 1)
+                + _profile.encode_frame(_profile.RETURN, 1, 2, "a", "/p/a.py", 1))
+        self.assertEqual(len(reader.feed(blob)), 2)
 
     def test_truncated_multibyte_does_not_raise(self):
         # "x" + "e"-acute * 300 is 601 bytes; the raw 500-byte truncation in
-        # encode_record cuts the 500th byte inside a two-byte "e"-acute
+        # encode_frame cuts the 500th byte inside a two-byte "e"-acute
         # character (byte 499 is its leading 0xC3), so a strict utf-8
         # decode of the truncated bytes raises UnicodeDecodeError. feed()
         # must not raise; it replaces the partial character and still
         # yields exactly one record.
+        reader = self._reader_after_hello()
         long_str = "x" + "é" * 300
-        blob = _profile.encode_record(_profile.CALL, 3, 42, long_str,
-                                      long_str, 5)
-        records = _profile.RecordReader().feed(blob)
+        blob = _profile.encode_frame(_profile.CALL, 3, 42, long_str,
+                                     long_str, 5)
+        records = reader.feed(blob)
         self.assertEqual(len(records), 1)
-        self.assertTrue(records[0][3].endswith("�"))
         self.assertTrue(records[0][4].endswith("�"))
+        self.assertTrue(records[0][5].endswith("�"))
+
+    def test_hello_yields_nothing_and_sets_version(self):
+        reader = _profile.RecordReader()
+        self.assertEqual(
+            reader.feed(_profile.encode_hello(pid=4321, start_ns=99)), [])
+        self.assertEqual(reader.version, 2)
+
+    def test_missing_hello_emits_gap_then_frame(self):
+        # No HELLO fed first: _expected starts as None, so the very first
+        # record (even at its own seq 0) is treated as a gap rather than a
+        # silently trusted unannounced stream.
+        blob = _profile.encode_frame(_profile.CALL, 1, 5, "f", "/p/a.py", 1)
+        out = _profile.RecordReader().feed(blob)
+        self.assertEqual(out[0], ("gap", 5))
+        self.assertEqual(out[1], ("frame", _profile.CALL, 1, 5, "f", "/p/a.py", 1))
+
+    def test_record_type_reads_rtype_byte(self):
+        hello = _profile.encode_hello(pid=1, start_ns=0)
+        frame = _profile.encode_frame(_profile.CALL, 1, 1, "f", "/p/a.py", 1)
+        self.assertEqual(_profile.record_type(hello), _profile.HELLO)
+        self.assertNotEqual(_profile.record_type(frame), _profile.HELLO)
+
+    def test_span_roundtrip(self):
+        reader = self._reader_after_hello()
+        begin = _profile.encode_span_begin(9, 100, "fwd")
+        end = _profile.encode_span_end(9, 150)
+        self.assertEqual(reader.feed(begin), [("span_begin", 9, 100, "fwd")])
+        self.assertEqual(reader.feed(end), [("span_end", 9, 150)])
+
+    def test_unknown_rtype_does_not_raise(self):
+        reader = self._reader_after_hello()
+        garbage = _profile._COMMON.pack(99, reader._expected, 0) + b"\x00" * 8
+        out = reader.feed(garbage)
+        self.assertEqual(out, [("gap", None)])
+        # The bad bytes were dropped; feeding nothing more yields nothing.
+        self.assertEqual(reader.feed(b""), [])
 
 
 class ProfileReaderTest(unittest.TestCase):
+    def setUp(self):
+        _profile._reset_seq()
+
     def test_reads_records_across_threads_and_reaches_eof(self):
         r, w = os.pipe()
         os.set_blocking(r, True)
         reader = _profile.ProfileReader(r)
         reader.start()
-        os.write(w, _profile.encode_record(_profile.CALL, 7, 100, "run", "/p/a.py", 3))
+        os.write(w, _profile.encode_hello(pid=1, start_ns=0))
+        os.write(w, _profile.encode_frame(_profile.CALL, 7, 100, "run", "/p/a.py", 3))
         deadline = time.monotonic() + 2.0
         got = []
         while not got and time.monotonic() < deadline:
             got.extend(reader.poll())
             time.sleep(0.005)
-        self.assertEqual(got, [(_profile.CALL, 7, 100, "run", "/p/a.py", 3)])
+        self.assertEqual(got, [("frame", _profile.CALL, 7, 100, "run", "/p/a.py", 3)])
         os.close(w)  # child gone -> EOF
         tail = reader.drain_to_eof(time.monotonic() + 2.0)
         self.assertEqual(tail, [])
@@ -1058,10 +1130,53 @@ class InstallHookTest(unittest.TestCase):
         os.close(r)
         os.waitpid(pid, 0)
         records = _profile.RecordReader().feed(data)
-        funcs = [rec[3] for rec in records]
+        frames = [rec for rec in records if rec[0] == "frame"]
+        funcs = [rec[4] for rec in frames]
         self.assertIn("hot", funcs)
-        kinds = [rec[0] for rec in records if rec[3] == "hot"]
+        self.assertNotIn("gap", [rec[0] for rec in records])
+        kinds = [rec[1] for rec in frames if rec[4] == "hot"]
         self.assertEqual(sorted(set(kinds)), [_profile.CALL, _profile.RETURN])
+
+    def test_forked_child_stops_profiling_and_does_not_corrupt_seq(self):
+        # A target that forks without exec (multiprocessing/DataLoader
+        # workers) inherits the hook, the pipe fd, and the seq counter's
+        # current value. If the child kept tracing, its records would
+        # interleave into the parent's seq stream and manufacture false
+        # gaps. install() must disable tracing in the forked child.
+        r, w = os.pipe()
+        code = (
+            "import os, sys, tempfile\n"
+            "sys.path.insert(0, %r)\n"
+            "from metagross import _profile\n"
+            "d = tempfile.mkdtemp()\n"
+            "p = os.path.join(d, 'proj.py')\n"
+            "with open(p, 'w') as stream:\n"
+            "    stream.write('def hot():\\n    return 1\\n')\n"
+            "sys.path.insert(0, d)\n"
+            "_profile.install(%d, d)\n"
+            "import proj\n"
+            "proj.hot()\n"
+            "child_pid = os.fork()\n"
+            "if child_pid == 0:\n"
+            "    proj.hot()\n"
+            "    os._exit(0)\n"
+            "os.waitpid(child_pid, 0)\n"
+            "proj.hot()\n"
+            "sys.setprofile(None)\n"
+        ) % (os.getcwd(), w)
+        pid = os.fork()
+        if pid == 0:
+            os.close(r)
+            exec(code)  # noqa: S102 — test child
+            os._exit(0)
+        os.close(w)
+        data = b""
+        while chunk := os.read(r, 4096):
+            data += chunk
+        os.close(r)
+        os.waitpid(pid, 0)
+        records = _profile.RecordReader().feed(data)
+        self.assertNotIn("gap", [rec[0] for rec in records])
 
 
 class AttributionTest(unittest.TestCase):
@@ -1168,10 +1283,109 @@ class AttributionTest(unittest.TestCase):
                          _events.FrameInfo("main", "/p/m.py", 1))
 
 
+class GapHandlingTest(unittest.TestCase):
+    def setUp(self):
+        _profile._reset_seq()
+
+    def test_seq_gap_emits_gap_record(self):
+        reader = _profile.RecordReader()
+        out = reader.feed(_profile.encode_hello(pid=1234, start_ns=1))
+        out += reader.feed(_profile.encode_frame(_profile.CALL, tid=7, ts_ns=10,
+                                                 func="a", path="/p/a.py", line=1))
+        # A real dropped record: encode one (it consumes a seq) but never feed
+        # it, so the reader sees the seq jump.
+        _profile.encode_frame(_profile.CALL, tid=7, ts_ns=20, func="x",
+                              path="/p/a.py", line=9)
+        out += reader.feed(_profile.encode_frame(_profile.CALL, tid=7, ts_ns=30,
+                                                 func="b", path="/p/a.py", line=2))
+        self.assertIn("gap", [rec[0] for rec in out])
+        # The gap tuple precedes the record that revealed it, so a consumer
+        # can prune/reset before trusting the record that follows.
+        gap_index = [rec[0] for rec in out].index("gap")
+        self.assertEqual(out[gap_index + 1][0], "frame")
+
+    def test_frame_timeline_gap_fails_closed(self):
+        tl = _events.FrameTimeline()
+        tl.on_record(0, 7, 10, "a", "/p/a.py", 1)
+        tl.attribute(7, 10)
+        tl.on_gap(50)
+        self.assertIsNone(tl.attribute(7, 20))   # below the gap horizon -> unknown
+
+    def test_gap_after_lost_return_does_not_leave_a_stale_open_frame(self):
+        # A CALL is recorded and its replay cursor is advanced past it (so
+        # a bare state reset alone, without also dropping the record, would
+        # let it replay again on the forward branch); its matching RETURN
+        # is then lost to the gap. on_gap must drop the CALL along with
+        # everything else before the gap, so queries both below the
+        # horizon and at/after it fail closed rather than reporting a
+        # confidently wrong frame.
+        tl = _events.FrameTimeline()
+        tl.on_record(0, 1, 10, "leaked", "/p/a.py", 1)   # CALL; its RETURN is lost
+        tl.attribute(1, 10)                              # advance the replay cursor
+        tl.on_gap(100)
+        self.assertIsNone(tl.attribute(1, 50))            # below horizon -> unknown
+        self.assertIsNone(tl.attribute(1, 200))           # at/after gap -> still unknown
+
+    def test_on_gap_drops_all_pre_gap_records_including_open_calls(self):
+        # on_gap must drop everything before the gap -- closed pairs AND
+        # still-open CALLs alike -- not retain open CALLs the way prune()
+        # does for an ordinary (non-gap) prune. See
+        # test_gap_does_not_confidently_attribute_to_a_leaked_open_call for
+        # why retaining an open CALL across a gap is itself a bug.
+        tl = _events.FrameTimeline()
+        tl.on_record(0, 1, 10, "done", "/p/a.py", 1)     # CALL, closed pair
+        tl.on_record(1, 1, 20, "done", "/p/a.py", 1)     # RETURN
+        tl.on_record(0, 1, 30, "leaked", "/p/a.py", 2)   # CALL; its RETURN is lost
+        tl.attribute(1, 30)
+        tl.on_gap(50)
+        self.assertEqual(tl._logs[1], [])                # nothing pre-gap survives
+        self.assertIsNone(tl.attribute(1, 40))            # below horizon -> unknown
+        self.assertIsNone(tl.attribute(1, 100))           # at/after gap -> still unknown
+
+    def test_gap_does_not_confidently_attribute_to_a_leaked_open_call(self):
+        # The regression this fix closes: a CALL's matching RETURN is
+        # exactly the record the gap dropped, so it looks indistinguishable
+        # from a genuinely still-open CALL. Retaining it (the old
+        # prune-and-retain shape) would let every top-level-idle query
+        # at/after the gap confidently -- and wrongly -- attribute to it
+        # forever. That violates "never a guessed frame."
+        tl = _events.FrameTimeline()
+        tl.on_record(0, 7, 10, "foo", "/p/a.py", 1)   # CALL foo; its RETURN is lost
+        tl.on_gap(50)
+        self.assertIsNone(tl.attribute(7, 100))       # NOT "foo"
+
+    def test_gap_horizon_survives_later_prune_with_lower_ts(self):
+        # prune() is also called from Joiner.flush() with whatever ts the
+        # oldest still-held GPU event has, independent of any gap. That
+        # value can be lower than a horizon a gap already raised; the
+        # horizon must not retreat just because of the call order.
+        tl = _events.FrameTimeline()
+        tl.on_record(0, 1, 10, "outer", "/p/a.py", 1)
+        tl.attribute(1, 10)
+        tl.on_gap(500)
+        tl.prune(50)
+        self.assertIsNone(tl.attribute(1, 100))  # still below the gap horizon
+
+    def test_joiner_dispatches_gap_to_timeline(self):
+        j = _events.Joiner(hold_ns=100)
+        j.on_profile_record(("frame", _profile.CALL, 1, 10, "f", "/p/a.py", 1))
+        j.timeline.attribute(1, 10)
+        j.on_profile_record(("gap", 500))
+        self.assertIsNone(j.timeline.attribute(1, 20))
+
+    def test_joiner_gap_without_ts_uses_monotonic_clock(self):
+        j = _events.Joiner(hold_ns=100)
+        j.on_profile_record(("frame", _profile.CALL, 1, 10, "f", "/p/a.py", 1))
+        j.on_profile_record(("gap", None))
+        # The real horizon is "now" (a huge monotonic_ns value); a query at
+        # the tiny fabricated ts=10 must fail closed either way.
+        self.assertIsNone(j.timeline.attribute(1, 10))
+
+
 class JoinerTest(unittest.TestCase):
     def test_hold_then_release(self):
         j = _events.Joiner(hold_ns=100)
-        j.on_profile_record((_profile.CALL, 1, 10, "f", "/p/a.py", 1))
+        j.on_profile_record(("frame", _profile.CALL, 1, 10, "f", "/p/a.py", 1))
         j.on_gpu_event(_raw(15, args=(0x77,), ts=50, dur=5, tid=1))
         self.assertEqual(j.flush(now_ns=100), [])          # still held
         released = j.flush(now_ns=200)
@@ -1182,7 +1396,7 @@ class JoinerTest(unittest.TestCase):
     def test_late_profile_record_beats_hold(self):
         j = _events.Joiner(hold_ns=100)
         j.on_gpu_event(_raw(16, ts=50, dur=5, tid=1))
-        j.on_profile_record((_profile.CALL, 1, 10, "f", "/p/a.py", 1))
+        j.on_profile_record(("frame", _profile.CALL, 1, 10, "f", "/p/a.py", 1))
         self.assertEqual(j.flush(now_ns=200)[0].frame.function, "f")
 
     def test_force_flush(self):
