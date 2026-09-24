@@ -1306,6 +1306,34 @@ class ProfileReaderTest(unittest.TestCase):
     def setUp(self):
         _profile._reset_seq()
 
+    def test_poll_flushes_a_pending_gap_left_unresolved_by_this_drain(self):
+        # Burst-then-quiet: the gap is first revealed on a first-sighting
+        # FRAME_DEF (no ts_ns), and the CALL that would normally resolve it
+        # is ALSO dropped under the same overrun. If poll() left the gap
+        # pending indefinitely, a pre-gap CALL whose RETURN was dropped
+        # could sit in the timeline past Joiner.flush's hold window and get
+        # attributed to -- the leaked-frame mis-attribution on_gap exists
+        # to prevent. poll() must flush it as ("gap", None) once its own
+        # drain empties the queue with no resolving record in hand, not
+        # leave it stuck for an indefinite number of future poll() calls.
+        r, w = os.pipe()
+        os.set_blocking(r, True)
+        reader = _profile.ProfileReader(r)
+        reader.start()
+        os.write(w, _profile.encode_hello(pid=1, start_ns=0))
+        os.write(w, _profile._encode_frame_def(0, "a", "/p/a.py", 1))
+        _profile._next_seq()  # a real dropped record, never written
+        os.write(w, _profile._encode_frame_def(1, "b", "/p/a.py", 2))
+        # No later real-ts record follows this drain batch.
+        deadline = time.monotonic() + 2.0
+        out = []
+        while not out and time.monotonic() < deadline:
+            out.extend(reader.poll())
+            time.sleep(0.005)
+        self.assertIn(("gap", None), out)
+        os.close(w)
+        os.close(r)
+
     def test_reads_records_across_threads_and_reaches_eof(self):
         r, w = os.pipe()
         os.set_blocking(r, True)

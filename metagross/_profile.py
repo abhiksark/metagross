@@ -204,7 +204,12 @@ class _DropCountWriter:
                 self._os_write(self._fd, data)
                 return
             except BlockingIOError:
-                continue  # pipe momentarily full: retry until it drains
+                # Pipe momentarily full: retry until it drains. This runs
+                # under `_FrameEmitter`'s lock, so yield the GIL between
+                # attempts rather than busy-spinning and starving other
+                # target threads' emits for however long the pipe stays full.
+                time.sleep(0)
+                continue
             except OSError:
                 return  # broken trace pipe must never kill the target
 
@@ -270,7 +275,16 @@ class RecordReader:
                 version, _pid, _start_ns = _HELLO_BODY.unpack_from(
                     self._buf, _COMMON.size)
                 self.version = version
-                self._expected = (seq + 1) % _SEQ_MOD
+                if self._expected is None:
+                    # The very first record ever: this HELLO establishes
+                    # the baseline itself, not a gap against one.
+                    self._expected = (seq + 1) % _SEQ_MOD
+                else:
+                    # A HELLO seen after the stream already started --
+                    # never happens in production (the child sends exactly
+                    # one), but route it through the same gap check as
+                    # every other rtype for a uniform invariant.
+                    self._note_seq(seq, out, None)
                 self._buf = self._buf[need:]
                 continue
             if rtype == FRAME_DEF:
@@ -435,6 +449,21 @@ class ProfileReader:
             except queue.Empty:
                 break
             out.extend(self._consume(item))
+        if self._reader._pending_gap:
+            # A gap revealed on a no-ts record is normally resolved by the
+            # next real-ts record (see RecordReader._note_seq), but poll()
+            # is called roughly every event-loop tick and the resolving
+            # record may not have arrived yet even under normal operation.
+            # Left unresolved across ticks, a pre-gap CALL whose RETURN was
+            # ALSO dropped under the same overrun could sit in the timeline
+            # long enough for Joiner.flush's >100ms hold window to release
+            # a GPU event against it -- exactly the leaked-frame
+            # mis-attribution on_gap exists to prevent. Flush it now as
+            # ("gap", None) rather than risk that: intentionally
+            # over-conservative (a resolving record merely in flight across
+            # a chunk boundary gets ("gap", now) for one flush), but only
+            # under overrun, and never a guessed frame either way.
+            out.extend(self._reader.finalize())
         return out
 
     def drain_to_eof(self, deadline: float) -> list:
