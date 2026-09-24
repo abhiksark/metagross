@@ -1789,11 +1789,11 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def _send_json(self, value: dict) -> None:
-        body = json.dumps(value, separators=(",", ":")).encode("utf-8")
+        body = json.dumps(value, separators=(",", ":"), allow_nan=False).encode("utf-8")
         self._send(body, "application/json; charset=utf-8")
 
     def _send_ack(self, value: dict) -> None:
-        body = json.dumps(value, separators=(",", ":")).encode("utf-8")
+        body = json.dumps(value, separators=(",", ":"), allow_nan=False).encode("utf-8")
         if len(body) > _MAX_RESPONSE_BODY:
             self._send_error(
                 http.server.HTTPStatus.INTERNAL_SERVER_ERROR,
@@ -1824,6 +1824,7 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
         body = json.dumps(
             {"error": public_messages.get(int(status), "request failed")},
             separators=(",", ":"),
+            allow_nan=False,
         ).encode("utf-8")
         headers = ((("WWW-Authenticate", "Bearer"),) if authenticate else ())
         self._send(
@@ -1972,8 +1973,8 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
                 "request body ended early",
             )
         try:
-            return json.loads(body.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            return _viewer._load_bounded_json(body)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
             raise _IngestRequestError(
                 http.server.HTTPStatus.BAD_REQUEST,
                 f"invalid JSON body: {exc}",

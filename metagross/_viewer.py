@@ -7,6 +7,7 @@ import argparse
 import collections
 import dataclasses
 import json
+import math
 import os
 import shutil
 import stat
@@ -26,6 +27,7 @@ _MAX_KERNELS = 4096
 _MAX_MEMORY_SAMPLES = 2000
 _MAX_RECENT = 10_000
 _DEFAULT_RECENT = 500
+_MAX_INT = 2**63
 
 
 class ViewerError(Exception):
@@ -130,10 +132,10 @@ class TraceModel:
             self.synchronization_duration_ns += event.duration_ns
         if event.api.startswith("cuMemcpy") and event.return_code == 0:
             copied = event.details.get("bytes", 0)
-            if _is_int(copied) and copied >= 0:
+            if _is_bounded_int(copied) and copied >= 0:
                 self.successful_copy_bytes += copied
         gpu_total = event.details.get("gpu_total")
-        if _is_int(gpu_total) and gpu_total >= 0:
+        if _is_bounded_int(gpu_total) and gpu_total >= 0:
             self.observed_outstanding_bytes = gpu_total
             self.observed_peak_bytes = max(self.observed_peak_bytes, gpu_total)
             self.memory_samples.append((event.timestamp, gpu_total))
@@ -220,6 +222,46 @@ def _is_int(value) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+def _is_bounded_int(value) -> bool:
+    """Return whether value is a plain int within the accepted magnitude."""
+    return _is_int(value) and abs(value) < _MAX_INT
+
+
+def _reject_nonfinite(value: str):
+    raise ValueError(f"non-finite JSON constant: {value}")
+
+
+def _finite_float(text: str) -> float:
+    """Parse a JSON number token, rejecting magnitudes that overflow to inf.
+
+    A literal like ``1e400`` is valid JSON syntax but ``float()`` silently
+    rounds it to ``inf``; without this guard such a value would pass
+    ``_reject_nonfinite`` (which only sees the NaN/Infinity constant
+    tokens) and later fail JSON re-encoding with ``allow_nan=False``.
+    """
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError(f"non-finite JSON number: {text}")
+    return value
+
+
+def _load_bounded_json(raw: bytes):
+    """Decode one trust-boundary JSON payload without raising past the caller.
+
+    Bounds recursion depth (translating RecursionError to ValueError) and
+    rejects non-finite floats, whether spelled as a constant token
+    (NaN, Infinity, -Infinity) or as a number literal that overflows to inf.
+    """
+    try:
+        return json.loads(
+            raw.decode("utf-8"),
+            parse_float=_finite_float,
+            parse_constant=_reject_nonfinite,
+        )
+    except RecursionError:
+        raise ValueError("json nesting too deep") from None
+
+
 def sanitize_text(value: str, limit: int = _MAX_TEXT) -> str:
     """Remove terminal controls and cap attacker-controlled display strings."""
     cleaned = "".join(
@@ -231,8 +273,8 @@ def sanitize_text(value: str, limit: int = _MAX_TEXT) -> str:
 
 def _required_int(record: dict, name: str) -> int:
     value = record.get(name)
-    if not _is_int(value):
-        raise ValueError(f"{name} must be an integer")
+    if not _is_bounded_int(value):
+        raise ValueError(f"{name} must be an integer within range")
     return value
 
 
@@ -258,8 +300,8 @@ def parse_event(record) -> ViewerEvent:
     if not isinstance(details, dict):
         raise ValueError("details must be an object")
     line = record.get("line")
-    if line is not None and not _is_int(line):
-        raise ValueError("line must be an integer or null")
+    if line is not None and not _is_bounded_int(line):
+        raise ValueError("line must be an integer within range or null")
     duration_ns = _required_int(record, "duration_ns")
     if duration_ns < 0:
         raise ValueError("duration_ns must not be negative")
@@ -296,9 +338,14 @@ def parse_event(record) -> ViewerEvent:
 
 
 def observe_raw_line(model: TraceModel, raw: bytes) -> bool:
-    """Validate and aggregate one bounded JSONL record."""
+    """Validate and aggregate one bounded JSONL record.
+
+    A malformed or hostile line (invalid JSON, too deeply nested, a
+    non-finite float constant, or a record that fails schema validation)
+    is counted in ``malformed_lines`` and never raises past this call.
+    """
     try:
-        record = json.loads(raw.decode("utf-8"))
+        record = _load_bounded_json(raw)
         model.observe(parse_event(record))
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
         model.malformed_lines += 1
@@ -365,8 +412,8 @@ def load_summary(path: Path) -> dict:
     if len(raw) > _MAX_SUMMARY_BYTES:
         raise ViewerError(f"summary {str(path)!r} exceeds 4 MiB")
     try:
-        return json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return _load_bounded_json(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise ViewerError(f"invalid summary JSON in {str(path)!r}: {exc}") from None
 
 

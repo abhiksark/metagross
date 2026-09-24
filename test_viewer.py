@@ -199,6 +199,41 @@ class ViewerModelTest(unittest.TestCase):
                 self.assertEqual(model.status, expected)
 
 
+class IngestBoundaryTest(unittest.TestCase):
+    def test_deeply_nested_json_is_malformed_not_fatal(self):
+        model = _viewer.TraceModel()
+        # Reuse the exact nesting depth the evidence file recorded as fatal
+        # (docs/audits/2026-09-05-launch-evidence.md ~line 242). Exceed the
+        # interpreter limit generously so the bomb is deterministic.
+        depth = sys.getrecursionlimit() * 2
+        raw = (b"[" * depth) + (b"]" * depth)
+        self.assertFalse(_viewer.observe_raw_line(model, raw))
+        self.assertEqual(model.malformed_lines, 1)  # counted, not raised
+
+    def test_absurd_duration_is_malformed(self):
+        model = _viewer.TraceModel()
+        record = _record()
+        record["duration_ns"] = 10**400
+        line = json.dumps(record).encode("utf-8")
+        self.assertFalse(_viewer.observe_raw_line(model, line))
+        self.assertEqual(model.malformed_lines, 1)
+
+    def test_non_finite_float_is_rejected(self):
+        model = _viewer.TraceModel()
+        self.assertFalse(_viewer.observe_raw_line(model, b'{"duration_ns": NaN}'))
+        self.assertEqual(model.malformed_lines, 1)
+
+    def test_overflowing_float_literal_is_malformed(self):
+        # A JSON number literal like 1e400 is syntactically valid but
+        # float() silently rounds it to inf; it must be rejected here, not
+        # allowed through to poison a later allow_nan=False re-encoding.
+        model = _viewer.TraceModel()
+        record = _record(details={"x": "PLACEHOLDER"})
+        line = json.dumps(record).replace('"PLACEHOLDER"', "1e400").encode("utf-8")
+        self.assertFalse(_viewer.observe_raw_line(model, line))
+        self.assertEqual(model.malformed_lines, 1)
+
+
 class ViewerFileTest(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -1619,6 +1654,35 @@ console.log(JSON.stringify({first, refresh, replacement, duplicate, fresh, block
         self.assertEqual(payload["timeline"]["events"][0]["lane"], "compute")
         self.assertEqual(payload["timeline"]["events"][0]["start_ns"], 0)
         self.assertEqual(payload["timeline"]["events"][0]["duration_ns"], 50_000)
+
+    def test_dashboard_follower_thread_survives_recursion_bomb_line(self):
+        # F5(a): a hostile line must not kill the background follower thread
+        # while the dashboard keeps reporting LIVE. observe_raw_line()
+        # returning False is necessary but not sufficient evidence; this
+        # drives the real file follower thread end to end.
+        trace = self.root / "events.jsonl"
+        trace.write_text(json.dumps(_record()) + "\n", encoding="utf-8")
+        state = _web.DashboardState(trace, None, 50, 0.05)
+        self.addCleanup(state.close)
+        state.start()
+
+        deadline = time.monotonic() + 2
+        while state.follower.model.events == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(state.follower.model.events, 1)
+
+        depth = sys.getrecursionlimit() * 2
+        bomb = (b"[" * depth) + (b"]" * depth) + b"\n"
+        with trace.open("ab") as handle:
+            handle.write(bomb)
+
+        deadline = time.monotonic() + 2
+        while state.follower.model.malformed_lines == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        self.assertTrue(state._thread.is_alive())
+        self.assertEqual(state.follower.model.malformed_lines, 1)
+        self.assertEqual(state.payload()["status"], "LIVE / MALFORMED")
 
     def test_dashboard_payload_bounds_high_volume_sections(self):
         model = _viewer.TraceModel(recent_limit=500)
