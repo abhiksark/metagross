@@ -35,11 +35,10 @@ _MAX_STR = 500
 # Every record starts with this 6-byte common header.
 _COMMON = struct.Struct("<BIB")  # rtype, seq, _reserved
 _HELLO_BODY = struct.Struct("<BIQ")  # version, pid, start_ns
-# Task 2 keeps CALL/RETURN bodies carrying func/path inline (as Phase A
-# did); Task 3 replaces this with a `frame_id` once frames are interned via
-# FRAME_DEF.
-_FRAME_PREFIX = struct.Struct("<IQIHH")  # tid, ts_ns, line, func_len, path_len
 _FRAME_DEF_PREFIX = struct.Struct("<IIIHH")  # frame_id, line, _pad, func_len, path_len
+# CALL/RETURN carry only the interned frame_id; FRAME_DEF (above) is what
+# assigns func/path/line to that id, once, the first time a frame is seen.
+_FRAME_REF_BODY = struct.Struct("<IQI")  # tid, ts_ns, frame_id
 _SPAN_BEGIN_PREFIX = struct.Struct("<IQH")  # tid, ts_ns, name_len
 _SPAN_END_BODY = struct.Struct("<IQ")  # tid, ts_ns
 
@@ -86,17 +85,58 @@ def encode_hello(pid: int, start_ns: int) -> bytes:
                                start_ns & 0xFFFFFFFFFFFFFFFF))
 
 
-def _frame_bytes(kind, seq, tid, ts_ns, func_bytes, path_bytes, line) -> bytes:
-    rtype = _FRAME_RTYPE_BY_KIND[kind]
-    return (_COMMON.pack(rtype, seq, 0)
-            + _FRAME_PREFIX.pack(tid, ts_ns, line, len(func_bytes), len(path_bytes))
+def _encode_frame_def(frame_id, func, path, line) -> bytes:
+    func_bytes = func.encode("utf-8", "replace")[:_MAX_STR]
+    path_bytes = path.encode("utf-8", "replace")[:_MAX_STR]
+    seq = _next_seq()
+    return (_COMMON.pack(FRAME_DEF, seq, 0)
+            + _FRAME_DEF_PREFIX.pack(frame_id, line, 0, len(func_bytes), len(path_bytes))
             + func_bytes + path_bytes)
 
 
+def _encode_frame_ref(kind, tid, ts_ns, frame_id) -> bytes:
+    rtype = _FRAME_RTYPE_BY_KIND[kind]
+    seq = _next_seq()
+    return _COMMON.pack(rtype, seq, 0) + _FRAME_REF_BODY.pack(tid, ts_ns, frame_id)
+
+
 def encode_frame(kind, tid, ts_ns, func, path, line) -> bytes:
-    func_bytes = func.encode("utf-8", "replace")[:_MAX_STR]
-    path_bytes = path.encode("utf-8", "replace")[:_MAX_STR]
-    return _frame_bytes(kind, _next_seq(), tid, ts_ns, func_bytes, path_bytes, line)
+    """Encode one self-contained frame record: a fresh FRAME_DEF (id 0)
+    immediately followed by the CALL/RETURN that references it.
+
+    A test or tool convenience for exercising the wire codec without
+    running a whole `_FrameEmitter`. `install()`'s hot path does not call
+    this -- it interns real frames through `_FrameEmitter` instead, so a
+    repeated frame costs one small reference rather than a redefinition.
+    """
+    frame_id = 0
+    return (_encode_frame_def(frame_id, func, path, line)
+            + _encode_frame_ref(kind, tid, ts_ns, frame_id))
+
+
+class _FrameEmitter:
+    """Intern (func, path, line) frames to a small integer id.
+
+    Writes one FRAME_DEF the first time a frame is seen, then a CALL/RETURN
+    carrying only that frame_id thereafter. `write` is called once per
+    finished record's bytes (never given a merged blob), so a caller that
+    wants to inspect or drop-and-count individual records can do so.
+    """
+
+    def __init__(self, write):
+        self._write = write
+        self._frames: dict[tuple[str, str, int], int] = {}
+        self._next_id = 0
+
+    def emit(self, kind, tid, ts, func, path, line) -> None:
+        key = (func, path, line)
+        frame_id = self._frames.get(key)
+        if frame_id is None:
+            frame_id = self._next_id
+            self._next_id += 1
+            self._frames[key] = frame_id
+            self._write(_encode_frame_def(frame_id, func, path, line))
+        self._write(_encode_frame_ref(kind, tid, ts, frame_id))
 
 
 def encode_span_begin(tid, ts_ns, name) -> bytes:
@@ -128,6 +168,14 @@ class RecordReader:
         self._buf = b""
         self._expected = None
         self.version = None
+        # frame_id -> (func, path, line). Never cleared, including on a
+        # gap: FRAME_DEF is never dropped (Task 4 makes it undroppable), so
+        # a definition always precedes its use and ids never desync.
+        self._frames: dict[int, tuple] = {}
+        # Defensive-only counter: a CALL/RETURN whose frame_id is somehow
+        # unknown is dropped rather than guessing a frame. This should not
+        # happen once Task 4 lands (FRAME_DEF cannot itself be lost).
+        self.lost_records = 0
 
     def feed(self, data: bytes) -> list[tuple]:
         self._buf += data
@@ -148,33 +196,38 @@ class RecordReader:
                 prefix_off = _COMMON.size
                 if len(self._buf) < prefix_off + _FRAME_DEF_PREFIX.size:
                     break
-                _fid, _line, _pad, fl, pl = _FRAME_DEF_PREFIX.unpack_from(
+                frame_id, line, _pad, fl, pl = _FRAME_DEF_PREFIX.unpack_from(
                     self._buf, prefix_off)
-                total = prefix_off + _FRAME_DEF_PREFIX.size + fl + pl
-                if len(self._buf) < total:
-                    break
-                self._buf = self._buf[total:]
-                self._note_seq(seq, out, None)
-                # Interning lands in Task 3; for now this only keeps the
-                # stream framed and seq-tracked so a future decoder can be
-                # added without a wire-format break.
-                continue
-            if rtype in (_FRAME_CALL_RTYPE, _FRAME_RETURN_RTYPE):
-                prefix_off = _COMMON.size
-                if len(self._buf) < prefix_off + _FRAME_PREFIX.size:
-                    break
-                tid, ts_ns, line, fl, pl = _FRAME_PREFIX.unpack_from(
-                    self._buf, prefix_off)
-                body_off = prefix_off + _FRAME_PREFIX.size
+                body_off = prefix_off + _FRAME_DEF_PREFIX.size
                 total = body_off + fl + pl
                 if len(self._buf) < total:
                     break
                 func = self._buf[body_off:body_off + fl].decode("utf-8", "replace")
                 path = self._buf[body_off + fl:total].decode("utf-8", "replace")
                 self._buf = self._buf[total:]
+                # FRAME_DEF carries no ts_ns of its own; a gap revealed here
+                # has an unknown ts until the next timestamped record.
+                self._note_seq(seq, out, None)
+                self._frames[frame_id] = (func, path, line)
+                continue
+            if rtype in (_FRAME_CALL_RTYPE, _FRAME_RETURN_RTYPE):
+                need = _COMMON.size + _FRAME_REF_BODY.size
+                if len(self._buf) < need:
+                    break
+                tid, ts_ns, frame_id = _FRAME_REF_BODY.unpack_from(
+                    self._buf, _COMMON.size)
+                self._buf = self._buf[need:]
                 self._note_seq(seq, out, ts_ns)
+                frame = self._frames.get(frame_id)
+                if frame is None:
+                    # Defensive only: FRAME_DEF is never dropped (Task 4),
+                    # so this should not happen. Fail closed -- drop this
+                    # one record and count it, never guess a frame, and
+                    # never clear the map on the strength of one bad id.
+                    self.lost_records += 1
+                    continue
                 kind = _KIND_BY_FRAME_RTYPE[rtype]
-                out.append(("frame", kind, tid, ts_ns, func, path, line))
+                out.append(("frame", kind, tid, ts_ns, *frame))
                 continue
             if rtype == SPAN_BEGIN:
                 prefix_off = _COMMON.size
@@ -300,7 +353,7 @@ class _ProjectClassifier:
         self.root_prefix = (self.root if self.root.endswith(os.sep)
                             else self.root + os.sep)
         self._path_cache: dict[str, bool] = {}
-        self._code_cache: dict[object, tuple[bytes, bytes, int] | None] = {}
+        self._code_cache: dict[object, tuple[str, str, int] | None] = {}
 
     def includes(self, path: str) -> bool:
         cached = self._path_cache.get(path)
@@ -318,7 +371,14 @@ class _ProjectClassifier:
         self._path_cache[path] = included
         return included
 
-    def metadata(self, code) -> tuple[bytes, bytes, int] | None:
+    def metadata(self, code) -> tuple[str, str, int] | None:
+        """Return the (func, path, line) key `_FrameEmitter` interns on.
+
+        Cached as plain strings, not pre-encoded bytes: with interning, a
+        repeat frame only ever needs this tuple for the dict lookup, and
+        the utf-8 encode + `_MAX_STR` truncation (in `_encode_frame_def`)
+        runs at most once per unique frame, the first time it is seen.
+        """
         try:
             return self._code_cache[code]
         except KeyError:
@@ -326,11 +386,7 @@ class _ProjectClassifier:
         if not self.includes(code.co_filename):
             self._code_cache[code] = None
             return None
-        metadata = (
-            code.co_name.encode("utf-8", "replace")[:_MAX_STR],
-            code.co_filename.encode("utf-8", "replace")[:_MAX_STR],
-            code.co_firstlineno,
-        )
+        metadata = (code.co_name, code.co_filename, code.co_firstlineno)
         self._code_cache[code] = metadata
         return metadata
 
@@ -344,10 +400,15 @@ def install(write_fd: int, project_root: str) -> None:
     classifier = _ProjectClassifier(project_root)
     lock = threading.Lock()
 
-    try:
-        os.write(write_fd, encode_hello(os.getpid(), time.monotonic_ns()))
-    except OSError:
-        pass  # broken trace pipe must never kill the target
+    def _write(record: bytes) -> None:
+        try:
+            os.write(write_fd, record)
+        except OSError:
+            pass  # broken trace pipe must never kill the target
+
+    emitter = _FrameEmitter(_write)
+
+    _write(encode_hello(os.getpid(), time.monotonic_ns()))
 
     def hook(frame, event, arg):
         if event == "call":
@@ -362,19 +423,16 @@ def install(write_fd: int, project_root: str) -> None:
         tid = getattr(local, "tid", None)
         if tid is None:
             tid = local.tid = threading.get_native_id()
-        func_bytes, path_bytes, line = metadata
+        func, path, line = metadata
         ts_ns = time.monotonic_ns()
         # threading.setprofile fires this hook on every target thread; the
-        # seq assignment and the write that carries it must stay ordered
+        # seq assignment and the write(s) that carry it must stay ordered
         # together, or the reader sees seqs out of order and manufactures
-        # false gaps (see _next_seq's docstring).
+        # false gaps (see _next_seq's docstring). emit() may issue two
+        # writes (a first-sight FRAME_DEF, then the CALL/RETURN) that must
+        # land back-to-back, so both happen under the same lock.
         with lock:
-            record = _frame_bytes(kind, _next_seq(), tid, ts_ns, func_bytes,
-                                  path_bytes, line)
-            try:
-                os.write(write_fd, record)
-            except OSError:
-                pass  # broken trace pipe must never kill the target
+            emitter.emit(kind, tid, ts_ns, func, path, line)
 
     def _disable_in_forked_child() -> None:
         # A target that forks without exec (e.g. multiprocessing/DataLoader

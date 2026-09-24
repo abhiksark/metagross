@@ -975,12 +975,15 @@ class RecordCodecTest(unittest.TestCase):
         # but before the func/path bytes finish arriving. The seq check
         # must not fire on the first, incomplete feed -- only once the
         # whole record is present -- or a slow/chunked write would
-        # manufacture a spurious gap on its own record.
+        # manufacture a spurious gap on its own record. encode_frame's blob
+        # is FRAME_DEF-first, so the split lands inside FRAME_DEF's own
+        # func/path bytes (the trailing CALL/RETURN reference is untouched
+        # until the second feed).
         reader = self._reader_after_hello()
         blob = _profile.encode_frame(_profile.RETURN, 7, 99,
                                      "somewhat_longer_func_name",
                                      "/p/a/longer/path.py", 2)
-        split = 6 + 20  # common header + frame prefix; strings incomplete
+        split = 6 + _profile._FRAME_DEF_PREFIX.size + 4  # a few bytes into func
         self.assertLess(split, len(blob))
         self.assertEqual(reader.feed(blob[:split]), [])
         self.assertEqual(reader.feed(blob[split:]),
@@ -1019,17 +1022,23 @@ class RecordCodecTest(unittest.TestCase):
     def test_missing_hello_emits_gap_then_frame(self):
         # No HELLO fed first: _expected starts as None, so the very first
         # record (even at its own seq 0) is treated as a gap rather than a
-        # silently trusted unannounced stream.
+        # silently trusted unannounced stream. With frame interning, the
+        # very first wire record for any frame is its FRAME_DEF, which
+        # carries no ts_ns field -- so the gap this reveals has an unknown
+        # ts (None) rather than the CALL's ts, per the wire spec ("or None
+        # if not yet known").
         blob = _profile.encode_frame(_profile.CALL, 1, 5, "f", "/p/a.py", 1)
         out = _profile.RecordReader().feed(blob)
-        self.assertEqual(out[0], ("gap", 5))
+        self.assertEqual(out[0], ("gap", None))
         self.assertEqual(out[1], ("frame", _profile.CALL, 1, 5, "f", "/p/a.py", 1))
 
     def test_record_type_reads_rtype_byte(self):
         hello = _profile.encode_hello(pid=1, start_ns=0)
+        # encode_frame's blob is FRAME_DEF-first; record_type reads that
+        # leading record's rtype, not the CALL/RETURN reference behind it.
         frame = _profile.encode_frame(_profile.CALL, 1, 1, "f", "/p/a.py", 1)
         self.assertEqual(_profile.record_type(hello), _profile.HELLO)
-        self.assertNotEqual(_profile.record_type(frame), _profile.HELLO)
+        self.assertEqual(_profile.record_type(frame), _profile.FRAME_DEF)
 
     def test_span_roundtrip(self):
         reader = self._reader_after_hello()
@@ -1045,6 +1054,54 @@ class RecordCodecTest(unittest.TestCase):
         self.assertEqual(out, [("gap", None)])
         # The bad bytes were dropped; feeding nothing more yields nothing.
         self.assertEqual(reader.feed(b""), [])
+
+    def test_unknown_frame_id_drops_one_record_without_clearing_map(self):
+        # Defensive only: once Task 4 makes FRAME_DEF undroppable, a
+        # CALL/RETURN should never reference an id the reader has not
+        # seen. If it somehow does, the reader must fail closed -- drop
+        # that one record and count it, never guess a frame, and never
+        # clear the map on the strength of one bad id.
+        reader = self._reader_after_hello()
+        known = _profile.encode_frame(_profile.CALL, 7, 10, "run", "/p/a.py", 1)
+        self.assertEqual(len(reader.feed(known)), 1)  # frame_id 0 now defined
+        bad = _profile._encode_frame_ref(_profile.CALL, tid=7, ts_ns=20,
+                                         frame_id=999)
+        self.assertEqual(reader.feed(bad), [])
+        self.assertEqual(reader.lost_records, 1)
+        # The map survived the drop: a later reference to the earlier,
+        # real frame_id (0) still resolves correctly.
+        again = _profile._encode_frame_ref(_profile.RETURN, tid=7, ts_ns=30,
+                                           frame_id=0)
+        self.assertEqual(reader.feed(again),
+                         [("frame", _profile.RETURN, 7, 30, "run", "/p/a.py", 1)])
+
+
+class FrameInterningTest(unittest.TestCase):
+    def setUp(self):
+        _profile._reset_seq()
+
+    def test_frame_defined_once_then_referenced_by_id(self):
+        written = []
+        emitter = _profile._FrameEmitter(written.append)  # write = collect bytes
+        emitter.emit(_profile.CALL, 7, 10, "run", "/p/a.py", 1)
+        emitter.emit(_profile.CALL, 7, 20, "run", "/p/a.py", 1)  # same frame
+        # Exactly one FRAME_DEF was written across the two same-frame calls.
+        # types.count uses the wire rtype (_FRAME_CALL_RTYPE), not the
+        # CALL/RETURN "kind" constant (0/1): those are a separate value
+        # space (kind 0/RETURN kind 1 collide with HELLO/FRAME_DEF rtypes),
+        # kept apart deliberately -- see the module docstring near CALL/
+        # RETURN and _FRAME_CALL_RTYPE.
+        types = [_profile.record_type(b) for b in written]
+        self.assertEqual(types.count(_profile.FRAME_DEF), 1)
+        self.assertEqual(types.count(_profile._FRAME_CALL_RTYPE), 2)
+        # The reader reconstructs identical FrameInfo fields for both references.
+        reader = _profile.RecordReader()
+        frames = []
+        for b in written:
+            frames += [r for r in reader.feed(b) if r[0] == "frame"]
+        self.assertEqual(len(frames), 2)
+        self.assertEqual(frames[0][4:], ("run", "/p/a.py", 1))
+        self.assertEqual(frames[1][4:], ("run", "/p/a.py", 1))
 
 
 class ProfileReaderTest(unittest.TestCase):
