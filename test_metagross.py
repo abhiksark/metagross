@@ -1129,6 +1129,77 @@ class FrameInterningTest(unittest.TestCase):
         self.assertEqual(frames[1][4:], ("run", "/p/a.py", 1))
 
 
+class FrameEmitterConcurrencyTest(unittest.TestCase):
+    def setUp(self):
+        _profile._reset_seq()
+
+    def test_concurrent_emit_and_span_do_not_desync_seq(self):
+        # emit() runs on the threading.setprofile hook (fires on every
+        # target thread); span_begin/span_end run on whatever thread the
+        # target's own code calls metagross.span() from. Without a single
+        # lock covering _next_seq() + write() for both paths, a race
+        # between them interleaves or duplicates seqs on the wire and the
+        # reader manufactures false gaps. list.append is itself atomic
+        # under the GIL, so the order records land in `written` reflects
+        # the order the lock let them through -- feeding them back in that
+        # same order must decode with zero gaps if the lock is effective.
+        #
+        # The default GIL switch interval rarely lands a context switch
+        # inside the tiny window between _next_seq()'s read and write of
+        # the module-global counter, so this test forces very frequent
+        # switches to make the race actually observable -- verified against
+        # a deliberately unlocked `_FrameEmitter` (reverting the `with
+        # self._lock:` wrapping) to reproduce dozens of manufactured gaps
+        # within a few thousand iterations; this test must stay green with
+        # the lock in place.
+        old_interval = sys.getswitchinterval()
+        sys.setswitchinterval(1e-6)
+        try:
+            written = []
+            emitter = _profile._FrameEmitter(written.append)
+            hello_bytes = _profile.encode_hello(pid=1, start_ns=0)  # consumes seq 0
+
+            def emit_worker():
+                for i in range(3000):
+                    emitter.emit(_profile.CALL, 1, i, "f", "/p/a.py", 1)
+
+            def span_worker():
+                for i in range(3000):
+                    emitter.span_begin(2, i, "op")
+                    emitter.span_end(2, i)
+
+            threads = [threading.Thread(target=emit_worker),
+                       threading.Thread(target=span_worker)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        finally:
+            sys.setswitchinterval(old_interval)
+
+        reader = _profile.RecordReader()
+        records = reader.feed(hello_bytes)
+        for data in written:
+            records += reader.feed(data)
+        self.assertNotIn("gap", [rec[0] for rec in records])
+        self.assertEqual(reader.lost_records, 0)
+
+    def test_span_begin_and_span_end_hold_the_lock_across_the_write(self):
+        # A direct assertion the coordinator's finding also asked for: the
+        # write for span_begin/span_end happens while the emitter's lock is
+        # held, not released beforehand.
+        emitter = _profile._FrameEmitter(lambda data: None)
+        held = []
+
+        def write(data):
+            held.append(emitter._lock.locked())
+
+        emitter._write = write
+        emitter.span_begin(1, 10, "op")
+        emitter.span_end(1, 20)
+        self.assertEqual(held, [True, True])
+
+
 class ProfileDropTest(unittest.TestCase):
     def setUp(self):
         _profile._reset_seq()
@@ -1376,6 +1447,35 @@ class InstallHookTest(unittest.TestCase):
         self.assertNotIn("gap", [rec[0] for rec in records])
 
 
+class SpanApiTest(unittest.TestCase):
+    def test_span_is_noop_without_profiling_installed(self):
+        # Outside a metagross run, span() must not raise or write anywhere.
+        with metagross.span("anything"):
+            pass  # no profiling handle installed -> no-op
+
+
+class OpSpanTimelineTest(unittest.TestCase):
+    def test_innermost_enclosing_span_at_ts(self):
+        t = _events.OpSpanTimeline()
+        t.on_span(0, 7, 10, "forward")     # SPAN_BEGIN
+        t.on_span(0, 7, 20, "matmul")
+        # SPAN_END matmul: the wire record carries no name (see
+        # _profile.encode_span_end / Joiner.on_profile_record), so the
+        # production path always calls on_span(1, tid, ts, None) here --
+        # never the closed span's name. Feeding a name back in would mask
+        # the unconditional-pop requirement `_apply` relies on.
+        t.on_span(1, 7, 30, None)
+        self.assertEqual(t.attribute(7, 25), "matmul")
+        self.assertEqual(t.attribute(7, 35), "forward")
+
+    def test_gap_fails_closed(self):
+        t = _events.OpSpanTimeline()
+        t.on_span(0, 7, 10, "forward")
+        t.attribute(7, 10)
+        t.on_gap(50)
+        self.assertIsNone(t.attribute(7, 20))
+
+
 class AttributionTest(unittest.TestCase):
     def setUp(self):
         self.tl = _events.FrameTimeline()
@@ -1612,6 +1712,22 @@ class GapHandlingTest(unittest.TestCase):
 
 
 class JoinerTest(unittest.TestCase):
+    def test_span_end_through_joiner_pops_the_innermost_span(self):
+        # The production path: Joiner.on_profile_record feeds the wire
+        # ("span_end", tid, ts) shape -- no name -- into
+        # OpSpanTimeline.on_span, which must still pop the innermost open
+        # span. This is the case test_innermost_enclosing_span_at_ts alone
+        # did not cover (it hand-fed the closed span's name, a shape
+        # production never produces).
+        j = _events.Joiner()
+        j.on_profile_record(("span_begin", 7, 10, "forward"))
+        j.on_profile_record(("span_begin", 7, 20, "matmul"))
+        j.on_profile_record(("span_end", 7, 30))       # ends matmul
+        self.assertEqual(j.spans.attribute(7, 25), "matmul")
+        self.assertEqual(j.spans.attribute(7, 35), "forward")  # enclosing span
+        j.on_profile_record(("span_end", 7, 40))       # ends forward
+        self.assertIsNone(j.spans.attribute(7, 45))
+
     def test_hold_then_release(self):
         j = _events.Joiner(hold_ns=100)
         j.on_profile_record(("frame", _profile.CALL, 1, 10, "f", "/p/a.py", 1))

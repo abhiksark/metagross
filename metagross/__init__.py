@@ -20,6 +20,24 @@ import traceback
 from typing import NoReturn
 
 
+def __getattr__(name: str):
+    """Lazily re-export `metagross.span` (PEP 562).
+
+    A plain top-level `from metagross._span import span` would force
+    `metagross._profile` into `sys.modules` on every `import metagross`,
+    including the unprivileged `--help` path
+    (test_target.TopLevelHelpTest.test_help_does_not_import_tracing_modules
+    asserts it stays out). `_span` imports only `_profile` -- no cycle with
+    this package -- but the import is deferred to first access of `span`
+    regardless, to keep the module import itself free of that side effect.
+    """
+    if name == "span":
+        from metagross._span import span
+
+        return span
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 class MetagrossError(Exception):
     """Base class for reported failures (exit 1)."""
 

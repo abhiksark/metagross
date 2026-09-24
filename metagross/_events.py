@@ -171,6 +171,134 @@ class FrameTimeline:
                     self._states[tid] = _ReplayState()
 
 
+class _SpanReplayState:
+    __slots__ = ("index", "last_ts_ns", "stack")
+
+    def __init__(self):
+        self.index = 0
+        self.last_ts_ns = -1
+        self.stack: list[str] = []
+
+
+class OpSpanTimeline:
+    """Per-TID metagross.span() logs with incremental point-in-time replay.
+
+    Structurally the same point-in-time replay + horizon design as
+    `FrameTimeline` above, but its stack elements are span NAMES (strings,
+    not FrameInfo) and a SPAN_END pops the top unconditionally (the wire
+    SPAN_END record carries no name to match against; see `_apply`) rather
+    than on an exact match -- kept as a separate class rather than sharing a
+    base because the two differ in element type and match semantics, and a
+    base narrow enough to cover both would tangle them for no real reuse
+    (~40 duplicated lines, permitted by the plan). `on_gap` mirrors
+    `FrameTimeline.on_gap`'s corrected drop-all-pre-gap shape: a dropped
+    SPAN_END is indistinguishable from a genuinely still-open span, so
+    prune-and-retain would leak an open span across the gap and
+    mis-attribute every query at/after it forever.
+    """
+
+    def __init__(self):
+        self._logs: dict[int, list[tuple]] = {}
+        self._states: dict[int, _SpanReplayState] = {}
+        self._horizons: dict[int, int] = {}
+
+    @staticmethod
+    def _apply(stack: list[str], record: tuple) -> None:
+        _, kind, name = record
+        if kind == 0:
+            stack.append(name)
+        elif kind == 1 and stack:
+            # The wire SPAN_END record carries no name (span_end(tid, ts)
+            # only -- see _profile.encode_span_end / Joiner.on_profile_record,
+            # which feeds `name=None` here), so this cannot be a name-match
+            # pop the way FrameTimeline's CALL/RETURN pop is (RETURN carries
+            # the same (func, path, line) as its CALL). Pop unconditionally
+            # instead: spans are strictly LIFO-nested per tid by construction
+            # (metagross.span() is a context manager -- it cannot close a
+            # span that is not the innermost open one), so the top of the
+            # stack is always the span this END closes. A dropped span
+            # record from a gap is handled separately: on_gap drops every
+            # pre-gap record before any END could apply against a
+            # differently-nested pre-gap stack.
+            stack.pop()
+
+    def on_span(self, kind, tid, ts_ns, name) -> None:
+        record = (ts_ns, kind, name)
+        log = self._logs.setdefault(tid, [])
+        if log and record < log[-1]:
+            bisect.insort_right(log, record)
+        else:
+            log.append(record)
+        state = self._states.get(tid)
+        if state is not None and ts_ns <= state.last_ts_ns:
+            # A late record invalidates the incremental stack. The next
+            # monotonic query rebuilds it once from the now-sorted log.
+            self._states[tid] = _SpanReplayState()
+
+    def attribute(self, tid: int, ts_ns: int):
+        log = self._logs.get(tid)
+        if not log:
+            return None
+        horizon = self._horizons.get(tid)
+        if horizon is not None and ts_ns < horizon:
+            return None  # history below the prune horizon is gone; do not guess
+        state = self._states.setdefault(tid, _SpanReplayState())
+        if ts_ns < state.last_ts_ns:
+            # Answer an older query independently rather than rewinding the
+            # monotonic cursor.
+            stack: list[str] = []
+            end = bisect.bisect_right(log, (ts_ns, 2))
+            for record in log[:end]:
+                self._apply(stack, record)
+            return stack[-1] if stack else None
+
+        while state.index < len(log) and log[state.index][0] <= ts_ns:
+            self._apply(state.stack, log[state.index])
+            state.index += 1
+        state.last_ts_ns = ts_ns
+        return state.stack[-1] if state.stack else None
+
+    def on_gap(self, ts_ns: int) -> None:
+        # Drop ALL pre-gap records, including still-open SPAN_BEGINs -- the
+        # SAME corrected fail-closed shape FrameTimeline.on_gap uses (see its
+        # docstring). A dropped SPAN_END is indistinguishable from a
+        # genuinely still-open span; retaining it would leak an open span
+        # across the gap and never clear, mis-attributing every subsequent
+        # query. Dropping everything below the gap forces post-gap queries
+        # to None until a real SPAN_BEGIN re-establishes the stack.
+        for tid, log in self._logs.items():
+            log[:] = [record for record in log if record[0] >= ts_ns]
+            self._horizons[tid] = max(self._horizons.get(tid, ts_ns), ts_ns)
+            self._states[tid] = _SpanReplayState()
+
+    def prune(self, min_ts_ns: int) -> None:
+        for tid, log in self._logs.items():
+            self._horizons[tid] = max(self._horizons.get(tid, min_ts_ns), min_ts_ns)
+            cut = 0
+            open_stack: list[str] = []
+            open_indices: list[int] = []
+            for i, record in enumerate(log):
+                if record[0] >= min_ts_ns:
+                    break
+                cut = i + 1
+                before = len(open_stack)
+                self._apply(open_stack, record)
+                if len(open_stack) > before:
+                    open_indices.append(i)           # a SPAN_BEGIN was pushed
+                elif len(open_stack) < before:
+                    open_indices.pop()               # a SPAN_END popped it
+            if not cut:
+                continue
+            retained = [log[i] for i in open_indices]  # still-open spans, in order
+            log[:] = retained + log[cut:]
+            state = self._states.get(tid)
+            if state is not None:
+                if state.index >= cut:
+                    state.index = len(retained) + (state.index - cut)
+                else:
+                    self._states[tid] = _SpanReplayState()
+
+
 @dataclasses.dataclass
 class AttributedEvent:
     raw: object
@@ -192,6 +320,7 @@ class Joiner:
     def __init__(self, hold_ns: int = 100_000_000):
         self.hold_ns = hold_ns
         self.timeline = FrameTimeline()
+        self.spans = OpSpanTimeline()
         self.registry = KernelRegistry()
         self.allocs = AllocTracker()
         self._pending: list = []
@@ -214,10 +343,16 @@ class Joiner:
         if tag == "frame":
             _, kind, tid, ts, func, path, line = rec
             self.timeline.on_record(kind, tid, ts, func, path, line)
+        elif tag == "span_begin":
+            _, tid, ts, name = rec
+            self.spans.on_span(0, tid, ts, name)
+        elif tag == "span_end":
+            _, tid, ts = rec
+            self.spans.on_span(1, tid, ts, None)
         elif tag == "gap":
-            self.timeline.on_gap(rec[1] if rec[1] is not None else time.monotonic_ns())
-        # span tags ("span_begin"/"span_end") are decoded already but land
-        # in the timeline in Task 5.
+            gap_ts = rec[1] if rec[1] is not None else time.monotonic_ns()
+            self.timeline.on_gap(gap_ts)
+            self.spans.on_gap(gap_ts)
 
     def enrich(self, event: AttributedEvent) -> EnrichedEvent:
         kernel, details = describe(

@@ -121,22 +121,47 @@ class _FrameEmitter:
     carrying only that frame_id thereafter. `write` is called once per
     finished record's bytes (never given a merged blob), so a caller that
     wants to inspect or drop-and-count individual records can do so.
+
+    Owns its own lock, held across every `_next_seq()` + `write()` pair
+    (`emit`, `span_begin`, `span_end` alike): `emit` runs on the
+    `threading.setprofile` hook, firing on every target thread, while
+    `span_begin`/`span_end` run on whatever thread the target's own code
+    calls `metagross.span()` from -- with no shared closure to lock through
+    the way the hook alone used to. Without a single lock covering both
+    paths, a concurrent hook `emit` and a `span()` call race on the
+    module-global `_next_seq()` counter and the interleaving of their
+    writes, producing out-of-order or duplicate seqs on the wire and
+    manufacturing false gaps. No reentrancy hazard: everything this lock
+    guards ends in a write to `write_fd` via `_DropCountWriter`, and nothing
+    on that path is project code the profiling hook would itself trace (see
+    `_ProjectClassifier`'s `_SELF_DIR` exclusion in `install()`), so the
+    lock is never re-acquired from inside itself.
     """
 
     def __init__(self, write):
         self._write = write
         self._frames: dict[tuple[str, str, int], int] = {}
         self._next_id = 0
+        self._lock = threading.Lock()
 
     def emit(self, kind, tid, ts, func, path, line) -> None:
         key = (func, path, line)
-        frame_id = self._frames.get(key)
-        if frame_id is None:
-            frame_id = self._next_id
-            self._next_id += 1
-            self._frames[key] = frame_id
-            self._write(_encode_frame_def(frame_id, func, path, line))
-        self._write(_encode_frame_ref(kind, tid, ts, frame_id))
+        with self._lock:
+            frame_id = self._frames.get(key)
+            if frame_id is None:
+                frame_id = self._next_id
+                self._next_id += 1
+                self._frames[key] = frame_id
+                self._write(_encode_frame_def(frame_id, func, path, line))
+            self._write(_encode_frame_ref(kind, tid, ts, frame_id))
+
+    def span_begin(self, tid, ts, name) -> None:
+        with self._lock:
+            self._write(encode_span_begin(tid, ts, name))
+
+    def span_end(self, tid, ts) -> None:
+        with self._lock:
+            self._write(encode_span_end(tid, ts))
 
 
 class _DropCountWriter:
@@ -507,7 +532,6 @@ def install(write_fd: int, project_root: str) -> None:
     global _current_emitter
     local = threading.local()
     classifier = _ProjectClassifier(project_root)
-    lock = threading.Lock()
 
     try:
         os.write(write_fd, encode_hello(os.getpid(), time.monotonic_ns()))
@@ -542,9 +566,11 @@ def install(write_fd: int, project_root: str) -> None:
         # together, or the reader sees seqs out of order and manufactures
         # false gaps (see _next_seq's docstring). emit() may issue two
         # writes (a first-sight FRAME_DEF, then the CALL/RETURN) that must
-        # land back-to-back, so both happen under the same lock.
-        with lock:
-            emitter.emit(kind, tid, ts_ns, func, path, line)
+        # land back-to-back -- and a concurrent metagross.span() call on
+        # another thread must not interleave with either. `emitter`'s own
+        # lock (held inside `emit`) covers both concerns; there is no
+        # separate lock here to take.
+        emitter.emit(kind, tid, ts_ns, func, path, line)
 
     def _disable_in_forked_child() -> None:
         # A target that forks without exec (e.g. multiprocessing/DataLoader
@@ -561,11 +587,11 @@ def install(write_fd: int, project_root: str) -> None:
         # `hook` as a profile "call" event before the body below runs and
         # clears it. That is safe only because `_ProjectClassifier` excludes
         # every file under this package's own directory (_SELF_DIR), so
-        # `hook` returns before reaching `with lock:` for any frame defined
-        # in _profile.py -- including this one. Do not relax that
-        # self-exclusion, or a `lock` some other thread held at the moment
-        # of fork (and so is held forever in this single-threaded child)
-        # would deadlock right here.
+        # `hook` returns before reaching `emitter.emit()` -- and its
+        # internal `emitter._lock` -- for any frame defined in _profile.py,
+        # including this one. Do not relax that self-exclusion, or a lock
+        # some other thread held at the moment of fork (and so is held
+        # forever in this single-threaded child) would deadlock right here.
         sys.setprofile(None)
         threading.setprofile(None)
         global _current_emitter
