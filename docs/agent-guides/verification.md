@@ -20,6 +20,7 @@ Use focused tests while iterating:
 
 ```sh
 /usr/bin/python3 -B -m unittest -v \
+  test_target \
   test_metagross.ParseArgsTest \
   test_metagross.RendererTest \
   test_metagross.DashboardPublisherTest \
@@ -97,6 +98,18 @@ The receiver is ephemeral: stopping it loses state, and a new authorized run
 replaces the retained capture. Explicit `--output` and `--summary-output` remain
 the durable path.
 
+Open the host receiver's complete private URL with its viewer-token fragment.
+Verify the fragment disappears, same-tab refresh retains access, and restarting
+the receiver requires its new private URL. The viewer token must differ from
+the producer secret copied into Docker. Missing, wrong, or duplicate bearer
+credentials must receive 401 from `/api/state`, including HEAD requests, while
+static assets remain readable without trace data or credentials. A viewer token
+must not authorize capture POSTs, and the producer token must not read state.
+`test_viewer.WebDashboardTest` exercises the real HTTP boundary and process
+restart; when Node.js is installed it also executes the shipped browser script
+to check fragment cleanup, session storage, and exactly one bearer header.
+Node.js is optional for tests and is not a dashboard runtime dependency.
+
 Also run two failures. A wrong token must return tracer failure before any
 target sentinel. Stopping the receiver during a longer workload must produce
 one prefixed controller warning without hanging or changing target stdout,
@@ -108,10 +121,13 @@ again to confirm replacement rather than count merging.
 - CLI parsing or validation: parse/usage tests plus README examples if affected.
 - Output path handling: ownership, symlink, regular-file, create/truncate, and
   permission tests.
-- Child process behavior: exit-code, signal, stdout/stderr, argument pass-through,
-  and environment/drop-privilege tests.
+- Child process behavior: run `test_target` for the unprivileged exec boundary,
+  startup barrier, PID preservation, normal shutdown, `atexit`, non-daemon
+  threads, buffered stdout/stderr, exceptions, exit codes, signals, argument
+  pass-through, environment, and descriptor inheritance. The live gate remains
+  required to verify probe attachment across exec and actual credential drops.
 - eBPF source changes: generated source tests and, when possible, live gate.
-- CUDA API additions: unit tests for raw event enrichment, rendering, README
+- CUDA API additions: unit tests for raw event enrichment, rendering, reference
   tables, and live gate when available.
 - Attribution changes: profile codec, timeline, joiner ordering, unknown-frame,
   and cross-thread tests.

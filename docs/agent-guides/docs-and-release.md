@@ -3,6 +3,12 @@
 Metagross is intended to become a product. Keep user-facing documentation and
 release behavior accurate whenever behavior changes.
 
+Keep the README focused on the first local capture and product boundaries.
+Detailed CLI, schema, API, file-safety, and viewer contracts belong in
+`docs/reference.md`; contributor gates belong in `CONTRIBUTING.md` and the
+verification guide. Update those alongside affected README examples without
+duplicating the full reference in the README.
+
 ## README update triggers
 
 Update `README.md` in the same change when altering:

@@ -10,6 +10,9 @@ predictable, and diagnosable. Favor a boring core over clever tracing magic.
 - `metagross/__init__.py` owns CLI parsing, validation, privilege handling,
   forking, startup synchronization, BCC orchestration, output setup, and exit
   behavior.
+- `metagross/_target.py` is the private runner entered by exec after the attach
+  barrier. It installs profiling and runs the target with normal interpreter
+  finalization, including non-daemon thread joins and `atexit` handlers.
 - `metagross/_bpf.py` owns CUDA API definitions, libcuda discovery, symbol
   resolution, eBPF C generation, BCC loading, probe attachment, and raw structs.
 - `metagross/_profile.py` owns the child-process Python profiler and binary
@@ -35,6 +38,8 @@ predictable, and diagnosable. Favor a boring core over clever tracing magic.
 - Metagross options must appear before the target script.
 - Everything after the target script belongs to the target and must pass through
   unchanged.
+- Top-level `-h` and `--help` print usage without a target or privileged imports.
+  Help flags after the target path remain target arguments.
 - `--project-root` defaults to the current directory.
 - Target scripts must resolve to regular `.py` files inside the project root.
 - `--ebpf` must work without root, BCC, CUDA, libcuda discovery, or an NVIDIA
@@ -51,11 +56,16 @@ predictable, and diagnosable. Favor a boring core over clever tracing magic.
   be complete, numeric where expected, and match passwd data.
 - Drop the target to the invoking sudo user when valid metadata is available.
 - Preserve `HOME`, `USER`, and `LOGNAME` for the dropped user.
-- Keep inherited profile pipe file descriptors close-on-exec.
+- The profile write descriptor crosses the single exec into the private runner.
+  Restore close-on-exec there before target code runs; target exec descendants
+  must not inherit it. Other controller descriptors remain close-on-exec.
 - Maintain the startup barrier: the child must not execute target code until the
   parent has attached every required uprobe/uretprobe to the exact child PID and
   any explicitly requested dashboard has acknowledged capture start.
-- Flush target stdout/stderr before child `os._exit`.
+- Drop credentials before exec and preserve the child PID across that boundary.
+  Use the controller's interpreter and locate the runner from this installation.
+- Allow the target interpreter to finalize normally. Reserve child `os._exit`
+  for startup failure before exec, flushing startup diagnostics first.
 - Broken trace pipes must not kill the target.
 - Pop `METAGROSS_DASHBOARD_TOKEN` before forking and defensively remove it again
   in the child before target code runs. Never put it in diagnostics, URLs,
@@ -73,6 +83,18 @@ predictable, and diagnosable. Favor a boring core over clever tracing magic.
 
 ## Direct dashboard transport
 
+- Generate an independent random viewer token for each dashboard server process,
+  including file-backed mode. Print it only in the private URL fragment. Browser
+  bootstrap must save it in session storage and clear the fragment before state
+  requests; a new process invalidates old viewer credentials.
+- Require exactly one matching bearer credential for GET and HEAD `/api/state`.
+  Reuse constant-time credential comparison for viewer and producer requests,
+  but never accept either token in the other's role. Keep static assets public
+  and free of trace data and credentials. Do not add cookies, query-token auth,
+  CORS, or producer credentials to browser resources.
+- The viewer token protects trace data from local callers without the secret.
+  It is not isolation from root, the same compromised user, terminal readers,
+  or browser/session-storage compromise; keep the server on loopback.
 - `--dashboard-port` is the only producer opt-in. A token in the environment
   alone must not enable network activity.
 - The privileged producer may connect only to numeric IPv4 `127.0.0.1` at the
@@ -104,7 +126,7 @@ When adding or changing a traced CUDA API, update all relevant pieces together:
 3. Python `ctypes` structures that mirror eBPF structs.
 4. `_events.describe` enrichment.
 5. Table and JSONL rendering tests.
-6. README traced API and detail tables.
+6. The traced API and detail tables in `docs/reference.md`.
 
 Rules:
 
