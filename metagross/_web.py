@@ -6,6 +6,7 @@ from __future__ import annotations
 import datetime
 import hmac
 import http.server
+import ipaddress
 import json
 import secrets
 import sys
@@ -18,6 +19,7 @@ from metagross import _follow, _tui, _viewer
 
 
 _DEFAULT_PORT = 8765
+_DEFAULT_HOST = "127.0.0.1"
 _TOP_LIMIT = 8
 _RECENT_LIMIT = 50
 _MEMORY_LIMIT = 120
@@ -1724,6 +1726,30 @@ class IngestDashboardState:
         return response
 
 
+def _client_is_loopback(address: tuple) -> bool:
+    try:
+        return ipaddress.ip_address(address[0]).is_loopback
+    except (ValueError, IndexError, TypeError):
+        return False
+
+
+def _client_is_internal(address: tuple) -> bool:
+    # Internal means not routable on the public internet: loopback, private,
+    # link-local, and shared (CGNAT, e.g. Tailscale) ranges all qualify.
+    try:
+        return not ipaddress.ip_address(address[0]).is_global
+    except (ValueError, IndexError, TypeError):
+        return False
+
+
+def _is_ipv4_literal(name: str) -> bool:
+    try:
+        ipaddress.IPv4Address(name)
+    except ValueError:
+        return False
+    return True
+
+
 class _DashboardServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -1731,6 +1757,8 @@ class _DashboardServer(http.server.ThreadingHTTPServer):
     def __init__(self, *args, **kwargs):
         self.viewer_token = secrets.token_urlsafe(32)
         super().__init__(*args, **kwargs)
+        # A non-loopback bind (the --host opt-in) lets LAN viewers read state.
+        self.lan_mode = not ipaddress.ip_address(self.server_address[0]).is_loopback
 
 
 class _IngestRequestError(Exception):
@@ -1748,7 +1776,7 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, _format: str, *_args) -> None:
         return
 
-    def _valid_host(self) -> bool:
+    def _valid_host(self, *, allow_lan: bool = True) -> bool:
         values = self.headers.get_all("Host", [])
         if len(values) != 1:
             return False
@@ -1756,11 +1784,19 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
         if host in ("127.0.0.1", "localhost"):
             return True
         name, separator, port = host.rpartition(":")
-        return bool(
+        if (
             separator
             and name in ("127.0.0.1", "localhost")
             and port == str(self.server.server_port)
-        )
+        ):
+            return True
+        if not (allow_lan and getattr(self.server, "lan_mode", False)):
+            return False
+        # LAN opt-in: also accept a numeric IPv4 Host. DNS names stay rejected,
+        # which is what defeats DNS rebinding.
+        if not separator:
+            return _is_ipv4_literal(host)
+        return _is_ipv4_literal(name) and port == str(self.server.server_port)
 
     def _send(
         self,
@@ -1835,6 +1871,16 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
         )
 
     def _serve(self) -> None:
+        # Defense in depth for the --host opt-in: never serve a client whose
+        # address is on the public internet, even if a port is forwarded.
+        if not _client_is_internal(self.client_address):
+            self.close_connection = True
+            self._send(
+                b"forbidden\n",
+                "text/plain; charset=utf-8",
+                status=http.server.HTTPStatus.FORBIDDEN,
+            )
+            return
         if not self._valid_host():
             self._send(
                 b"invalid Host header\n",
@@ -1882,7 +1928,14 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
             return False
 
     def _post_preflight(self) -> tuple[str, int]:
-        if not self._valid_host():
+        # Capture ingest stays loopback-only even when --host admits LAN
+        # viewers: the privileged producer only ever connects from 127.0.0.1.
+        if not _client_is_loopback(self.client_address):
+            raise _IngestRequestError(
+                http.server.HTTPStatus.FORBIDDEN,
+                "capture ingest is loopback-only",
+            )
+        if not self._valid_host(allow_lan=False):
             raise _IngestRequestError(
                 http.server.HTTPStatus.FORBIDDEN,
                 "invalid Host header",
@@ -2081,6 +2134,10 @@ class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
         self._serve()
 
     def do_OPTIONS(self) -> None:
+        if not _client_is_internal(self.client_address):
+            self.close_connection = True
+            self._send_error(http.server.HTTPStatus.FORBIDDEN, "forbidden")
+            return
         if not self._valid_host():
             self._send_error(
                 http.server.HTTPStatus.FORBIDDEN,
@@ -2122,8 +2179,13 @@ def run_web_dashboard(
     port: int = _DEFAULT_PORT,
     *,
     ingest_token: str | None = None,
+    host: str = _DEFAULT_HOST,
 ) -> int:
-    """Serve a loopback-only file-backed or ingest-backed dashboard."""
+    """Serve a file-backed or ingest-backed dashboard.
+
+    The server binds loopback unless host opts in to a LAN address. Capture
+    ingest stays loopback-only either way.
+    """
     if trace is None:
         if ingest_token is None:
             print(
@@ -2135,7 +2197,7 @@ def run_web_dashboard(
     else:
         state = DashboardState(trace, summary, recent_limit, refresh_seconds)
     try:
-        server = _DashboardServer(("127.0.0.1", port), _DashboardRequestHandler)
+        server = _DashboardServer((host, port), _DashboardRequestHandler)
     except OSError as exc:
         print(f"metagross view: cannot start web dashboard: {exc}", file=sys.stderr)
         state.close()
@@ -2143,11 +2205,29 @@ def run_web_dashboard(
     server.dashboard_state = state
     server.ingest_token = ingest_token
     state.start()
+    if server.lan_mode:
+        print(
+            "metagross view: warning: the dashboard is reachable from the "
+            f"network on {host}:{server.server_port}. It uses plain HTTP, so "
+            "the viewer token and trace data cross the network unencrypted, "
+            "and anyone with the URL can read trace source paths and timing. "
+            "Clients with public-internet addresses are refused and capture "
+            "ingest stays loopback-only; use this only on a trusted internal "
+            "network.",
+            file=sys.stderr,
+        )
+    display_host = "<this-host-ip>" if host == "0.0.0.0" else host
     address = (
-        f"http://127.0.0.1:{server.server_port}/"
+        f"http://{display_host}:{server.server_port}/"
         f"#viewer_token={server.viewer_token}"
     )
     print(f"metagross view: dashboard available at {address}", file=sys.stderr)
+    if host == "0.0.0.0":
+        print(
+            "metagross view: replace <this-host-ip> with an IPv4 address of "
+            "this machine; hostnames are rejected",
+            file=sys.stderr,
+        )
     try:
         server.serve_forever(poll_interval=min(0.2, refresh_seconds))
     except KeyboardInterrupt:

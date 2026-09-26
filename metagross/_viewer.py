@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import collections
 import dataclasses
+import ipaddress
 import json
 import math
 import os
@@ -641,6 +642,26 @@ def _web_port(value: str) -> int:
     return parsed
 
 
+def _web_host(value: str) -> str:
+    # Numeric IPv4 only: the dashboard's Host check rejects hostnames.
+    try:
+        address = ipaddress.IPv4Address(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            "must be a numeric IPv4 address such as 0.0.0.0"
+        ) from None
+    if address.is_global:
+        raise argparse.ArgumentTypeError(
+            "must be an internal address; public addresses are refused"
+        )
+    if address.is_loopback and str(address) != "127.0.0.1":
+        # Other 127.x binds print a URL the Host check would then refuse.
+        raise argparse.ArgumentTypeError(
+            "the only loopback address accepted is 127.0.0.1"
+        )
+    return str(address)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = _ViewerParser(
         prog="python3 -m metagross view",
@@ -662,7 +683,7 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument(
         "--web",
         action="store_true",
-        help="serve a live dashboard on the local loopback interface",
+        help="serve a live browser dashboard (loopback by default; see --host)",
     )
     parser.add_argument(
         "--receive",
@@ -685,6 +706,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--port",
         type=_web_port,
         help="web dashboard port (default: 8765; use 0 for any free port)",
+    )
+    parser.add_argument(
+        "--host",
+        type=_web_host,
+        help=(
+            "web dashboard bind address (default: 127.0.0.1); use 0.0.0.0 or "
+            "an internal interface IPv4 address to let viewers on the internal "
+            "network in; public addresses are refused"
+        ),
     )
     return parser
 
@@ -748,11 +778,27 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+    if not args.web and args.host is not None:
+        parser.print_usage(sys.stderr)
+        print(
+            "metagross view: --host is only valid with --web",
+            file=sys.stderr,
+        )
+        return 2
+    if args.receive and args.host not in (None, "127.0.0.1", "0.0.0.0"):
+        parser.print_usage(sys.stderr)
+        print(
+            "metagross view: --receive requires --host 127.0.0.1 or 0.0.0.0 "
+            "(the tracer delivers captures only to 127.0.0.1)",
+            file=sys.stderr,
+        )
+        return 2
     if args.web:
         from metagross import _web
 
         refresh_seconds = 0.2 if args.refresh is None else args.refresh
         port = _web._DEFAULT_PORT if args.port is None else args.port
+        host = _web._DEFAULT_HOST if args.host is None else args.host
         if args.receive:
             from metagross import _publish
 
@@ -768,6 +814,7 @@ def main(argv: list[str] | None = None) -> int:
                 refresh_seconds,
                 port,
                 ingest_token=ingest_token,
+                host=host,
             )
         return _web.run_web_dashboard(
             args.trace,
@@ -775,6 +822,7 @@ def main(argv: list[str] | None = None) -> int:
             args.recent,
             refresh_seconds,
             port,
+            host=host,
         )
     if args.follow:
         from metagross import _tui

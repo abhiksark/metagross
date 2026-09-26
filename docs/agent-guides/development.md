@@ -23,7 +23,9 @@ predictable, and diagnosable. Favor a boring core over clever tracing magic.
   truncation/replacement detection, and final-summary watching.
 - `metagross/_tui.py` owns the standard-library curses dashboard, live overview
   layout, refresh loop, and keyboard controls.
-- `metagross/_web.py` owns the loopback-only standard-library HTTP server,
+- `metagross/_web.py` owns the standard-library HTTP server (loopback by
+  default, reachable from the internal network only through the `--host`
+  opt-in),
   bounded file and authenticated in-memory state, browser JSON payload, and
   embedded static frontend.
 - `metagross/_publish.py` owns bounded ordered delivery from the privileged
@@ -92,9 +94,21 @@ predictable, and diagnosable. Favor a boring core over clever tracing magic.
   but never accept either token in the other's role. Keep static assets public
   and free of trace data and credentials. Do not add cookies, query-token auth,
   CORS, or producer credentials to browser resources.
-- The viewer token protects trace data from local callers without the secret.
-  It is not isolation from root, the same compromised user, terminal readers,
-  or browser/session-storage compromise; keep the server on loopback.
+- The viewer token protects trace data from callers without the secret. It is
+  not isolation from root, the same compromised user, terminal readers, or
+  browser/session-storage compromise. Bind loopback by default.
+- `view --web --host` is the only internal-network opt-in. It must be a numeric
+  IPv4 address, must print the plain-HTTP warning, and widens only viewer
+  access. `--host` refuses public (`is_global`) addresses and loopback addresses
+  other than `127.0.0.1`, and the viewer paths refuse clients whose address is
+  public before any other Metagross check. These are defense in depth, not a
+  substitute for a firewall.
+  With a non-loopback bind, the Host check may also accept numeric IPv4 Host
+  values but must keep rejecting DNS names, which is the DNS-rebinding defense.
+- Capture ingest (`POST /api/capture/*`) stays loopback-only regardless of
+  `--host`: reject non-loopback clients and keep the strict loopback Host check
+  for ingest. `--receive` accepts only `--host 127.0.0.1` or `0.0.0.0`, because
+  the producer connects only to `127.0.0.1`.
 - `--dashboard-port` is the only producer opt-in. A token in the environment
   alone must not enable network activity.
 - The privileged producer may connect only to numeric IPv4 `127.0.0.1` at the
@@ -106,9 +120,10 @@ predictable, and diagnosable. Favor a boring core over clever tracing magic.
   Delivery loss after release is fail-open for the target, bounded for the
   controller, declared in the HTTP-only summary, and must not change target
   stdout, stderr, signals, or exit status.
-- The receiver remains bound to `127.0.0.1`, requires the matching bearer token,
-  validates complete bounded batches before one locked commit, and retains only
-  one in-memory capture. A new authorized start replaces the prior capture.
+- The receiver binds `127.0.0.1` by default (or `0.0.0.0` with `--host`), keeps
+  capture ingest loopback-only, requires the matching bearer token, validates
+  complete bounded batches before one locked commit, and retains only one
+  in-memory capture. A new authorized start replaces the prior capture.
 - Docker direct delivery uses both `--network host` for loopback connectivity
   and the independently required `--pid=host` for eBPF identity. Host networking
   removes Docker network isolation, so this workflow is only for trusted local

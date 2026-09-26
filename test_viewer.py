@@ -21,6 +21,7 @@ import tempfile
 import termios
 import threading
 import time
+import types
 import urllib.parse
 import urllib.request
 import unittest
@@ -757,12 +758,14 @@ class WebDashboardTest(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
 
-    def _start_ingest_server(self):
+    def _start_ingest_server(self, lan_mode=False):
         state = _web.IngestDashboardState(recent_limit=50, refresh_seconds=0.05)
         server = _web._DashboardServer(
             ("127.0.0.1", 0),
             _web._DashboardRequestHandler,
         )
+        # Exercise LAN-mode rules without opening every interface in the suite.
+        server.lan_mode = lan_mode
         server.dashboard_state = state
         server.ingest_token = self.TOKEN
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -826,6 +829,119 @@ class WebDashboardTest(unittest.TestCase):
             length = int(headers.get("content-length", "0"))
             body = stream.read(length)
         return int(status_line.split()[1]), headers, body
+
+    def _state_status(self, server, host_header):
+        status, _headers, _body = self._raw_http(
+            server,
+            (f"GET /api/state HTTP/1.1\r\n"
+             f"Host: {host_header}\r\n"
+             f"Authorization: Bearer {server.viewer_token}\r\n"
+             "Connection: close\r\n\r\n").encode(),
+        )
+        return status
+
+    def test_lan_mode_accepts_ipv4_host_and_rejects_dns_names(self):
+        state, server = self._start_ingest_server(lan_mode=True)
+        state.start_capture("a" * 32, "private-trace.py")
+        port = server.server_port
+        self.assertEqual(self._state_status(server, f"10.1.2.3:{port}"), 200)
+        self.assertEqual(self._state_status(server, f"127.0.0.1:{port}"), 200)
+        # DNS names stay rejected: that is what defeats DNS rebinding.
+        self.assertEqual(self._state_status(server, f"evil.example:{port}"), 403)
+        self.assertEqual(self._state_status(server, f"10.1.2.3:{port + 1}"), 403)
+
+    def test_default_mode_rejects_non_loopback_ipv4_host(self):
+        state, server = self._start_ingest_server()
+        state.start_capture("a" * 32, "private-trace.py")
+        port = server.server_port
+        self.assertEqual(self._state_status(server, f"10.1.2.3:{port}"), 403)
+        self.assertEqual(self._state_status(server, f"127.0.0.1:{port}"), 200)
+
+    def test_lan_mode_ingest_from_loopback_still_works(self):
+        state, server = self._start_ingest_server(lan_mode=True)
+        status, _headers, _body = self._post_json(
+            server,
+            "/api/capture/start",
+            {"schema_version": 1, "capture_id": "c" * 32, "trace_name": "lan.py"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(state.payload()["trace_name"], "lan.py")
+
+    def test_lan_mode_ingest_keeps_strict_loopback_host(self):
+        # Ingest must not inherit the relaxed LAN Host rule (allow_lan=False).
+        state, server = self._start_ingest_server(lan_mode=True)
+        body = json.dumps(
+            {"schema_version": 1, "capture_id": "d" * 32, "trace_name": "x.py"}
+        ).encode()
+        status, _headers, _body = self._raw_http(
+            server,
+            (f"POST /api/capture/start HTTP/1.1\r\n"
+             f"Host: 10.1.2.3:{server.server_port}\r\n"
+             f"Authorization: Bearer {self.TOKEN}\r\n"
+             "Content-Type: application/json\r\n"
+             f"Content-Length: {len(body)}\r\n"
+             "Connection: close\r\n\r\n").encode() + body,
+        )
+        self.assertEqual(status, 403)
+        self.assertNotEqual(state.payload().get("trace_name"), "x.py")
+
+    def test_ingest_preflight_rejects_non_loopback_client(self):
+        # The producer path stays loopback-only even when viewers are on the LAN.
+        handler = types.SimpleNamespace(client_address=("10.1.2.3", 51515))
+        with self.assertRaises(_web._IngestRequestError) as caught:
+            _web._DashboardRequestHandler._post_preflight(handler)
+        self.assertEqual(caught.exception.status, 403)
+
+    def test_viewer_paths_refuse_public_clients_first(self):
+        # A stub without headers or path proves the check runs before either.
+        for method in ("_serve", "do_OPTIONS"):
+            with self.subTest(method=method):
+                sent = []
+                handler = types.SimpleNamespace(
+                    client_address=("8.8.8.8", 51515),
+                    _send=lambda *args, status=200, **kwargs: sent.append(status),
+                    _send_error=lambda status, message, **kwargs: sent.append(status),
+                )
+                getattr(_web._DashboardRequestHandler, method)(handler)
+                self.assertEqual(sent, [403])
+
+    def test_client_is_internal(self):
+        cases = (
+            (("127.0.0.1", 1), True),
+            (("10.1.2.3", 1), True),
+            (("172.16.5.10", 1), True),
+            (("100.64.0.10", 1), True),  # shared (CGNAT) range, e.g. Tailscale
+            (("8.8.8.8", 1), False),
+            (("not-an-ip", 1), False),
+        )
+        for address, expected in cases:
+            with self.subTest(address=address):
+                self.assertEqual(_web._client_is_internal(address), expected)
+
+    def test_lan_bind_warns_and_default_does_not(self):
+        cases = (
+            ("0.0.0.0", True, "http://<this-host-ip>:"),
+            ("127.0.0.1", False, "http://127.0.0.1:"),
+        )
+        for host, warns, url in cases:
+            with self.subTest(host=host):
+                error = io.StringIO()
+                with (
+                    mock.patch.object(
+                        _web._DashboardServer,
+                        "serve_forever",
+                        side_effect=KeyboardInterrupt,
+                    ),
+                    contextlib.redirect_stderr(error),
+                ):
+                    result = _web.run_web_dashboard(
+                        None, None, 50, 0.05, 0,
+                        ingest_token=self.TOKEN, host=host,
+                    )
+                self.assertEqual(result, 130)
+                output = error.getvalue()
+                self.assertEqual("reachable from the network" in output, warns)
+                self.assertIn(url, output)
 
     def test_state_rejects_missing_wrong_and_duplicate_viewer_credentials(self):
         state, server = self._start_ingest_server()
@@ -2218,6 +2334,47 @@ class ViewerRoutingTest(unittest.TestCase):
                 )
             self.assertEqual(result, 2)
 
+    def test_web_host_must_be_numeric_ipv4(self):
+        # A hostname URL would be rejected by the Host check in the browser.
+        for host in ("localhost", "evil.example", "::1", "1.2.3", "256.1.1.1", ""):
+            with self.subTest(host=host), contextlib.redirect_stderr(io.StringIO()):
+                result = metagross.main(
+                    ["view", "--web", "--host", host, str(self.trace)]
+                )
+            self.assertEqual(result, 2)
+
+    def test_web_host_must_be_internal(self):
+        cases = (
+            ("8.8.8.8", "public addresses are refused"),
+            ("1.1.1.1", "public addresses are refused"),
+            ("127.0.0.2", "the only loopback address accepted is 127.0.0.1"),
+        )
+        for host, message in cases:
+            error = io.StringIO()
+            with self.subTest(host=host), contextlib.redirect_stderr(error):
+                result = metagross.main(
+                    ["view", "--web", "--host", host, str(self.trace)]
+                )
+            self.assertEqual(result, 2)
+            self.assertIn(message, error.getvalue())
+
+    def test_web_routes_internal_hosts(self):
+        for host in ("172.16.5.10", "192.168.1.20", "169.254.1.1",
+                     "100.64.0.10"):
+            with (
+                self.subTest(host=host),
+                mock.patch.object(
+                    _web, "run_web_dashboard", return_value=0
+                ) as dashboard,
+            ):
+                result = metagross.main(
+                    ["view", "--web", "--host", host, str(self.trace)]
+                )
+                self.assertEqual(result, 0)
+                dashboard.assert_called_once_with(
+                    self.trace, None, 500, 0.2, 8765, host=host
+                )
+
     def test_mode_specific_options_are_rejected(self):
         cases = (
             (
@@ -2239,6 +2396,20 @@ class ViewerRoutingTest(unittest.TestCase):
             (
                 ["view", "--follow", "--port", "8765", str(self.trace)],
                 "--port is only valid with --web",
+            ),
+            (
+                ["view", "--snapshot", "--host", "0.0.0.0", str(self.trace)],
+                "--host is only valid with --web",
+            ),
+            (
+                ["view", "--follow", "--host", "0.0.0.0", str(self.trace)],
+                "--host is only valid with --web",
+            ),
+            (
+                # The tracer delivers captures only to 127.0.0.1, so a receiver
+                # bound to one LAN address alone would silently refuse it.
+                ["view", "--web", "--receive", "--host", "172.16.5.10"],
+                "--receive requires --host 127.0.0.1 or 0.0.0.0",
             ),
             (
                 ["view", "--snapshot", "--receive", str(self.trace)],
@@ -2294,7 +2465,39 @@ class ViewerRoutingTest(unittest.TestCase):
                 ]
             )
         self.assertEqual(result, 0)
-        dashboard.assert_called_once_with(self.trace, None, 500, 0.1, 9000)
+        dashboard.assert_called_once_with(
+            self.trace, None, 500, 0.1, 9000, host="127.0.0.1"
+        )
+
+    def test_web_routes_lan_host(self):
+        with mock.patch.object(_web, "run_web_dashboard", return_value=0) as dashboard:
+            result = metagross.main(
+                ["view", "--web", "--host", "0.0.0.0", "--port", "9000",
+                 str(self.trace)]
+            )
+        self.assertEqual(result, 0)
+        dashboard.assert_called_once_with(
+            self.trace, None, 500, 0.2, 9000, host="0.0.0.0"
+        )
+
+    def test_receive_allows_wildcard_host(self):
+        token = "route-token-" + ("y" * 32)
+        with (
+            mock.patch.object(_web, "run_web_dashboard", return_value=0) as dashboard,
+            mock.patch.dict(
+                os.environ,
+                {"METAGROSS_DASHBOARD_TOKEN": token},
+                clear=False,
+            ),
+        ):
+            result = metagross.main(
+                ["view", "--web", "--receive", "--host", "0.0.0.0",
+                 "--port", "9000"]
+            )
+        self.assertEqual(result, 0)
+        dashboard.assert_called_once_with(
+            None, None, 500, 0.2, 9000, ingest_token=token, host="0.0.0.0"
+        )
 
     def test_receive_routes_with_removed_token(self):
         token = "route-token-" + ("x" * 32)
@@ -2326,6 +2529,7 @@ class ViewerRoutingTest(unittest.TestCase):
             0.1,
             9000,
             ingest_token=token,
+            host="127.0.0.1",
         )
 
     def test_receive_rejects_missing_or_invalid_token_without_echoing_it(self):

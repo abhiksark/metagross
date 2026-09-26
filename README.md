@@ -55,7 +55,10 @@ Run both terminals from this repository directory.
    Open the complete private URL printed by the receiver.
    Its `#viewer_token=…` browser credential differs from the producer token and
    disappears from the visible URL after entering browser session storage.
-   Keep the URL private; do not proxy or forward the port.
+   Keep the URL private. To view it from another machine on a trusted internal
+   network, add `--host 0.0.0.0` instead of proxying the port, and read the
+   warning it prints. Public addresses and public-internet clients are refused
+   as defense in depth; this does not replace a firewall.
 
 2. **Terminal two: trace your script** with the copied producer token.
 

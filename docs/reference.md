@@ -277,11 +277,29 @@ session storage and removes the fragment from the visible URL before requesting
 trace data. Refreshing the same tab keeps access; after restarting the server,
 open its newly printed URL. Session storage must be enabled.
 
-The server listens only on the local loopback interface, reads the trace and
-summary in a bounded background
-follower, and needs no TTY, root, BCC, CUDA, GPU, JavaScript packages, or
-external network access. Choose another port with `--port PORT`; use `--port 0`
-to let the OS select a free one. The timeline-first workspace groups CUDA driver
+By default the server listens only on the local loopback interface. To view the
+dashboard from another machine on the internal network, add `--host` with one of
+this machine's internal IPv4 addresses, which then appears in the printed URL,
+or `--host 0.0.0.0` for all interfaces, in which case replace `<this-host-ip>`
+in the printed URL with one of this machine's internal addresses. The browser
+must address the server by IPv4 address or `localhost`; other hostnames are
+rejected.
+
+This mode is internal-network only. `--host` accepts `127.0.0.1`, `0.0.0.0`,
+and private, link-local, or shared-range (for example Tailscale) IPv4 addresses,
+and refuses public ones. On a carrier-grade NAT network, the shared range can
+also include other subscribers. The server also refuses requests from public-internet
+client addresses. These checks add defense in depth; they do not replace a
+firewall. A non-loopback bind prints a warning: the dashboard uses plain HTTP,
+so the viewer token and trace data cross the network unencrypted, and anyone
+with the URL can read trace source paths and timing. Capture ingest from the
+tracer stays loopback-only, and `--receive` accepts only `--host 127.0.0.1` or
+`--host 0.0.0.0` because the tracer delivers captures only to `127.0.0.1`.
+
+The server reads the trace and summary in a bounded background follower, and
+needs no TTY, root, BCC, CUDA, GPU, JavaScript packages, or external network
+access. Choose another port with `--port PORT`; use `--port 0` to let the OS
+select a free one. The timeline-first workspace groups CUDA driver
 API events by attributed project function and provides API/function/kernel
 search, API-family filters, 1x to 16x zoom, drag-to-pan navigation, synchronized
 timeline and event-table selection, and a source/detail inspector. Compute-style
@@ -300,11 +318,15 @@ contain no trace data or embedded credentials. The producer secret in
 sent to the browser; a viewer credential cannot publish captures.
 
 Treat the private URL as access to sensitive trace paths, function names, and
-timings. Loopback binding limits network exposure; it does not authenticate
-other local users. Viewer authentication blocks local callers without the
-secret, but does not protect against root, a compromised user account or browser,
-or software able to read the terminal output or browser session storage. Do not
-share the private URL or expose the server through a proxy or port forward.
+timings. The default loopback binding limits network exposure; it does not
+authenticate other local users. With `--host`, the dashboard is also reachable
+from the internal network over plain HTTP; use it only on a trusted internal
+network.
+Viewer authentication blocks callers without the secret, but does not protect
+against root, a compromised user account or browser, or software able to read
+the terminal output or browser session storage. Do not share the private URL,
+and do not expose the server through a proxy or port forward; use `--host` when
+viewers on the internal network need access.
 
 The live status moves from `WAITING` to `LIVE`, then reconciles to `COMPLETE`,
 `INCOMPLETE`, or `MISMATCH` when the final summary appears. An empty summary
@@ -473,13 +495,14 @@ receiver, it cannot certify completion; inspect the controller warning too.
 |--------|-----------------------------|
 | `--snapshot` | Read a completed trace, print to stdout, and exit. |
 | `--follow` | Follow JSONL in an interactive terminal. |
-| `--web` | Serve a loopback browser dashboard. |
+| `--web` | Serve a browser dashboard, loopback-only unless `--host` is given. |
 | `--receive` | Web-only in-memory receiver; rejects a trace path or `--summary`. |
 | `--summary FILE` | Optional version-1 final capture summary for file modes. |
 | `--recent N` | Retain 1 to 10,000 recent events; default 500. |
 | `--width COLUMNS` | Snapshot-only width, 60 to 240; default uses terminal width (120 fallback). |
 | `--refresh SECONDS` | Follow/web-only interval, 0.05 to 5.0; default 0.2. |
 | `--port PORT` | Web-only port, 0 to 65,535; default 8765, zero selects a free port. |
+| `--host ADDRESS` | Web-only internal IPv4 bind address; default 127.0.0.1. Use 0.0.0.0 or an internal interface address to admit viewers on the internal network; public addresses are refused. With `--receive`, only 127.0.0.1 or 0.0.0.0. |
 | `-h`, `--help` | Show viewer usage. |
 
 Exactly one of `--snapshot`, `--follow`, or `--web` is required. A trace path is
