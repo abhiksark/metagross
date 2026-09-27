@@ -54,10 +54,14 @@ docker build \
   -t metagross-pytorch .
 ```
 
-The build resumes interrupted wheel downloads. If pulling the
-`nvidia/cuda` base image itself fails partway, pull it on another machine and
-transfer it with `docker save --platform linux/amd64 -o cuda-base.tar
-nvidia/cuda:12.4.1-runtime-ubuntu22.04` and `docker load -i cuda-base.tar`.
+The build resumes interrupted wheel downloads. If pulling the `nvidia/cuda`
+base image itself fails partway, pull it on another machine and transfer it.
+The `--platform` option needs Docker 28 or newer:
+
+```sh
+docker save --platform linux/amd64 -o cuda-base.tar nvidia/cuda:12.4.1-runtime-ubuntu22.04
+docker load -i cuda-base.tar
+```
 
 ## Available workloads
 
