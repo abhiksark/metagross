@@ -1112,6 +1112,83 @@ console.log(JSON.stringify({first, refresh, replacement, duplicate, fresh, block
         self.assertEqual(observed["toDuplicate"]["stored"], [])
         self.assertEqual(observed["toDuplicate"]["requests"], [])
 
+    @unittest.skipUnless(shutil.which("node"), "browser-script check needs Node.js")
+    def test_browser_pasted_token_uses_session_storage_not_the_url(self):
+        # A tab opened without the fragment shows the form; pasting fixes it.
+        harness = r"""
+const vm = require('node:vm');
+const fs = require('node:fs');
+const script = fs.readFileSync(0, 'utf8');
+async function paste(text, blocked = false) {
+  const storage = new Map();
+  const location = new URL('http://127.0.0.1:8765/?view=timeline');
+  const requests = [];
+  const elements = new Map();
+  const element = (id) => {
+    if (!elements.has(id)) elements.set(id, {listeners: {}, hidden: true,
+      addEventListener(name, callback) { this.listeners[name] = callback; }});
+    return elements.get(id);
+  };
+  const context = {
+    URLSearchParams, Headers,
+    document: {getElementById: element, querySelectorAll() { return []; }},
+    window: {
+      location,
+      history: {replaceState() { throw Error('URL must not change'); }},
+      sessionStorage: {
+        getItem(key) { return storage.get(key) || null; },
+        setItem(key, value) { if (blocked) throw Error('blocked'); storage.set(key, value); },
+        removeItem(key) { storage.delete(key); }
+      },
+      addEventListener() {},
+      setTimeout() { return 1; },
+      clearTimeout() {}
+    },
+    fetch(path, options) {
+      requests.push([...new Headers(options.headers)]);
+      return Promise.resolve({ok: false, status: 401});
+    }
+  };
+  vm.runInNewContext(script, context);
+  await new Promise(setImmediate);
+  const formShownBeforePaste = !element('token-form').hidden;
+  element('token-input').value = text;
+  element('token-form').listeners.submit({preventDefault() {}});
+  await new Promise(setImmediate);
+  return {formShownBeforePaste, url: location.href, stored: [...storage.values()],
+    requests, inputCleared: element('token-input').value === ''};
+}
+(async () => {
+  const token = 'v'.repeat(43);
+  console.log(JSON.stringify({
+    raw: await paste('  ' + token + '\n'),
+    url: await paste('http://10.0.0.5:8765/#viewer_token=' + token),
+    junk: await paste('not a token'),
+    duplicate: await paste('http://10.0.0.5:8765/#viewer_token=a&viewer_token=b'),
+    blocked: await paste(token, true),
+  }));
+})();
+"""
+        result = subprocess.run(
+            [shutil.which("node"), "-e", harness], input=_web._APP_JS.decode(),
+            capture_output=True, text=True, timeout=5, check=True,
+        )
+        observed = json.loads(result.stdout)
+        clean_url = "http://127.0.0.1:8765/?view=timeline"
+        bearer = [["authorization", "Bearer " + "v" * 43]]
+        for name in ("raw", "url"):
+            with self.subTest(paste=name):
+                self.assertTrue(observed[name]["formShownBeforePaste"])
+                self.assertEqual(observed[name]["stored"], ["v" * 43])
+                self.assertEqual(observed[name]["requests"], [bearer])
+                self.assertEqual(observed[name]["url"], clean_url)
+                self.assertTrue(observed[name]["inputCleared"])
+        for name in ("junk", "duplicate", "blocked"):
+            with self.subTest(paste=name):
+                self.assertEqual(observed[name]["stored"], [])
+                self.assertEqual(observed[name]["requests"], [])
+                self.assertTrue(observed[name]["inputCleared"])
+
     def test_ingest_state_lifecycle_idempotency_and_reset(self):
         state = _web.IngestDashboardState(recent_limit=50, refresh_seconds=0.05)
         first_id = "a" * 32

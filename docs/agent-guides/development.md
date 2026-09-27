@@ -88,7 +88,10 @@ predictable, and diagnosable. Favor a boring core over clever tracing magic.
 - Generate an independent random viewer token for each dashboard server process,
   including file-backed mode. Print it only in the private URL fragment. Browser
   bootstrap must save it in session storage and clear the fragment before state
-  requests; a new process invalidates old viewer credentials.
+  requests; a new process invalidates old viewer credentials. The page may also
+  accept a pasted token or private URL when the tab has no valid credential; it
+  follows the same session-storage rule and must never write the token into the
+  URL or history.
 - Require exactly one matching bearer credential for GET and HEAD `/api/state`.
   Reuse constant-time credential comparison for viewer and producer requests,
   but never accept either token in the other's role. Keep static assets public

@@ -277,6 +277,12 @@ session storage and removes the fragment from the visible URL before requesting
 trace data. Refreshing the same tab keeps access; after restarting the server,
 open its newly printed URL. Session storage must be enabled.
 
+Session storage belongs to one tab, and the address bar keeps only the URL
+without the fragment, so a new tab or a history suggestion opens the page
+without a credential. The page then shows a field that accepts the viewer token
+or the complete private URL. A pasted value is stored the same way and never
+enters the address bar or browser history.
+
 By default the server listens only on the local loopback interface. To view the
 dashboard from another machine on the internal network, add `--host` with one of
 this machine's internal IPv4 addresses, which then appears in the printed URL,

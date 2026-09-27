@@ -55,6 +55,8 @@ Run both terminals from this repository directory.
    Open the complete private URL printed by the receiver.
    Its `#viewer_token=…` browser credential differs from the producer token and
    disappears from the visible URL after entering browser session storage.
+   A new tab needs the complete URL again, or paste it into the field the page
+   shows.
    Keep the URL private. To view it from another machine on a trusted internal
    network, add `--host 0.0.0.0` instead of proxying the port, and read the
    warning it prints. Public addresses and public-internet clients are refused

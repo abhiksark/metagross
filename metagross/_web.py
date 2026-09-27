@@ -88,6 +88,11 @@ _INDEX_HTML = b"""<!doctype html>
 
   <main id="workspace" class="workspace">
     <div id="warning" class="warning" role="status" hidden></div>
+    <form id="token-form" class="token-form" hidden>
+      <label for="token-input">Viewer token or private dashboard URL</label>
+      <input id="token-input" type="text" autocomplete="off" spellcheck="false" required>
+      <button class="tool-button primary" type="submit">Connect</button>
+    </form>
 
     <section class="metric-strip" aria-label="Trace summary">
       <article class="metric-cell signal">
@@ -463,6 +468,26 @@ button:focus-visible, input:focus-visible, a:focus-visible, .timeline-scroll:foc
   font-family: var(--mono);
   font-size: 11px;
 }
+.token-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.token-form input {
+  flex: 1 1 280px;
+  height: 27px;
+  padding: 4px 9px;
+  border: 1px solid #5c5c5c;
+  border-radius: 2px;
+  color: var(--text);
+  background: #1c1c1c;
+  font-family: var(--mono);
+  font-size: 12px;
+}
 
 .metric-strip {
   display: grid;
@@ -768,21 +793,21 @@ th:nth-child(6), td:nth-child(6) { width: 10%; text-align: right; }
 _APP_JS = rb"""(() => {
   "use strict";
 
+  const tokenKey = "metagross-viewer-token";
   let viewerToken = "";
   function readViewerToken() {
     viewerToken = "";
     try {
-      const key = "metagross-viewer-token";
       const tokens = new URLSearchParams(window.location.hash.slice(1)).getAll("viewer_token");
       if (tokens.length) {
         window.history.replaceState(null, "", window.location.pathname + window.location.search);
-        window.sessionStorage.removeItem(key);
+        window.sessionStorage.removeItem(tokenKey);
         if (tokens.length === 1 && tokens[0]) {
-          window.sessionStorage.setItem(key, tokens[0]);
+          window.sessionStorage.setItem(tokenKey, tokens[0]);
           viewerToken = tokens[0];
         }
       } else {
-        viewerToken = window.sessionStorage.getItem(key) || "";
+        viewerToken = window.sessionStorage.getItem(tokenKey) || "";
       }
     } catch {
       viewerToken = "";
@@ -790,6 +815,28 @@ _APP_JS = rb"""(() => {
   }
   readViewerToken();
   window.addEventListener("hashchange", readViewerToken);
+
+  // A pasted token takes the same session-storage path as the URL fragment,
+  // but never enters the address bar or history.
+  function usePastedToken(text) {
+    const value = text.trim();
+    const hash = value.indexOf("#");
+    const tokens = hash < 0
+      ? [value]
+      : new URLSearchParams(value.slice(hash + 1)).getAll("viewer_token");
+    if (tokens.length !== 1 || !/^[A-Za-z0-9_-]+$/.test(tokens[0])) return false;
+    try {
+      window.sessionStorage.setItem(tokenKey, tokens[0]);
+    } catch {
+      return false;
+    }
+    viewerToken = tokens[0];
+    return true;
+  }
+
+  function tokenError(message) {
+    return Object.assign(new Error(message), {needsToken: true});
+  }
 
   const byId = (id) => document.getElementById(id);
   const pauseButton = byId("pause-button");
@@ -1195,6 +1242,7 @@ _APP_JS = rb"""(() => {
     const warningText = data.trace_error || data.summary_error;
     warning.hidden = !warningText;
     warning.textContent = warningText || "";
+    byId("token-form").hidden = true;
 
     setText("metric-events", formatCount(data.metrics.events));
     setText("metric-rate", `${Number(data.metrics.event_rate).toLocaleString(undefined, {maximumFractionDigits: 1, minimumFractionDigits: 1})} /s`);
@@ -1231,18 +1279,19 @@ _APP_JS = rb"""(() => {
     const warning = byId("warning");
     warning.hidden = false;
     warning.textContent = `Dashboard connection failed: ${error.message}`;
+    byId("token-form").hidden = !error.needsToken;
     setText("updated-at", "Connection lost");
   }
 
   async function poll() {
     if (timer) window.clearTimeout(timer);
     try {
-      if (!viewerToken) throw new Error("Open the private dashboard URL printed in the terminal; session storage must be enabled.");
+      if (!viewerToken) throw tokenError("This tab has no viewer token. Open the full private URL printed in the terminal, including #viewer_token=, or paste it below. Session storage must be enabled.");
       const response = await fetch("/api/state", {
         cache: "no-store",
         headers: {Authorization: `Bearer ${viewerToken}`},
       });
-      if (response.status === 401) throw new Error("Open the current private dashboard URL printed in the terminal.");
+      if (response.status === 401) throw tokenError("The viewer token is not current. Paste the private URL printed by the running dashboard below.");
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       render(await response.json());
     } catch (error) {
@@ -1284,6 +1333,14 @@ _APP_JS = rb"""(() => {
     pauseButton.setAttribute("aria-pressed", String(paused));
     if (paused && timer) window.clearTimeout(timer);
     if (!paused) poll();
+  });
+  byId("token-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    const input = byId("token-input");
+    const accepted = usePastedToken(input.value);
+    input.value = "";
+    if (accepted) poll();
+    else showConnectionError(tokenError("That is not a viewer token or private dashboard URL, or session storage is disabled."));
   });
   timelineScroll.addEventListener("scroll", () => {
     laneLabels.style.transform = `translateY(${-timelineScroll.scrollTop}px)`;

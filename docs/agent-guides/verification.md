@@ -107,7 +107,8 @@ static assets remain readable without trace data or credentials. A viewer token
 must not authorize capture POSTs, and the producer token must not read state.
 `test_viewer.WebDashboardTest` exercises the real HTTP boundary and process
 restart; when Node.js is installed it also executes the shipped browser script
-to check fragment cleanup, session storage, and exactly one bearer header.
+to check fragment cleanup, session storage, exactly one bearer header, and that
+a pasted token is stored without touching the URL.
 Node.js is optional for tests and is not a dashboard runtime dependency.
 
 Also run two failures. A wrong token must return tracer failure before any
