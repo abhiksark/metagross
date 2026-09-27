@@ -16,9 +16,12 @@ RUN apt-get update \
         python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-RUN python3 -m pip install --no-cache-dir \
+# pip 25.1+ resumes interrupted downloads; the CUDA wheels are hundreds of MB
+# each, and without resume a dropped connection fails the build's hash check.
+RUN python3 -m pip install --no-cache-dir "pip==26.2.1"
+RUN python3 -m pip install --no-cache-dir --resume-retries 50 \
         "torch==${TORCH_VERSION}" --index-url "${TORCH_INDEX_URL}"
-RUN python3 -m pip install --no-cache-dir "numpy==1.26.4"
+RUN python3 -m pip install --no-cache-dir --resume-retries 50 "numpy==1.26.4"
 
 # The controller remains root for BPF access. Metagross validates these sudo
 # values and drops only the traced target to this unprivileged account.

@@ -7,7 +7,8 @@ a CUDA-capable Linux host.
 ## Host requirements
 
 - A native x86-64 Linux host with an NVIDIA GPU and a driver compatible with
-  CUDA 12.4.
+  CUDA 12.4. RTX 50-series and other Blackwell GPUs need the CUDA 12.8 build
+  described in [Build](#build).
 - Docker with the NVIDIA Container Toolkit (`docker run --gpus all ...`).
 - BPF enabled in the host kernel.
 - Headers for the running host kernel at `/lib/modules/$(uname -r)/build`.
@@ -38,6 +39,25 @@ account. Use a non-root UID/GID that is not already assigned in the base image.
 The default image pins PyTorch 2.5.1 with CUDA 12.4 wheels. Override
 `TORCH_VERSION` and `TORCH_INDEX_URL` together if another supported wheel is
 needed.
+
+Blackwell GPUs (compute capability 12.0, such as the RTX 5090) require this
+override, because the CUDA 12.4 wheels contain no kernels for them. This build
+was verified on an RTX 5090 with driver 580:
+
+```sh
+docker build \
+  --build-arg TARGET_UID="$(id -u)" \
+  --build-arg TARGET_GID="$(id -g)" \
+  --build-arg TORCH_VERSION=2.11.0 \
+  --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128 \
+  -f examples/docker/Dockerfile \
+  -t metagross-pytorch .
+```
+
+The build resumes interrupted wheel downloads. If pulling the
+`nvidia/cuda` base image itself fails partway, pull it on another machine and
+transfer it with `docker save --platform linux/amd64 -o cuda-base.tar
+nvidia/cuda:12.4.1-runtime-ubuntu22.04` and `docker load -i cuda-base.tar`.
 
 ## Available workloads
 
@@ -314,6 +334,10 @@ capture was incomplete.
 
 - `CUDA is unavailable`: verify the NVIDIA Container Toolkit and the
   `--gpus all` flag.
+- `no kernel image is available for execution on the device`, or a warning that
+  the GPU's CUDA capability is not compatible with the installed PyTorch: build
+  with a PyTorch wheel that supports the GPU; see the Blackwell example in
+  [Build](#build).
 - Missing kernel headers or BCC compile errors: install headers for `uname -r`
   on the host and verify `/lib/modules/$(uname -r)/build` exists.
 - `open(/sys/kernel/debug/tracing/uprobe_events)` or cleanup failures: include
