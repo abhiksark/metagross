@@ -20,20 +20,25 @@ GPU kernel execution time or utilization.
 This experimental, source-only public preview traces one trusted Python workload
 without changing normal target stdout; trace rows go to stderr by default.
 
-<img src="assets/dashboard-live.webp" alt="Metagross live dashboard showing CUDA driver calls grouped by upload_inputs, compute, and download_checksum" width="1200">
+<img src="assets/dashboard-demo.webp" alt="Metagross web dashboard filling with CUDA driver calls from a PyTorch pipeline, grouped by Python function, then showing one cuBLAS launch's details and the summary panels" width="1000">
 
-*Live Docker capture: 627 CUDA driver calls across three attributed project functions.*
+*Recorded trace of a PyTorch pipeline (537 CUDA driver calls) replayed through
+the web dashboard at about 1.3× speed. Calls without a safe project frame stay
+`<unknown>`.*
 
-## What you get
+## Functionality overview
 
-- Live attribution for selected launch, copy, allocation, and synchronization
-  driver calls.
-- A function-grouped timeline, event details, and aggregate rankings without
-  workload source instrumentation.
-- Optional named regions via `metagross.span("name")`, an opt-in context
-  manager that groups events by a script-chosen label alongside function
-  attribution; a no-op when the script runs outside a trace.
-- Optional stable JSONL and final summary files for durable captures.
+| Capability | What it does |
+|------------|--------------|
+| [Driver call tracing](docs/reference.md#traced-api-table) | Hooks 17 CUDA driver APIs with eBPF uprobes: kernel launches, allocations and frees, copies between host and device, and stream, context, and event synchronization. Needs no changes to the traced script; `--trace` selects any of the `launch`, `memory`, `copy`, and `sync` families. |
+| [Python attribution](docs/reference.md#how-attribution-works) | Assigns each call to the project function active at API entry, skipping standard-library and installed-package frames. Calls with no safe project frame stay `<unknown>`; `--no-attribution` turns the profile hook off. |
+| [Call details](docs/reference.md#traced-api-table) | Records the return code, CPU-side duration, and per-API arguments: launch grid, block, shared memory, and stream; byte counts; pointers; and resolved kernel names. |
+| [Named regions](docs/reference.md#op-spans) | Tags every call inside `with metagross.span("name"):` with that label, alongside function attribution. The span is a no-op when the script runs outside a trace. |
+| [Live web dashboard](#what-the-dashboard-shows) | Shows the capture in a browser as it runs: a function-grouped timeline with zoom, pan, and filters, an event table with a detail inspector, and API, function, kernel, and allocation summaries. |
+| [Terminal viewers](docs/reference.md#viewer-option-reference) | Prints a static dashboard with `view --snapshot` or follows a growing JSONL file with `view --follow`. Both run without root, BCC, CUDA, or a GPU. |
+| [Durable output](docs/reference.md#output) | Writes table rows to stderr by default, stable JSONL with `--json --output`, a versioned summary with `--summary-output`, and a one-line capture report with `--stats`. |
+| [Completeness checks](docs/reference.md#viewer-status-reference) | Counts lost events, dropped nested calls, and CUDA errors. Only a reconciled final summary is shown as `COMPLETE`. |
+| [Target preservation](docs/reference.md#privilege-and-trust-boundary) | Runs one script as the invoking sudo user, with its arguments, stdout, and exit status unchanged. |
 
 <a id="quick-start"></a>
 ## Quick start: trace your script live
