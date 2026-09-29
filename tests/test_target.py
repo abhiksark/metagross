@@ -1,4 +1,4 @@
-# test_target.py
+# tests/test_target.py
 """Unprivileged execution-boundary tests with real target interpreters."""
 
 import contextlib

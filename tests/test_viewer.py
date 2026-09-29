@@ -1,4 +1,4 @@
-# test_viewer.py
+# tests/test_viewer.py
 """Unprivileged tests for the Metagross visual trace viewer."""
 
 from __future__ import annotations
@@ -1985,7 +1985,7 @@ async function paste(text, blocked = false) {
             self.assertIn('setAttribute("aria-selected"', script)
             self.assertIn("timelineSignature", script)
 
-        master = Path(__file__).parent / "assets/logo-mark.svg"
+        master = Path(__file__).resolve().parent.parent / "assets/logo-mark.svg"
         path_tag = "{http://www.w3.org/2000/svg}path"
         expected_paths = [node.attrib["d"] for node in ET.parse(master).iter(path_tag)]
         for route in ("/logo.svg", "/favicon.svg"):
@@ -2041,7 +2041,7 @@ async function paste(text, blocked = false) {
                 "0",
                 str(trace),
             ],
-            cwd=Path(__file__).resolve().parent,
+            cwd=Path(__file__).resolve().parent.parent,
             env=environment,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -2112,7 +2112,7 @@ async function paste(text, blocked = false) {
         command = list(process.args)
         command[command.index("--port") + 1] = str(urllib.parse.urlsplit(url).port)
         process = subprocess.Popen(
-            command, cwd=Path(__file__).resolve().parent, env=environment,
+            command, cwd=Path(__file__).resolve().parent.parent, env=environment,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
         restarted_url = None
@@ -2163,7 +2163,7 @@ async function paste(text, blocked = false) {
                 "--port",
                 "0",
             ],
-            cwd=Path(__file__).resolve().parent,
+            cwd=Path(__file__).resolve().parent.parent,
             env=environment,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -2743,7 +2743,7 @@ class LiveDashboardPtyTest(unittest.TestCase):
                         "--follow",
                         str(trace),
                     ],
-                    cwd=Path(__file__).resolve().parent,
+                    cwd=Path(__file__).resolve().parent.parent,
                     env=environment,
                     stdin=slave_fd,
                     stdout=slave_fd,

@@ -52,7 +52,7 @@ driver support:
 
 ```sh
 sudo env RUN_EBPF_INTEGRATION=1 \
-  /usr/bin/python3 -m unittest -v test_metagross.LiveTraceTest
+  /usr/bin/python3 -m unittest -v tests.test_metagross.LiveTraceTest
 ```
 
 This executes local GPU work and installs temporary BPF probes. Review the code

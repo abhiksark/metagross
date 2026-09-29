@@ -1,4 +1,4 @@
-# test_metagross.py
+# tests/test_metagross.py
 """Tests for metagross. Unprivileged unless RUN_EBPF_INTEGRATION=1."""
 import collections
 import contextlib
@@ -720,7 +720,7 @@ class OutputSafetyTest(unittest.TestCase):
              "    raise SystemExit(0)\n"
              "raise SystemExit(1)\n", path, str(self.uid), str(self.gid)],
             capture_output=True, text=True, timeout=5,
-            cwd=os.path.dirname(os.path.abspath(__file__)),
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 

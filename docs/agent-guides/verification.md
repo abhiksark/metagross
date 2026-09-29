@@ -20,12 +20,12 @@ Use focused tests while iterating:
 
 ```sh
 /usr/bin/python3 -B -m unittest -v \
-  test_target \
-  test_metagross.ParseArgsTest \
-  test_metagross.RendererTest \
-  test_metagross.DashboardPublisherTest \
-  test_viewer.WebDashboardTest \
-  test_viewer.ViewerRoutingTest
+  tests.test_target \
+  tests.test_metagross.ParseArgsTest \
+  tests.test_metagross.RendererTest \
+  tests.test_metagross.DashboardPublisherTest \
+  tests.test_viewer.WebDashboardTest \
+  tests.test_viewer.ViewerRoutingTest
 ```
 
 If class names change, inspect `test_metagross.py` and run the closest affected
@@ -39,7 +39,7 @@ credentials, output ownership, or cleanup:
 
 ```sh
 sudo env RUN_EBPF_INTEGRATION=1 \
-  /usr/bin/python3 -m unittest -v test_metagross.LiveTraceTest
+  /usr/bin/python3 -m unittest -v tests.test_metagross.LiveTraceTest
 ```
 
 or:
@@ -105,7 +105,7 @@ the producer secret copied into Docker. Missing, wrong, or duplicate bearer
 credentials must receive 401 from `/api/state`, including HEAD requests, while
 static assets remain readable without trace data or credentials. A viewer token
 must not authorize capture POSTs, and the producer token must not read state.
-`test_viewer.WebDashboardTest` exercises the real HTTP boundary and process
+`tests.test_viewer.WebDashboardTest` exercises the real HTTP boundary and process
 restart; when Node.js is installed it also executes the shipped browser script
 to check fragment cleanup, session storage, exactly one bearer header, and that
 a pasted token is stored without touching the URL.
@@ -122,7 +122,7 @@ again to confirm replacement rather than count merging.
 - CLI parsing or validation: parse/usage tests plus README examples if affected.
 - Output path handling: ownership, symlink, regular-file, create/truncate, and
   permission tests.
-- Child process behavior: run `test_target` for the unprivileged exec boundary,
+- Child process behavior: run `tests.test_target` for the unprivileged exec boundary,
   startup barrier, PID preservation, normal shutdown, `atexit`, non-daemon
   threads, buffered stdout/stderr, exceptions, exit codes, signals, argument
   pass-through, environment, and descriptor inheritance. The live gate remains
