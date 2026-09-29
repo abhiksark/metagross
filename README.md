@@ -6,46 +6,66 @@
 [![Tests](https://github.com/abhiksark/metagross/actions/workflows/test.yml/badge.svg)](https://github.com/abhiksark/metagross/actions/workflows/test.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
-![Platform](https://img.shields.io/badge/platform-Linux-lightgrey)
+![Platform](https://img.shields.io/badge/platform-Linux%20x86--64-lightgrey)
 ![eBPF](https://img.shields.io/badge/eBPF-BCC-orange)
 ![CUDA](https://img.shields.io/badge/NVIDIA-CUDA%20driver%20API-76b900)
 ![Status](https://img.shields.io/badge/status-experimental-yellow)
 
 # Metagross
 
-Watch selected CUDA driver calls update live, grouped by the Python project
-function that caused them. Metagross reports host-side API elapsed time, not
-GPU kernel execution time or utilization.
+Metagross shows which function in your Python project triggered each traced
+CUDA kernel launch, memory allocation, copy, and synchronization, without
+changing your script. It traces selected CUDA driver API calls with eBPF and reports
+their host-side elapsed time, not GPU kernel execution time or utilization.
 
-This experimental, source-only public preview traces one trusted Python workload
-without changing normal target stdout; trace rows go to stderr by default.
+This is an experimental, source-only public preview for tracing one trusted
+Python workload on your own machine.
 
 <img src="assets/dashboard-demo.webp" alt="Metagross web dashboard filling with CUDA driver calls from a PyTorch pipeline, grouped by Python function, then showing one cuBLAS launch's details and the summary panels" width="1000">
 
-*Recorded trace of a PyTorch pipeline (537 CUDA driver calls) replayed through
-the web dashboard at about 1.3× speed. Calls without a safe project frame stay
-`<unknown>`.*
+*Recorded trace of a PyTorch pipeline (537 CUDA driver calls) streamed into the
+web dashboard at about 1.3× its original pace. Calls that cannot be safely tied
+to a project function show as `<unknown>`.*
+
+To try the dashboard without root, BCC, CUDA, or a GPU, open the
+[sample capture](examples/captures/README.md).
+
+## When Metagross fits
+
+| Question | Tool |
+|----------|------|
+| Which project function launched, copied, allocated, or synchronized through CUDA? | Metagross |
+| How do GPU execution and CPU/GPU overlap behave? | [NVIDIA Nsight Systems](https://developer.nvidia.com/nsight-systems) |
+| Why is an individual GPU kernel slow? | [Nsight Compute](https://developer.nvidia.com/nsight-compute) |
+| Which operators, autograd work, or tensor allocations dominate? | A framework profiler, such as the PyTorch profiler |
 
 ## Functionality overview
 
 | Capability | What it does |
 |------------|--------------|
-| [Driver call tracing](docs/reference.md#traced-api-table) | Hooks 17 CUDA driver APIs with eBPF uprobes: kernel launches, allocations and frees, copies between host and device, and stream, context, and event synchronization. Needs no changes to the traced script; `--trace` selects any of the `launch`, `memory`, `copy`, and `sync` families. |
-| [Python attribution](docs/reference.md#how-attribution-works) | Assigns each call to the project function active at API entry, skipping standard-library and installed-package frames. Calls with no safe project frame stay `<unknown>`; `--no-attribution` turns the profile hook off. |
+| [Driver call tracing](docs/reference.md#traced-api-table) | Reports 17 CUDA driver APIs through eBPF uprobes: kernel launches, allocations and frees, memory copies, and stream, context, and event synchronization. Three more probes read kernel names. Needs no changes to the traced script; `--trace` selects any of the `launch`, `memory`, `copy`, and `sync` families. |
+| [Python attribution](docs/reference.md#how-attribution-works) | Assigns each call to the function under the project root that was active at API entry, skipping standard-library, installed-package, and Metagross frames. Calls with no safe project frame stay `<unknown>`; `--no-attribution` turns function attribution off. |
 | [Call details](docs/reference.md#traced-api-table) | Records the return code, CPU-side duration, and per-API arguments: launch grid, block, shared memory, and stream; byte counts; pointers; and resolved kernel names. |
-| [Named regions](docs/reference.md#op-spans) | Tags every call inside `with metagross.span("name"):` with that label, alongside function attribution. The span is a no-op when the script runs outside a trace. |
-| [Live web dashboard](#what-the-dashboard-shows) | Shows the capture in a browser as it runs: a function-grouped timeline with zoom, pan, and filters, an event table with a detail inspector, and API, function, kernel, and allocation summaries. |
+| [Named regions](docs/reference.md#op-spans) | Labels the calls made inside `with metagross.span("name"):` on the same thread, in table and JSONL output. Spans need function attribution and do nothing when the script runs outside a trace. |
+| [Live web dashboard](#read-the-dashboard) | Shows the capture in a browser as it runs: a function-grouped timeline with zoom, pan, and filters, an event table with a detail inspector, and API, function, kernel, and allocation summaries. |
 | [Terminal viewers](docs/reference.md#viewer-option-reference) | Prints a static dashboard with `view --snapshot` or follows a growing JSONL file with `view --follow`. Both run without root, BCC, CUDA, or a GPU. |
 | [Durable output](docs/reference.md#output) | Writes table rows to stderr by default, stable JSONL with `--json --output`, a versioned summary with `--summary-output`, and a one-line capture report with `--stats`. |
-| [Completeness checks](docs/reference.md#viewer-status-reference) | Counts lost events, dropped nested calls, and CUDA errors. Only a reconciled final summary is shown as `COMPLETE`. |
-| [Target preservation](docs/reference.md#privilege-and-trust-boundary) | Runs one script as the invoking sudo user, with its arguments, stdout, and exit status unchanged. |
+| [Completeness checks](docs/reference.md#viewer-status-reference) | Tracks lost events, dropped nested calls, and lost profile records, and shows `COMPLETE` only when the final summary reports the capture complete and matches the events received. CUDA error counts are reported but do not affect completeness. |
+| [Target preservation](docs/reference.md#privilege-and-trust-boundary) | Runs one script as the sudo caller (or as root, with a warning, when started directly as root), with its arguments and stdout unchanged and its exit status passed through; a signal becomes `128 + signal number`. |
 
-<a id="quick-start"></a>
-## Quick start: trace your script live
+## Requirements
 
-Live tracing needs Linux, an NVIDIA GPU and compatible driver, root/sudo, BPF
-support, running-kernel headers, and Python 3.10+. On Ubuntu, use the system
-Python and BCC bindings:
+Live tracing needs:
+
+- x86-64 Linux with kernel 5.8 or later, BPF enabled, and headers for the
+  running kernel.
+- An NVIDIA GPU and driver.
+- Root through `sudo`.
+- The system Python 3.10 or later (`/usr/bin/python3`) with the distribution's
+  BCC bindings. Your script runs under this interpreter, so it must be able to
+  import your script's dependencies.
+
+On Ubuntu:
 
 ```sh
 git clone https://github.com/abhiksark/metagross.git
@@ -53,9 +73,55 @@ cd metagross
 sudo apt install python3-bpfcc "linux-headers-$(uname -r)"
 ```
 
-Run both terminals from this repository directory.
+For other distributions, see the
+[BCC installation guide](https://github.com/iovisor/bcc/blob/master/INSTALL.md).
+The viewers and both `--help` commands run without root, BCC, CUDA, or a GPU.
 
-1. **Terminal one: start the unprivileged loopback receiver.**
+<a id="quick-start"></a>
+## Quick start
+
+Metagross runs from source, so run every command below from the repository root.
+
+### 1. Trace the included demo
+
+```sh
+sudo /usr/bin/python3 -m metagross examples/gpu_demo.py
+```
+
+Metagross writes one table row per traced call to stderr; the demo's own output
+stays on stdout. Rows have this shape (timings vary):
+
+```text
+TIME        FUNCTION          LOCATION            API             RET  DURATION DETAILS
+12:10:03.41 compute           gpu_demo.py:86      LaunchKernel    0    0.05ms   kernel=vec_add grid=8,1,1 block=128,1,1 shared=0 stream=0x0
+```
+
+### 2. Trace your own script
+
+```sh
+PROJECT_ROOT="/absolute/path/to/your/project"
+WORKLOAD="$PROJECT_ROOT/path/to/workload.py"
+sudo /usr/bin/python3 -B -m metagross --project-root "$PROJECT_ROOT" "$WORKLOAD"
+```
+
+- Set `PROJECT_ROOT` to your project's absolute path; only functions under it
+  are attributed.
+- Set `WORKLOAD` to a regular `.py` file inside that root.
+- Place Metagross options before `"$WORKLOAD"` and script arguments after it;
+  the arguments reach your script unchanged.
+
+To keep a durable capture, add `--json --output /tmp/metagross.jsonl
+--summary-output /tmp/metagross-summary.json` and open it later with the [viewers](docs/reference.md#visual-trace-viewer).
+See the [complete CLI and interpreter contract](docs/reference.md#usage) and the
+[prepared-container route](examples/docker/README.md).
+
+### 3. Watch it live in the browser
+
+The live dashboard uses two terminals. A receiver running as your user serves
+the browser page, and the tracer running under `sudo` sends events to it. A
+shared token lets the receiver accept events only from your tracer.
+
+1. **Terminal one: start the receiver.**
 
    ```sh
    export METAGROSS_DASHBOARD_TOKEN="$(/usr/bin/python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
@@ -63,21 +129,13 @@ Run both terminals from this repository directory.
    /usr/bin/python3 -B -m metagross view --web --receive --port 8765
    ```
 
-   Open the complete private URL printed by the receiver.
-   Its `#viewer_token=…` browser credential differs from the producer token and
-   disappears from the visible URL after entering browser session storage.
-   A new tab needs the complete URL again, or paste it into the field the page
-   shows.
-   Keep the URL private. To view it from another machine on a trusted internal
-   network, add `--host 0.0.0.0` instead of proxying the port, and read the
-   warning it prints. Public addresses and public-internet clients are refused
-   as defense in depth; this does not replace a firewall.
+   Open the complete URL the receiver prints and keep it private; it carries a
+   separate browser credential. To view the dashboard from another machine on
+   a trusted internal network, see the
+   [viewer access options](docs/reference.md#visual-trace-viewer).
 
-2. **Terminal two: trace your script** with the copied producer token.
-
-   The controller loads BPF as root but drops the target to the validated sudo
-   caller. Run only trusted local scripts; preserve only the producer variable
-   across sudo:
+2. **Terminal two: run the tracer with the same token.** Pass only this
+   variable through `sudo`:
 
    ```sh
    export METAGROSS_DASHBOARD_TOKEN='paste the copied token here'
@@ -90,95 +148,85 @@ Run both terminals from this repository directory.
      "$WORKLOAD"
    ```
 
-Watch `WAITING → LIVE → COMPLETE` when the final summary reconciles. Target
-stdout stays target-owned; trace rows remain on stderr by default. Keep the
-receiver and browser tab open: rerunning the producer replaces the prior
-in-memory capture and repopulates the same tab automatically.
-`LIVE`, `INCOMPLETE`, `MISMATCH`, or malformed warnings are not final evidence
-of a loss-free capture.
+Rerunning the tracer replaces the previous capture in the same browser tab. The
+receiver keeps the capture in memory only, so stopping it loses the capture; add
+`--output` and `--summary-output` to the tracer for a durable recording.
 
-When finished, stop the receiver with Ctrl-C and clear the token in **both shells**:
+When finished, stop the receiver with Ctrl-C and clear the token in both shells:
 
 ```sh
 unset METAGROSS_DASHBOARD_TOKEN
 ```
 
-Direct delivery is in-memory: stopping the receiver loses the capture. For a
-durable recording, see [JSONL and summary output](docs/reference.md#output).
+## Read the dashboard
 
-## Point Metagross at your workload
+| Area | What it shows |
+|------|---------------|
+| Metric strip | Events and event rate, attributed percentage, CUDA errors, CPU API time, synchronization time, copied bytes, and current and peak observed allocations. |
+| Integrity counters | Lost, dropped, delivery-dropped, and malformed event counts. |
+| CUDA API timeline | One lane per function name, plus `<unknown>`, with zoom, pan, and API-family and text filters. |
+| Selection details | The selected call's timing, thread, function, file, kernel, and captured arguments. |
+| Events view | The most recent calls matching the timeline filters (500 by default), newest first. |
+| Summary analysis | Top CUDA APIs, project functions, top kernels, and the observed allocation curve. |
 
-- `PROJECT_ROOT` is the absolute project boundary used for attribution.
-- `WORKLOAD` must be a regular `.py` file inside that root; `/usr/bin/python3`
-  must be able to import its dependencies.
-- Put Metagross options before `"$WORKLOAD"`; append target arguments after it
-  and they pass through unchanged.
+The status in the top right starts at `WAITING` and becomes `LIVE` once the
+capture starts. `LIVE` does not mean the capture is complete. Only `COMPLETE` means the
+final summary reported the capture complete and matched the events received; `INCOMPLETE`,
+`MISMATCH`, or a malformed warning means the capture cannot be treated as
+complete. Allocation figures cover driver allocations Metagross observed, not
+device-wide memory use or tensor memory.
 
-One launched Python process is traced; there is no existing-PID attach,
-subprocess capture, or `python -m` target form. See the
-[complete CLI and interpreter contract](docs/reference.md#usage) or the
-[prepared-container route](examples/docker/README.md).
+See the [status reference](docs/reference.md#viewer-status-reference),
+[HTTP fields and schema](docs/reference.md#local-http-interface), and
+[storage and display bounds](docs/reference.md#storage-and-display-bounds).
 
-Optionally mark named regions of your own code with `import metagross` and
-`with metagross.span("step"): ...`; every CUDA call attributed inside that
-block carries `"step"` in its `span` field, in table output and JSONL alike.
+## Mark named regions
+
+Optionally label regions of your own code:
+
+```python
+import metagross
+
+with metagross.span("step"):
+    ...
+```
+
+Calls made inside the block on the same thread carry `"step"` in the `span`
+field of table and JSONL output; the web dashboard does not show spans. Spans
+need function attribution and do nothing when the script runs outside a trace.
 See [op spans](docs/reference.md#op-spans) and the annotated
 [`examples/quicklook.py`](examples/quicklook.py).
 
-## What the dashboard shows
-
-| Label | Meaning |
-|-------|---------|
-| Activity | Events / event rate, attributed percentage, and nonzero raw CUDA return codes. |
-| Host timing | Accumulated CPU API elapsed time and its synchronization-call subset. |
-| Data / memory | Successful copied bytes and current/peak successfully observed driver allocations, not device-wide utilization or tensor memory. |
-| Views | Bounded recent events grouped by function, plus aggregate API, function, and kernel rankings. |
-
-Only a reconciled final summary yields `COMPLETE`; `INCOMPLETE`, `MISMATCH`, or
-malformed warnings mean the capture cannot be treated as complete.
-`LIVE` is not final evidence of a loss-free capture.
-See the [HTTP fields and schema](docs/reference.md#local-http-interface) and
-[storage and display bounds](docs/reference.md#storage-and-display-bounds).
-
 ## Other ways to start
 
-- [Sanitized no-GPU dashboard replay](examples/captures/README.md).
 - [Prepared Docker workload, alternate workloads, and benchmarks](examples/docker/README.md).
-- [Durable JSONL and final summary capture](docs/reference.md#output) and
-  [snapshot/follow viewers](docs/reference.md#viewer-option-reference).
+- [Terminal snapshot and follow viewers](docs/reference.md#viewer-option-reference)
+  for saved JSONL captures.
 
-Both help commands run without root, BCC, CUDA, or a GPU:
+Usage help runs without root, BCC, CUDA, or a GPU:
 
 ```sh
 /usr/bin/python3 -m metagross --help
 /usr/bin/python3 -m metagross view --help
 ```
 
-## When Metagross fits
+## Limits
 
-| Question | Tool |
-|----------|------|
-| Which project function launched, copied, allocated, or synchronized through CUDA? | Metagross: connect selected driver calls to active Python project frames. |
-| How do GPU execution and CPU/GPU overlap behave? | [NVIDIA Nsight Systems](https://developer.nvidia.com/nsight-systems). |
-| Why is an individual GPU kernel slow? | [Nsight Compute](https://developer.nvidia.com/nsight-compute). |
-| Which operators, autograd work, or tensor allocations dominate? | A framework profiler. |
-
-## Requirements and limits
-
-- Selected CUDA driver APIs in one launched Python process, including its Python
-  threads; no framework-wide coverage or arbitrary-image entrypoint replacement.
+- Metagross traces selected CUDA driver APIs in one launched Python process and
+  its Python threads. It does not attach to an existing process, follow
+  subprocesses, run `python -m` targets, or record framework-level events.
 - Timing is host-side API elapsed time, not GPU execution time or utilization.
-- Attribution and kernel names are best effort; C++ worker threads without active
-  project Python frames can be unknown.
-- Observed driver allocations are not tensor memory; caching allocators reuse them,
-  and VMM / expandable-segment allocations are outside the traced API set.
-- Profiling adds overhead; high rates and nested driver re-entry can lose events.
-  Inspect warnings and final summary completeness.
-- Trusted local workloads only: this is not a sandbox or production monitor.
-  Keep captures and the private viewer URL private.
+- Attribution and kernel names are best effort. Calls from C++ worker threads
+  without an active project Python frame show as `<unknown>`.
+- Observed driver allocations are not tensor memory. Caching allocators reuse
+  them, and VMM and expandable-segment allocations are outside the traced API set.
+- Profiling adds overhead. High call rates and nested driver re-entry can lose
+  events, so check warnings and the final summary.
+- Metagross loads its probes as root, then runs your script as your own user
+  when started through `sudo`, or as root with a warning otherwise. It is for trusted local workloads and is not a sandbox or a production
+  monitor. Keep captures and the private viewer URL private.
 
-See the [BCC installation guide](https://github.com/iovisor/bcc/blob/master/INSTALL.md),
-[full limits](docs/reference.md#overhead-and-limits), and
+See the [full limits](docs/reference.md#overhead-and-limits) and the
 [privilege and trust boundary](docs/reference.md#privilege-and-trust-boundary).
 
 ## Documentation
@@ -186,7 +234,8 @@ See the [BCC installation guide](https://github.com/iovisor/bcc/blob/master/INST
 - [Reference](docs/reference.md): all options, schemas, API coverage, file safety,
   viewer states, exit behavior, and extended limits.
 - [Examples](examples/README.md): local demonstrations and function descriptions.
-- [Example captures](examples/captures/README.md): sanitized replay provenance.
+- [Example captures](examples/captures/README.md): where the sample capture came
+  from and how to open it.
 - [Docker guide](examples/docker/README.md): container workflow, workload portfolio,
   and benchmarks.
 
