@@ -420,6 +420,50 @@ class BenchmarkHarnessTest(unittest.TestCase):
         self.assertIsNone(summary["target_median_seconds"])
 
 
+@unittest.skipUnless(shutil.which("sh"), "requires a POSIX sh")
+class DockerWrapperTest(unittest.TestCase):
+    WRAPPER = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           os.pardir, "examples", "docker", "metagross")
+
+    def _docker_argv(self, *args, image=None):
+        """Run the wrapper against a fake docker and return docker's argv."""
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = os.path.join(tmp, "bin")
+            project = os.path.realpath(os.path.join(tmp, "project"))
+            os.mkdir(bin_dir)
+            os.mkdir(project)
+            fake = os.path.join(bin_dir, "docker")
+            with open(fake, "w") as f:
+                f.write("#!/bin/sh\nprintf '%s\\n' \"$@\"\n")
+            os.chmod(fake, 0o755)
+            env = dict(os.environ, PWD=project,
+                       PATH=bin_dir + os.pathsep + os.environ["PATH"])
+            env.pop("METAGROSS_IMAGE", None)
+            if image is not None:
+                env["METAGROSS_IMAGE"] = image
+            result = subprocess.run(
+                ["sh", self.WRAPPER, *args], cwd=project, env=env,
+                capture_output=True, text=True, check=True,
+            )
+        return project, result.stdout.splitlines()
+
+    def test_mounts_and_enters_current_directory(self):
+        project, argv = self._docker_argv("run.py", "a b")
+        self.assertEqual(argv[argv.index("-w") + 1], project)
+        self.assertIn(f"{project}:{project}", argv)
+        self.assertEqual(argv[-3:], ["metagross-pytorch", "run.py", "a b"])
+        self.assertNotIn("--network=host", argv)
+
+    def test_web_uses_host_network(self):
+        _, argv = self._docker_argv("--web", "run.py")
+        self.assertIn("--network=host", argv)
+        self.assertEqual(argv[-2:], ["--web", "run.py"])
+
+    def test_image_override(self):
+        _, argv = self._docker_argv(image="metagross-pytorch:cu128")
+        self.assertEqual(argv[-1], "metagross-pytorch:cu128")
+
+
 class ValidateSudoTest(unittest.TestCase):
     def _lookup(self, name):
         if name == "tester":

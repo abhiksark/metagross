@@ -69,8 +69,6 @@ bindings, and PyTorch, so the host needs only:
 <a id="quick-start"></a>
 ## Quick start
 
-Run every command below from the repository root.
-
 ### 1. Build the image
 
 ```sh
@@ -86,59 +84,57 @@ docker build \
 The build arguments make the traced script run as your UID and GID, so the
 trace files it writes belong to you.
 
-### 2. Trace the included workload
+### 2. Install the `metagross` command
+
+From the repository root:
 
 ```sh
-docker run --rm \
-  --gpus all \
-  --privileged \
-  --pid=host \
-  -v /lib/modules:/lib/modules:ro \
-  -v /usr/src:/usr/src:ro \
-  -v /sys/kernel/debug:/sys/kernel/debug \
-  -v /sys/kernel/tracing:/sys/kernel/tracing \
-  metagross-pytorch
+mkdir -p ~/.local/bin
+ln -s "$PWD/examples/docker/metagross" ~/.local/bin/metagross
+```
+
+`~/.local/bin` must be on your `PATH`. The command runs the image with the
+privileges and kernel mounts that tracing needs; the
+[Docker guide](examples/docker/README.md#use-the-metagross-command) shows the
+full `docker run` it issues.
+
+### 3. Trace the included workload
+
+```sh
+metagross
 ```
 
 Metagross prints one table row per traced CUDA call to stderr, and the
 workload's checksum goes to stdout. The [Docker guide](examples/docker/README.md)
-explains each flag and lists five more workloads.
+lists five more workloads.
 
-### 3. Trace your own script with the live dashboard
+### 4. Trace your own script with the live dashboard
 
 ```sh
-PROJECT_ROOT="/absolute/path/to/your/project"
-docker run --rm \
-  --gpus all \
-  --privileged \
-  --pid=host \
-  --network host \
-  -v /lib/modules:/lib/modules:ro \
-  -v /usr/src:/usr/src:ro \
-  -v /sys/kernel/debug:/sys/kernel/debug \
-  -v /sys/kernel/tracing:/sys/kernel/tracing \
-  -v "$PROJECT_ROOT:/workspace/project:ro" \
-  metagross-pytorch \
-  --web \
-  --project-root /workspace/project \
-  /workspace/project/path/to/workload.py
+cd /path/to/your/project
+metagross --web run.py
 ```
 
 Open the URL it prints and keep it private. The dashboard fills in as your
 script runs and keeps the capture after the script exits. Press Ctrl-C to stop
 it; the command then exits with your script's status.
 
-- Only functions under `--project-root` are attributed; the script must be a
-  regular `.py` file inside it.
+- Drop `--web` to print the trace table to stderr instead.
+- The current directory is the project root: only functions in files under it
+  are attributed, and the script must be a regular `.py` file inside it.
+- The current directory is mounted read-write at the same path and your script
+  runs there, so relative paths work as they do with `python run.py`. Files
+  outside it are not visible to your script.
 - Put Metagross options before the script path and script arguments after it;
   the arguments reach your script unchanged.
 - Your script can import only what the image provides: PyTorch and NumPy.
   Add other packages to [`examples/docker/Dockerfile`](examples/docker/Dockerfile)
   and rebuild.
-- `--network host` lets your browser reach the dashboard on `127.0.0.1:8765`
-  (change the port with `--web-port`). It also removes Docker's network
-  isolation for this container, which already runs privileged in the host PID
-  namespace.
+- With `--web`, the container also runs with `--network host` so your browser
+  can reach the dashboard on `127.0.0.1:8765` (change the port with
+  `--web-port`). This removes Docker's network isolation for a container that
+  already runs privileged in the host PID namespace.
+- Set `METAGROSS_IMAGE` to use another image tag, such as a CUDA 12.8 build.
 - The capture is kept in memory only. To also save it to files, see
   [Write JSONL to the host](examples/docker/README.md#write-jsonl-to-the-host).
 

@@ -1,0 +1,13 @@
+#!/bin/sh
+# examples/docker/metagross
+# Runs Metagross from its Docker image on a script in the current directory.
+network=
+for arg in "$@"; do
+    [ "$arg" = --web ] && network=--network=host
+done
+exec docker run --rm -i --gpus all --privileged --pid=host $network \
+    -v /lib/modules:/lib/modules:ro -v /usr/src:/usr/src:ro \
+    -v /sys/kernel/debug:/sys/kernel/debug \
+    -v /sys/kernel/tracing:/sys/kernel/tracing \
+    -v "$PWD:$PWD" -w "$PWD" \
+    "${METAGROSS_IMAGE:-metagross-pytorch}" "$@"

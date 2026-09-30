@@ -41,5 +41,7 @@ COPY examples/docker/benchmarks/ /workspace/benchmarks/
 COPY examples/docker/tests/ /workspace/tests/
 RUN chmod -R a+rX /workspace
 
-ENTRYPOINT ["/usr/bin/python3", "-m", "metagross"]
+# -c, not -m: the working directory may be the user's mounted project, and -m
+# would put it ahead of this image's Metagross on the root controller's path.
+ENTRYPOINT ["/usr/bin/python3", "-c", "import sys; sys.path[0] = '/workspace'; import metagross; sys.exit(metagross.main())"]
 CMD ["--project-root", "/workspace/workloads", "/workspace/workloads/basic_tensor_ops.py"]

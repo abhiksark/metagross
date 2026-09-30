@@ -31,8 +31,9 @@ sudo /usr/bin/python3 -m metagross examples/gpu_demo.py
   `RUN_EBPF_INTEGRATION=1` set.
 - **docker/** contains a containerized Metagross + PyTorch environment with
   tensor, CNN, ViT, decoder-only transformer, training, and multi-stage pipeline
-  workloads. See [`docker/README.md`](docker/README.md) for the required NVIDIA,
-  host-PID, and BPF flags.
+  workloads, and the `metagross` command that runs it on a script in the
+  current directory. See [`docker/README.md`](docker/README.md) for the required
+  NVIDIA, host-PID, and BPF flags.
 
 ## Function Overview
 

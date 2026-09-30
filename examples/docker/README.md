@@ -63,6 +63,50 @@ docker save --platform linux/amd64 -o cuda-base.tar nvidia/cuda:12.4.1-runtime-u
 docker load -i cuda-base.tar
 ```
 
+## Use the metagross command
+
+[`metagross`](metagross) is a short shell script that runs the image on a script
+in the current directory. Install it once from the repository root:
+
+```sh
+mkdir -p ~/.local/bin
+ln -s "$PWD/examples/docker/metagross" ~/.local/bin/metagross
+```
+
+Then, from any project directory:
+
+```sh
+metagross run.py            # trace table on stderr
+metagross --web run.py      # live browser dashboard
+metagross                   # the included basic workload
+```
+
+Each call runs this command, with every argument passed to Metagross unchanged:
+
+```sh
+docker run --rm -i --gpus all --privileged --pid=host \
+  -v /lib/modules:/lib/modules:ro -v /usr/src:/usr/src:ro \
+  -v /sys/kernel/debug:/sys/kernel/debug \
+  -v /sys/kernel/tracing:/sys/kernel/tracing \
+  -v "$PWD:$PWD" -w "$PWD" \
+  metagross-pytorch "$@"
+```
+
+- The current directory is mounted read-write at the same path and becomes the
+  working directory. The default `--project-root .` is therefore your project,
+  relative paths resolve as they do on the host, and files your script writes
+  there belong to the build-time UID and GID. Files outside the current
+  directory are not visible.
+- `--web` adds `--network host` so your browser can reach the dashboard.
+- `METAGROSS_IMAGE` selects another image tag, for example
+  `METAGROSS_IMAGE=metagross-pytorch:cu128 metagross run.py`.
+- `--output` and `--summary-output` refuse a directory that other users or
+  your group can write to. If your umask leaves project directories
+  group-writable, write traces to a private subdirectory made with
+  `mkdir -m 700 traces`.
+
+The sections below use the full `docker run` form and explain each flag.
+
 ## Available workloads
 
 All workloads use seeded synthetic inputs and core PyTorch; no datasets, model
