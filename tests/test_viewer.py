@@ -216,9 +216,8 @@ class ViewerModelTest(unittest.TestCase):
 class IngestBoundaryTest(unittest.TestCase):
     def test_deeply_nested_json_is_malformed_not_fatal(self):
         model = _viewer.TraceModel()
-        # Reuse the exact nesting depth the evidence file recorded as fatal
-        # (docs/audits/2026-09-05-launch-evidence.md ~line 242). Exceed the
-        # interpreter limit generously so the bomb is deterministic.
+        # Nesting past the recursion limit used to crash the viewer. Exceed
+        # the interpreter limit generously so the bomb is deterministic.
         depth = sys.getrecursionlimit() * 2
         raw = (b"[" * depth) + (b"]" * depth)
         self.assertFalse(_viewer.observe_raw_line(model, raw))

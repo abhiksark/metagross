@@ -12,3 +12,8 @@ traces/
 
 # SDD workspace
 .superpowers/
+
+# Planning notes and audit evidence stay local; only reference and agent guides ship.
+/docs/plans/
+/docs/audits/
+/docs/superpowers/
