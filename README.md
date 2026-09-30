@@ -51,78 +51,71 @@ To try the dashboard without root, BCC, CUDA, or a GPU, open the
 | [Terminal viewers](docs/reference.md#viewer-option-reference) | Prints a static dashboard with `view --snapshot` or follows a growing JSONL file with `view --follow`. Both run without root, BCC, CUDA, or a GPU. |
 | [Durable output](docs/reference.md#output) | Writes table rows to stderr by default, stable JSONL with `--json --output`, a versioned summary with `--summary-output`, and a one-line capture report with `--stats`. |
 | [Completeness checks](docs/reference.md#viewer-status-reference) | Tracks lost events, dropped nested calls, and lost profile records, and shows `COMPLETE` only when the final summary reports the capture complete and matches the events received. CUDA error counts are reported but do not affect completeness. |
-| [Target preservation](docs/reference.md#privilege-and-trust-boundary) | Runs one script as the sudo caller (or as root, with a warning, when started directly as root), with its arguments and stdout unchanged and its exit status passed through; a signal becomes `128 + signal number`. |
+| [Target preservation](docs/reference.md#privilege-and-trust-boundary) | Runs one script as the image's unprivileged account, with its arguments and stdout unchanged and its exit status passed through; a signal becomes `128 + signal number`. |
 
 ## Requirements
 
-Live tracing needs:
+Run Metagross through its Docker image. The image bundles Metagross, the BCC
+bindings, and PyTorch, so the host needs only:
 
 - x86-64 Linux with kernel 5.8 or later, BPF enabled, and headers for the
-  running kernel.
-- An NVIDIA GPU and driver.
-- Root through `sudo`.
-- The system Python 3.10 or later (`/usr/bin/python3`) with the distribution's
-  BCC bindings. Your script runs under this interpreter, so it must be able to
-  import your script's dependencies.
-
-On Ubuntu:
-
-```sh
-git clone https://github.com/abhiksark/metagross.git
-cd metagross
-sudo apt install python3-bpfcc "linux-headers-$(uname -r)"
-```
-
-For other distributions, see the
-[BCC installation guide](https://github.com/iovisor/bcc/blob/master/INSTALL.md).
-The viewers and both `--help` commands run without root, BCC, CUDA, or a GPU.
+  running kernel (on Ubuntu, `sudo apt install "linux-headers-$(uname -r)"`).
+- An NVIDIA GPU with a driver that supports CUDA 12.4. RTX 50-series and other
+  Blackwell GPUs need the CUDA 12.8 build described in the
+  [Docker guide](examples/docker/README.md#build).
+- Docker with the NVIDIA Container Toolkit, and permission to run privileged
+  containers.
+- Python 3.10 or later on the host for the dashboard, which uses only the
+  standard library.
 
 <a id="quick-start"></a>
 ## Quick start
 
-Metagross runs from source, so run every command below from the repository root.
+Run every command below from the repository root.
 
-### 1. Trace the included demo
-
-```sh
-sudo /usr/bin/python3 -m metagross examples/gpu_demo.py
-```
-
-Metagross writes one table row per traced call to stderr; the demo's own output
-stays on stdout. Rows have this shape (timings vary):
-
-```text
-TIME        FUNCTION          LOCATION            API             RET  DURATION DETAILS
-12:10:03.41 compute           gpu_demo.py:86      LaunchKernel    0    0.05ms   kernel=vec_add grid=8,1,1 block=128,1,1 shared=0 stream=0x0
-```
-
-### 2. Trace your own script
+### 1. Build the image
 
 ```sh
-PROJECT_ROOT="/absolute/path/to/your/project"
-WORKLOAD="$PROJECT_ROOT/path/to/workload.py"
-sudo /usr/bin/python3 -B -m metagross --project-root "$PROJECT_ROOT" "$WORKLOAD"
+git clone https://github.com/abhiksark/metagross.git
+cd metagross
+docker build \
+  --build-arg TARGET_UID="$(id -u)" \
+  --build-arg TARGET_GID="$(id -g)" \
+  -f examples/docker/Dockerfile \
+  -t metagross-pytorch .
 ```
 
-- Set `PROJECT_ROOT` to your project's absolute path; only functions under it
-  are attributed.
-- Set `WORKLOAD` to a regular `.py` file inside that root.
-- Place Metagross options before `"$WORKLOAD"` and script arguments after it;
-  the arguments reach your script unchanged.
+The build arguments make the traced script run as your UID and GID, so the
+trace files it writes belong to you.
 
-See the [complete CLI and interpreter contract](docs/reference.md#usage) and the
-[prepared-container route](examples/docker/README.md).
+### 2. Trace the included workload
 
-### 3. Watch it live in the browser
+```sh
+docker run --rm \
+  --gpus all \
+  --privileged \
+  --pid=host \
+  -v /lib/modules:/lib/modules:ro \
+  -v /usr/src:/usr/src:ro \
+  -v /sys/kernel/debug:/sys/kernel/debug \
+  -v /sys/kernel/tracing:/sys/kernel/tracing \
+  metagross-pytorch
+```
 
-The tracer writes the capture to a file, and the dashboard follows that file.
-Use two terminals. `traces/` is ignored by Git.
+Metagross prints one table row per traced CUDA call to stderr, and the
+workload's checksum goes to stdout. The [Docker guide](examples/docker/README.md)
+explains each flag and lists five more workloads.
+
+### 3. Trace your own script in the browser
+
+The tracer writes the capture into `traces/`, and the dashboard on the host
+follows those files. `traces/` is ignored by Git. Use two terminals.
 
 1. **Terminal one: start the dashboard.**
 
    ```sh
-   mkdir -p traces
-   /usr/bin/python3 -m metagross view --web \
+   mkdir -p -m 700 traces
+   python3 -m metagross view --web \
      --summary traces/live-summary.json traces/live.jsonl
    ```
 
@@ -131,20 +124,40 @@ Use two terminals. `traces/` is ignored by Git.
    trusted internal network, see the
    [viewer access options](docs/reference.md#visual-trace-viewer).
 
-2. **Terminal two: run the tracer.**
+2. **Terminal two: run your script in the container.**
 
    ```sh
    PROJECT_ROOT="/absolute/path/to/your/project"
-   WORKLOAD="$PROJECT_ROOT/path/to/workload.py"
-   sudo /usr/bin/python3 -B -m metagross --json \
-     --output traces/live.jsonl --summary-output traces/live-summary.json \
-     --project-root "$PROJECT_ROOT" "$WORKLOAD"
+   docker run --rm \
+     --gpus all \
+     --privileged \
+     --pid=host \
+     -v /lib/modules:/lib/modules:ro \
+     -v /usr/src:/usr/src:ro \
+     -v /sys/kernel/debug:/sys/kernel/debug \
+     -v /sys/kernel/tracing:/sys/kernel/tracing \
+     -v "$PWD/traces:/traces" \
+     -v "$PROJECT_ROOT:/workspace/project:ro" \
+     metagross-pytorch \
+     --json --output /traces/live.jsonl \
+     --summary-output /traces/live-summary.json \
+     --project-root /workspace/project \
+     /workspace/project/path/to/workload.py
    ```
 
-Rerunning the tracer overwrites both files, and the open page starts over with
-the new run. Stop the dashboard with Ctrl-C. The files stay in `traces/`, so you
-can reopen them later with `view --web` or `view --snapshot`. They contain
-source paths and function names; delete them when you no longer need them.
+   - Only functions under `--project-root` are attributed; the script must be a
+     regular `.py` file inside it.
+   - Put Metagross options before the script path and script arguments after it;
+     the arguments reach your script unchanged.
+   - Your script can import only what the image provides: PyTorch and NumPy.
+     Add other packages to [`examples/docker/Dockerfile`](examples/docker/Dockerfile)
+     and rebuild.
+
+Rerunning the container overwrites both files, and the open page starts over
+with the new run. Stop the dashboard with Ctrl-C. The files stay in `traces/`,
+so you can reopen them later with `view --web` or `view --snapshot`. They
+contain source paths and function names; delete them when you no longer need
+them.
 
 ## Read the dashboard
 
@@ -187,15 +200,15 @@ See [op spans](docs/reference.md#op-spans) and the annotated
 
 ## Other ways to start
 
-- [Prepared Docker workload, alternate workloads, and benchmarks](examples/docker/README.md).
+- [Five more PyTorch workloads, correctness tests, and an overhead benchmark](examples/docker/README.md).
 - [Terminal snapshot and follow viewers](docs/reference.md#viewer-option-reference)
   for saved JSONL captures.
 
-Usage help runs without root, BCC, CUDA, or a GPU:
+Usage help runs on the host without Docker, root, BCC, CUDA, or a GPU:
 
 ```sh
-/usr/bin/python3 -m metagross --help
-/usr/bin/python3 -m metagross view --help
+python3 -m metagross --help
+python3 -m metagross view --help
 ```
 
 ## Limits
@@ -210,9 +223,11 @@ Usage help runs without root, BCC, CUDA, or a GPU:
   them, and VMM and expandable-segment allocations are outside the traced API set.
 - Profiling adds overhead. High call rates and nested driver re-entry can lose
   events, so check warnings and the final summary.
-- Metagross loads its probes as root, then runs your script as your own user
-  when started through `sudo`, or as root with a warning otherwise. It is for trusted local workloads and is not a sandbox or a production
-  monitor. Keep captures and the private viewer URL private.
+- The container runs privileged and shares the host PID namespace. Metagross
+  loads its probes as root inside it, then runs your script as the image's
+  unprivileged account. Use it only with trusted local code; it is not a
+  sandbox or a production monitor. Keep captures and the private viewer URL
+  private.
 
 See the [full limits](docs/reference.md#overhead-and-limits) and the
 [privilege and trust boundary](docs/reference.md#privilege-and-trust-boundary).

@@ -17,7 +17,10 @@ cd metagross
 Use Python 3.10 or newer. Ordinary inspection and unit tests need only the
 standard library, with no root, BCC, CUDA, or GPU. Optional Node.js tests exercise
 the browser bootstrap when Node.js is present; it is not a runtime dependency.
-Live tracing setup is in the [quick start](README.md#quick-start).
+Users run Metagross through Docker; see the [quick start](README.md#quick-start).
+The privileged live test gate below runs on the host instead and needs the
+system Python with BCC bindings and headers for the running kernel. On Ubuntu:
+`sudo apt install python3-bpfcc "linux-headers-$(uname -r)"`.
 
 ## Changes and pull requests
 
