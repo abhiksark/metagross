@@ -21,11 +21,12 @@ their host-side elapsed time, not GPU kernel execution time or utilization.
 This is an experimental, source-only public preview for tracing one trusted
 Python workload on your own machine.
 
-<img src="assets/dashboard-demo.webp" alt="Metagross web dashboard filling with CUDA driver calls from a PyTorch pipeline, grouped by Python function, then showing one cuBLAS launch's details and the summary panels" width="1000">
+<img src="assets/dashboard-demo.webp" alt="A terminal runs metagross --web run.py and streams CUDA driver calls, each labeled with its Python function; the web dashboard then fills with those calls grouped by function, shows one cuBLAS launch's details and the summary panels, and the video ends on the metagross run.py command" width="1000">
 
-*Recorded trace of a PyTorch pipeline (537 CUDA driver calls) streamed into the
-web dashboard at about 1.3× its original pace. Calls that cannot be safely tied
-to a project function show as `<unknown>`.*
+*The command traces the PyTorch pipeline example; the terminal shows a shortened
+stream of its trace rows. The dashboard section is a recorded trace of the same
+pipeline (537 CUDA driver calls) replayed at about 1.3× its original pace. Calls
+that cannot be safely tied to a project function show as `<unknown>`.*
 
 To try the dashboard without root, BCC, CUDA, or a GPU, open the
 [sample capture](examples/captures/README.md).
