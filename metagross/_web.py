@@ -2237,11 +2237,13 @@ def run_web_dashboard(
     *,
     ingest_token: str | None = None,
     host: str = _DEFAULT_HOST,
+    on_ready=None,
 ) -> int:
     """Serve a file-backed or ingest-backed dashboard.
 
     The server binds loopback unless host opts in to a LAN address. Capture
-    ingest stays loopback-only either way.
+    ingest stays loopback-only either way. `on_ready`, when given, receives
+    the bound port once the socket is listening and the URL is printed.
     """
     if trace is None:
         if ingest_token is None:
@@ -2286,6 +2288,8 @@ def run_web_dashboard(
             file=sys.stderr,
         )
     try:
+        if on_ready is not None:
+            on_ready(server.server_port)
         server.serve_forever(poll_interval=min(0.2, refresh_seconds))
     except KeyboardInterrupt:
         return 130

@@ -18,7 +18,8 @@ The tracing interface is:
 sudo /usr/bin/python3 -m metagross \
   [--json] [--output FILE] [--stats] [--summary-output FILE] \
   [--project-root DIR] [--trace FAMILIES] [--no-attribution] \
-  [--dashboard-port PORT] script.py [script arguments...]
+  [--dashboard-port PORT | --web [--web-port PORT]] \
+  script.py [script arguments...]
 ```
 
 Metagross options must appear before the script. Everything after the script is
@@ -36,8 +37,10 @@ BCC, CUDA, or a target script. Help flags after the script go to the target.
 | `--project-root DIR` | Current directory; project attribution and target validation boundary. |
 | `--trace FAMILIES` | `all`; comma-separated `launch`, `memory`, `copy`, `sync`. |
 | `--no-attribution` | Off; disable the Python profile hook. |
-| `--dashboard-port PORT` | Disabled; integer 1 to 65,535 for direct loopback delivery. |
-| `--ebpf` | Print generated C without tracing; accepts `--trace`, rejects `--dashboard-port`. |
+| `--dashboard-port PORT` | Disabled; integer 1 to 65,535 for direct loopback delivery to a separately started receiver. |
+| `--web` | Off; start a [built-in dashboard](#built-in-web-dashboard) for this capture. Rejects `--dashboard-port`. |
+| `--web-port PORT` | 8765; built-in dashboard port, 0 to 65,535, where zero selects a free port. Requires `--web`. |
+| `--ebpf` | Print generated C without tracing; accepts `--trace`, rejects `--dashboard-port` and `--web`. |
 | `-h`, `--help` | Print usage without a target or privileged dependencies. |
 
 `--trace all` cannot be combined with another family. Empty or unknown families
@@ -429,11 +432,42 @@ Target exit statuses from 0 through 255 are preserved. A target signal returns
 dependency, privilege, probe, compile, attach, transport, or cleanup
 failures, and 2 for invalid command-line syntax. A broken trace output stops
 rendering but lets the target finish and preserves its status.
+With `--web`, Metagross keeps serving the finished capture after the target
+exits and returns the target's status once Ctrl-C or SIGTERM stops the
+dashboard, so a non-interactive run blocks until it is signalled. A dashboard
+that cannot start returns 1 before the target is forked.
 For direct dashboard delivery, a failed startup handshake returns 1 without
 executing the target. A delivery failure after the startup barrier has released
 only warns and marks the in-memory capture incomplete; the target continues and
 its status remains authoritative.
 
+
+## Built-in web dashboard
+
+`--web` streams the capture to a browser dashboard that Metagross starts
+itself, with no trace file and no token to handle. It is a tracer option;
+`view --web` is the separate viewer for saved JSONL files.
+
+```sh
+sudo /usr/bin/python3 -m metagross --web examples/gpu_demo.py
+```
+
+Before loading probes or forking the target, the controller starts the
+in-memory receiver as the same unprivileged account the target runs as, in its
+own session, bound to `127.0.0.1` on `--web-port` (8765 by default). It prints
+the private viewer URL to standard error. The controller generates the producer
+token and passes it to the receiver through an inherited pipe; the token never
+appears in an environment variable, the command line, or the terminal. Terminal
+Ctrl-C reaches the target, not the dashboard, and the dashboard exits if the
+controller dies.
+
+After the target exits, the dashboard keeps serving until Ctrl-C or SIGTERM,
+then Metagross returns the target's exit status. SIGTERM before the target
+exits, for example `docker stop` during a run, ends Metagross immediately
+without a final summary; use Ctrl-C to stop the target and finish the capture. Add `--output` or
+`--summary-output` when a durable copy is also required. In Docker, run the
+container with `--network host` so `127.0.0.1` is the host's loopback; see the
+[Docker guide](../examples/docker/README.md).
 
 ## Advanced direct delivery
 

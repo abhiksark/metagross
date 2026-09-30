@@ -112,20 +112,10 @@ The elevated flags are important:
   clean up uprobe events. Omitting them can produce a successful trace followed
   by a cleanup failure.
 
-## Stream directly to the host browser dashboard
+## Watch the capture in the browser dashboard
 
-This path sends normalized events directly to a loopback-only dashboard without
-creating a JSONL or summary file. Rebuild the image after source changes, then
-generate one token and start the receiver in the host terminal:
-
-```sh
-export METAGROSS_DASHBOARD_TOKEN="$(/usr/bin/python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
-printf 'Copy this token into the Docker terminal: %s\n' "$METAGROSS_DASHBOARD_TOKEN"
-/usr/bin/python3 -B -m metagross view --web --receive --port 8765
-```
-
-Export the copied value as `METAGROSS_DASHBOARD_TOKEN` in the Docker terminal,
-then run:
+Add `--network host` and `--web`. Metagross starts the dashboard inside the
+container as the unprivileged target account and prints a private URL:
 
 ```sh
 docker run --rm \
@@ -133,36 +123,36 @@ docker run --rm \
   --privileged \
   --pid=host \
   --network host \
-  -e METAGROSS_DASHBOARD_TOKEN \
   -v /lib/modules:/lib/modules:ro \
   -v /usr/src:/usr/src:ro \
   -v /sys/kernel/debug:/sys/kernel/debug \
   -v /sys/kernel/tracing:/sys/kernel/tracing \
   metagross-pytorch \
-  --dashboard-port 8765 \
+  --web \
   --project-root /workspace/workloads \
   /workspace/workloads/basic_tensor_ops.py
 ```
 
-Do not mount `/traces` and do not pass `--output` or `--summary-output` for the
-fileless workflow. Open the printed host URL: it moves from `WAITING` to `LIVE`
-and then to a final status while the target checksum remains on container
-stdout.
+Open the printed `http://127.0.0.1:8765/#viewer_token=…` URL on the host. It
+moves from `WAITING` to `LIVE` and then to a final status while the target
+checksum remains on container stdout. After the workload exits, the dashboard
+keeps the capture until you press Ctrl-C or stop the container; the container
+then exits with the workload's status. Use `--web-port PORT` when port 8765 is
+taken.
 
-`--network host` is required because the privileged producer connects only to
-numeric `127.0.0.1`; it removes Docker network isolation. `--pid=host` remains
-separately required so the PID filtered by Metagross matches the TGID observed
-by host eBPF. Use these privileges and host namespaces only with trusted local
-code. The shared token is removed before the target script runs and is not
-available to browser JavaScript.
+`--network host` makes the dashboard's `127.0.0.1` the host's loopback and
+removes Docker's network isolation. `--pid=host` remains separately required so
+the PID filtered by Metagross matches the TGID observed by host eBPF. Use these
+privileges and host namespaces only with trusted local code. The producer token
+is generated inside the container and is never printed, placed in the
+environment, or sent to the browser.
 
-Receiver state exists only in memory and is lost when the host dashboard stops.
-A new authorized container run replaces the retained capture rather than
-merging with it. Use the existing `--output` and `--summary-output` options, plus
-a host volume, when durable JSONL and summary files are required. Missing,
-wrong-token, or unreachable receivers fail the handshake before target
-execution. Losing the receiver after startup emits one controller warning,
-marks delivery incomplete, and preserves target stdout, stderr, and exit status.
+The capture is kept in memory only. Add `--output` and `--summary-output` with a
+host volume, as in [Write JSONL to the host](#write-jsonl-to-the-host), when
+durable files are also required. A dashboard that cannot start, for example
+because its port is taken, fails before the workload runs. For the lower-level
+two-terminal receiver, see
+[Advanced direct delivery](../../docs/reference.md#advanced-direct-delivery).
 
 ## Run another workload
 
@@ -350,11 +340,10 @@ capture was incomplete.
   included.
 - `libcuda.so.1 not found`: verify the container is launched with NVIDIA GPU
   passthrough; the NVIDIA runtime supplies the host driver library.
-- Direct delivery returns HTTP 401 or fails before the workload starts: export
-  the same `METAGROSS_DASHBOARD_TOKEN` in both terminals and start the receiver
-  before the container.
-- Direct delivery cannot connect: include `--network host`, keep the receiver
-  port and `--dashboard-port` equal, and verify the host port is unused.
+- `cannot start the web dashboard`: another process holds the port; pass
+  `--web-port` with a free port.
+- The dashboard URL does not load: include `--network host` and open the URL on
+  the machine running the container.
 
 Docker Desktop on macOS and Windows does not expose a native NVIDIA Linux driver
 and host eBPF environment suitable for this example.

@@ -13,6 +13,10 @@ predictable, and diagnosable. Favor a boring core over clever tracing magic.
 - `metagross/_target.py` is the private runner entered by exec after the attach
   barrier. It installs profiling and runs the target with normal interpreter
   finalization, including non-daemon thread joins and `atexit` handlers.
+- `metagross/_dashboard.py` is the private runner for `--web`. The controller
+  execs it as the target's account in a new session; it arms a parent-death
+  signal, reads the producer token from an inherited pipe, and serves the
+  in-memory receiver on `127.0.0.1`.
 - `metagross/_bpf.py` owns CUDA API definitions, libcuda discovery, symbol
   resolution, eBPF C generation, BCC loading, probe attachment, and raw structs.
 - `metagross/_profile.py` owns the child-process Python profiler and binary
@@ -112,8 +116,16 @@ predictable, and diagnosable. Favor a boring core over clever tracing magic.
   `--host`: reject non-loopback clients and keep the strict loopback Host check
   for ingest. `--receive` accepts only `--host 127.0.0.1` or `0.0.0.0`, because
   the producer connects only to `127.0.0.1`.
-- `--dashboard-port` is the only producer opt-in. A token in the environment
-  alone must not enable network activity.
+- `--dashboard-port` and `--web` are the only producer opt-ins. A token in the
+  environment alone must not enable network activity.
+- `--web` starts its receiver before BPF compilation and the target fork, with
+  the target's credentials applied by `subprocess.Popen` (groups, gid, then
+  uid), in a new session, with stdout on `/dev/null`. The controller generates
+  the producer token and passes it only through an inherited pipe: never the
+  environment, argv, or the terminal. The runner arms `PR_SET_PDEATHSIG` after
+  the credential drop and exits if the controller is already gone. Stop the
+  receiver on every controller exit path; after a traced run, keep serving
+  until Ctrl-C or SIGTERM and return the target's status.
 - The privileged producer may connect only to numeric IPv4 `127.0.0.1` at the
   validated port with `http.client`; do not add DNS, proxy, redirect,
   non-loopback, or browser-token paths.

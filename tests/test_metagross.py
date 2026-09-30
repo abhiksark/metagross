@@ -315,6 +315,26 @@ class ParseArgsTest(unittest.TestCase):
             ):
                 parse_args(argv)
 
+    def test_web_options_and_target_argument_boundary(self) -> None:
+        cfg = parse_args(["--web", "--web-port", "0", "script.py", "--web"])
+        self.assertTrue(cfg.web)
+        self.assertEqual(cfg.web_port, 0)
+        self.assertEqual(cfg.script_args, ["--web"])
+        self.assertIsNone(parse_args(["--web", "script.py"]).web_port)
+
+    def test_web_rejects_invalid_combinations(self) -> None:
+        for argv, message in (
+            (["--web-port", "8000", "script.py"], "requires --web"),
+            (["--web", "--dashboard-port", "8765", "script.py"], "cannot be combined"),
+            (["--dashboard-port", "8765", "--web", "script.py"], "cannot be combined"),
+            (["--web", "--ebpf"], "cannot be combined"),
+            (["--ebpf", "--web"], "cannot be combined"),
+            (["--web", "--web-port", "65536", "script.py"], "between 0 and 65535"),
+            (["--web", "--web-port", "port", "script.py"], "integer"),
+        ):
+            with self.subTest(argv=argv), self.assertRaisesRegex(UsageError, message):
+                parse_args(argv)
+
     def test_trace_all_uses_default_selection(self) -> None:
         cfg = parse_args(["--trace", "all", "script.py"])
         self.assertIsNone(cfg.trace_families)
@@ -328,7 +348,7 @@ class ParseArgsTest(unittest.TestCase):
             parse_args(["--trace", ",", "script.py"])
 
     def test_value_options_require_values(self) -> None:
-        for option in ("--trace", "--summary-output", "--dashboard-port"):
+        for option in ("--trace", "--summary-output", "--dashboard-port", "--web-port"):
             with self.subTest(option=option):
                 with self.assertRaisesRegex(UsageError, "requires a value"):
                     parse_args([option])
@@ -2628,6 +2648,152 @@ class MainRoutingTest(unittest.TestCase):
             rc = metagross.main(["examples/gpu_demo.py"])
         self.assertEqual(rc, 1)
         self.assertIn("root", err.getvalue())
+
+
+class PrivateDashboardTest(unittest.TestCase):
+    """`--web` starts the in-memory dashboard itself; the token stays internal."""
+
+    REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _quiet_stderr_fd():
+        # The runner inherits fd 2 and prints its URL there; keep test output clean.
+        saved = os.dup(2)
+        with open(os.devnull, "w") as devnull:
+            os.dup2(devnull.fileno(), 2)
+        try:
+            yield
+        finally:
+            os.dup2(saved, 2)
+            os.close(saved)
+
+    def _start(self, port=0):
+        with self._quiet_stderr_fd():
+            dashboard = metagross._start_private_dashboard(None, port)
+        self.addCleanup(metagross._stop_dashboard, dashboard)
+        return dashboard
+
+    @staticmethod
+    def _alive(pid):
+        try:
+            with open(f"/proc/{pid}/status") as status:
+                return "State:\tZ" not in status.read()
+        except FileNotFoundError:
+            return False
+
+    def test_receives_a_capture_with_the_internal_token(self):
+        dashboard = self._start()
+        publisher = _publish.DashboardPublisher(
+            dashboard.port, dashboard.token, "workload.py"
+        )
+        self.addCleanup(publisher.close)
+        publisher.start()
+        publisher.offer(DashboardPublisherTest._record())
+        result = publisher.finish(DashboardPublisherTest._summary(1))
+        self.assertIsNone(result.error)
+        self.assertEqual(result.dropped_events, 0)
+
+    def test_rejects_any_other_token(self):
+        dashboard = self._start()
+        publisher = _publish.DashboardPublisher(
+            dashboard.port, "other-token-" + ("y" * 32), "workload.py"
+        )
+        self.addCleanup(publisher.close)
+        with self.assertRaisesRegex(_publish.DashboardPublishError, "HTTP 401"):
+            publisher.start()
+
+    def test_token_stays_out_of_environment_and_argv(self):
+        inherited = "inherited-" + ("t" * 32)
+        with mock.patch.dict(os.environ, {"METAGROSS_DASHBOARD_TOKEN": inherited}):
+            dashboard = self._start()
+        pid = dashboard.process.pid
+        with open(f"/proc/{pid}/environ", "rb") as environ_file:
+            environ = environ_file.read()
+        with open(f"/proc/{pid}/cmdline", "rb") as cmdline_file:
+            cmdline = cmdline_file.read()
+        for secret in (dashboard.token, inherited):
+            self.assertNotIn(secret.encode(), environ)
+            self.assertNotIn(secret.encode(), cmdline)
+
+    def test_runs_in_its_own_session_away_from_terminal_ctrl_c(self):
+        dashboard = self._start()
+        self.assertEqual(os.getsid(dashboard.process.pid), dashboard.process.pid)
+
+    def test_dies_with_the_controller(self):
+        helper = subprocess.Popen(
+            [sys.executable, "-B", "-c",
+             "import metagross, time; "
+             "d = metagross._start_private_dashboard(None, 0); "
+             "print(d.process.pid, flush=True); time.sleep(30)"],
+            cwd=self.REPO, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        )
+        self.addCleanup(helper.stdout.close)
+        pid = int(helper.stdout.readline())
+        helper.kill()
+        helper.wait()
+        deadline = time.monotonic() + 5
+        while self._alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertFalse(self._alive(pid))
+
+    def test_busy_port_fails_and_reaps_the_runner(self):
+        with socket.socket() as busy:
+            busy.bind(("127.0.0.1", 0))
+            busy.listen()
+            with mock.patch("metagross._stop_process",
+                            wraps=metagross._stop_process) as stop, \
+                    self._quiet_stderr_fd(), \
+                    self.assertRaisesRegex(MetagrossError, "cannot start the web dashboard"):
+                metagross._start_private_dashboard(None, busy.getsockname()[1])
+        self.assertIsNotNone(stop.call_args.args[0].returncode)
+
+    def test_serve_until_stopped_ends_on_interrupt_and_restores_sigterm(self):
+        import signal as signal_module
+
+        before = signal_module.getsignal(signal_module.SIGTERM)
+        process = mock.Mock(wait=mock.Mock(side_effect=KeyboardInterrupt))
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            metagross._serve_until_stopped(metagross._Dashboard(process, 1, "t"))
+        self.assertIn("Press Ctrl-C", err.getvalue())
+        self.assertIs(signal_module.getsignal(signal_module.SIGTERM), before)
+
+    def _run_live_web(self, trace_effect, cfg=None):
+        cfg = cfg or Config(script=__file__, project_root=os.path.dirname(__file__),
+                            web=True)
+        fake = metagross._Dashboard(mock.Mock(), 1, "t" * 43)
+        with mock.patch("metagross.os.geteuid", return_value=0), \
+                mock.patch("metagross.validate_sudo", return_value=None), \
+                mock.patch("metagross._start_private_dashboard",
+                           return_value=fake) as start, \
+                mock.patch("metagross._trace", side_effect=trace_effect) as trace, \
+                mock.patch("metagross._serve_until_stopped") as serve, \
+                mock.patch("metagross._stop_dashboard") as stop, \
+                contextlib.redirect_stderr(io.StringIO()):
+            try:
+                result = metagross.run_live(cfg)
+            except MetagrossError as exc:
+                result = exc
+        return result, fake, start, trace, serve, stop
+
+    def test_run_live_serves_then_returns_the_target_status(self):
+        result, fake, start, trace, serve, stop = self._run_live_web([3])
+        self.assertEqual(result, 3)
+        start.assert_called_once_with(None, 8765)
+        self.assertEqual(trace.call_args.args[4:], (1, "t" * 43))
+        serve.assert_called_once_with(fake)
+        stop.assert_called_once_with(fake)
+
+    def test_run_live_stops_the_dashboard_when_tracing_fails(self):
+        result, fake, start, _, serve, stop = self._run_live_web(
+            MetagrossError("attach failed"),
+            Config(script=__file__, project_root=os.path.dirname(__file__),
+                   web=True, web_port=0),
+        )
+        self.assertIsInstance(result, MetagrossError)
+        start.assert_called_once_with(None, 0)
+        serve.assert_not_called()
+        stop.assert_called_once_with(fake)
 
 
 class RunLiveInitFailureTest(unittest.TestCase):

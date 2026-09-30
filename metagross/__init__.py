@@ -11,6 +11,7 @@ import io
 import json
 import os
 import pwd
+import select
 import signal
 import stat
 import subprocess
@@ -58,6 +59,8 @@ class Config:
     python_attribution: bool = True
     trace_families: frozenset[str] | None = None
     dashboard_port: int | None = None
+    web: bool = False
+    web_port: int | None = None
     script: str | None = None
     script_args: list[str] = dataclasses.field(default_factory=list)
 
@@ -71,13 +74,16 @@ class Credentials:
 
 
 _FINAL_DRAIN_TIMEOUT_S = 2.0
+_DASHBOARD_READY_TIMEOUT_S = 5.0
+_DEFAULT_WEB_PORT = 8765
 _TRACE_FAMILIES = frozenset(("launch", "memory", "copy", "sync"))
 
 _USAGE = (
     "usage: sudo /usr/bin/python3 -m metagross [--json] [--output FILE]\n"
     "           [--stats] [--summary-output FILE] [--project-root DIR]\n"
     "           [--trace FAMILIES] [--no-attribution]\n"
-    "           [--dashboard-port PORT] script.py [script arguments...]\n"
+    "           [--dashboard-port PORT | --web [--web-port PORT]]\n"
+    "           script.py [script arguments...]\n"
     "       /usr/bin/python3 -m metagross [--trace FAMILIES] --ebpf\n"
     "       /usr/bin/python3 -m metagross view (--snapshot|--follow|--web) TRACE.jsonl\n"
     "       /usr/bin/python3 -m metagross view --web --receive [--port PORT]\n"
@@ -102,6 +108,16 @@ def _parse_trace_families(value: str) -> frozenset[str] | None:
         )
     return selected
 
+def _parse_web_port(value: str) -> int:
+    try:
+        port = int(value)
+    except ValueError:
+        raise UsageError("--web-port must be an integer") from None
+    if not 0 <= port <= 65_535:
+        raise UsageError("--web-port must be between 0 and 65535")
+    return port
+
+
 def _parse_dashboard_port(value: str) -> int:
     try:
         port = int(value)
@@ -123,6 +139,7 @@ def parse_args(argv: list[str]) -> Config:
         if not arg.startswith("--"):
             cfg.script = arg
             cfg.script_args = list(argv[i + 1 :])
+            _check_web_options(cfg)
             return cfg
         if arg == "--json":
             cfg.json_output = True
@@ -134,12 +151,15 @@ def parse_args(argv: list[str]) -> Config:
             cfg.show_stats = True
         elif arg == "--no-attribution":
             cfg.python_attribution = False
+        elif arg == "--web":
+            cfg.web = True
         elif arg in (
             "--output",
             "--summary-output",
             "--project-root",
             "--trace",
             "--dashboard-port",
+            "--web-port",
         ):
             if i + 1 >= len(argv):
                 raise UsageError(f"{arg} requires a value")
@@ -153,6 +173,8 @@ def parse_args(argv: list[str]) -> Config:
                 cfg.project_root = value
             elif arg == "--trace":
                 cfg.trace_families = _parse_trace_families(value)
+            elif arg == "--web-port":
+                cfg.web_port = _parse_web_port(value)
             else:
                 if cfg.dump_ebpf:
                     raise UsageError(
@@ -162,9 +184,19 @@ def parse_args(argv: list[str]) -> Config:
         else:
             raise UsageError(f"unknown option: {arg}")
         i += 1
+    _check_web_options(cfg)
     if cfg.dump_ebpf:
         return cfg
     raise UsageError("missing target script")
+
+
+def _check_web_options(cfg: Config) -> None:
+    if cfg.web_port is not None and not cfg.web:
+        raise UsageError("--web-port requires --web")
+    if cfg.web and cfg.dashboard_port is not None:
+        raise UsageError("--web cannot be combined with --dashboard-port")
+    if cfg.web and cfg.dump_ebpf:
+        raise UsageError("--web cannot be combined with --ebpf")
 
 
 def validate_sudo(environ, invoker_lookup) -> Credentials | None:
@@ -388,11 +420,137 @@ def _child_main(
     ])
 
 
+@dataclasses.dataclass(frozen=True)
+class _Dashboard:
+    process: subprocess.Popen
+    port: int
+    token: str
+
+
+def _start_private_dashboard(creds, port: int) -> _Dashboard:
+    """Start the in-memory dashboard as the target user and wait until it listens.
+
+    The producer token is generated here and crosses to the runner only
+    through an inherited pipe: never the environment, argv, or the terminal.
+    """
+    import secrets
+
+    token = secrets.token_urlsafe(32)
+    token_r, token_w = os.pipe()
+    ready_r, ready_w = os.pipe()
+    package_root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    bootstrap = (
+        f"import sys; sys.path.insert(0, {package_root!r}); "
+        "from metagross._dashboard import main; del sys.path[0]; "
+        "sys.exit(main(sys.argv[1:]))"
+    )
+    env = {k: v for k, v in os.environ.items() if k != "METAGROSS_DASHBOARD_TOKEN"}
+    drop = {}
+    if creds is not None:
+        env.update(HOME=creds.home, USER=creds.user, LOGNAME=creds.user)
+        drop = dict(
+            user=creds.uid,
+            group=creds.gid,
+            extra_groups=os.getgrouplist(creds.user, creds.gid),
+        )
+    try:
+        # A new session keeps terminal Ctrl-C (meant for the target) away from
+        # the dashboard; stdout is target-owned, so the runner gets /dev/null.
+        process = subprocess.Popen(
+            [
+                sys.executable, *subprocess._args_from_interpreter_flags(),
+                "-c", bootstrap,
+                str(token_r), str(ready_w), str(port), str(os.getpid()),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            pass_fds=(token_r, ready_w),
+            cwd="/",
+            env=env,
+            start_new_session=True,
+            **drop,
+        )
+    except BaseException:
+        for fd in (token_w, ready_r):
+            os.close(fd)
+        raise
+    finally:
+        for fd in (token_r, ready_w):
+            os.close(fd)
+    dashboard = None
+    try:
+        with os.fdopen(token_w, "wb") as token_file:
+            token_file.write(token.encode("ascii"))
+        bound_port = _read_ready_port(ready_r, _DASHBOARD_READY_TIMEOUT_S)
+        if bound_port is not None:
+            dashboard = _Dashboard(process, bound_port, token)
+    except OSError:
+        pass
+    finally:
+        os.close(ready_r)
+        if dashboard is None:
+            _stop_process(process)
+    if dashboard is None:
+        raise MetagrossError("cannot start the web dashboard")
+    return dashboard
+
+
+def _read_ready_port(fd: int, timeout_s: float) -> int | None:
+    """Return the port line the runner writes once it listens, or None."""
+    data = b""
+    deadline = time.monotonic() + timeout_s
+    while not data.endswith(b"\n") and len(data) < 16:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
+            return None
+        chunk = os.read(fd, 16)
+        if not chunk:
+            return None
+        data += chunk
+    try:
+        return int(data)
+    except ValueError:
+        return None
+
+
+def _stop_process(process: subprocess.Popen) -> None:
+    if process.poll() is None:
+        process.terminate()
+    try:
+        process.wait(timeout=_DASHBOARD_READY_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+
+
+def _stop_dashboard(dashboard: _Dashboard) -> None:
+    _stop_process(dashboard.process)
+
+
+def _serve_until_stopped(dashboard: _Dashboard) -> None:
+    """Keep the finished capture viewable until Ctrl-C or SIGTERM."""
+    print(
+        "metagross: the target exited; the dashboard is still serving. "
+        "Press Ctrl-C to stop it.",
+        file=sys.stderr,
+    )
+
+    def _interrupt(_signum, _frame):
+        raise KeyboardInterrupt
+
+    previous = signal.signal(signal.SIGTERM, _interrupt)
+    try:
+        dashboard.process.wait()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
 def run_live(cfg: Config) -> int:
     # 1. Root check; validate sudo metadata, or warn and run as root.
     if os.geteuid() != 0:
         raise MetagrossError("must run as root (use sudo)")
-    publisher = None
     dashboard_token = None
     if cfg.dashboard_port is not None:
         from metagross import _publish
@@ -407,6 +565,24 @@ def run_live(cfg: Config) -> int:
         uid, gid = 0, 0
     else:
         uid, gid = creds.uid, creds.gid
+    if not cfg.web:
+        return _trace(cfg, creds, uid, gid, cfg.dashboard_port, dashboard_token)
+
+    # Start the dashboard before anything with side effects, so a busy port
+    # fails before output files are truncated or the target is forked.
+    port = _DEFAULT_WEB_PORT if cfg.web_port is None else cfg.web_port
+    dashboard = _start_private_dashboard(creds, port)
+    try:
+        status = _trace(cfg, creds, uid, gid, dashboard.port, dashboard.token)
+        _serve_until_stopped(dashboard)
+        return status
+    finally:
+        _stop_dashboard(dashboard)
+
+
+def _trace(cfg, creds, uid, gid, dashboard_port, dashboard_token) -> int:
+    """Attach probes, run the target, and return its exit status."""
+    publisher = None
 
     # 2. Validate the target, resolve libcuda, and load bcc (lazily, since
     # it is a privileged/optional dependency unneeded by unprivileged paths).
@@ -521,10 +697,12 @@ def run_live(cfg: Config) -> int:
             raise
         raise MetagrossError(f"failed to attach probes: {exc}") from exc
 
-    if cfg.dashboard_port is not None:
+    if dashboard_port is not None:
+        from metagross import _publish
+
         try:
             publisher = _publish.DashboardPublisher(
-                cfg.dashboard_port,
+                dashboard_port,
                 dashboard_token,
                 os.path.basename(script),
             )

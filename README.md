@@ -47,7 +47,7 @@ To try the dashboard without root, BCC, CUDA, or a GPU, open the
 | [Python attribution](docs/reference.md#how-attribution-works) | Assigns each call to the function under the project root that was active at API entry, skipping standard-library, installed-package, and Metagross frames. Calls with no safe project frame stay `<unknown>`; `--no-attribution` turns function attribution off. |
 | [Call details](docs/reference.md#traced-api-table) | Records the return code, CPU-side duration, and per-API arguments: launch grid, block, shared memory, and stream; byte counts; pointers; and resolved kernel names. |
 | [Named regions](docs/reference.md#op-spans) | Labels the calls made inside `with metagross.span("name"):` on the same thread, in table and JSONL output. Spans need function attribution and do nothing when the script runs outside a trace. |
-| [Live web dashboard](#read-the-dashboard) | Shows the capture in a browser as it runs: a function-grouped timeline with zoom, pan, and filters, an event table with a detail inspector, and API, function, kernel, and allocation summaries. |
+| [Live web dashboard](#read-the-dashboard) | Shows the capture in a browser as it runs, started with `--web`: a function-grouped timeline with zoom, pan, and filters, an event table with a detail inspector, and API, function, kernel, and allocation summaries. |
 | [Terminal viewers](docs/reference.md#viewer-option-reference) | Prints a static dashboard with `view --snapshot` or follows a growing JSONL file with `view --follow`. Both run without root, BCC, CUDA, or a GPU. |
 | [Durable output](docs/reference.md#output) | Writes table rows to stderr by default, stable JSONL with `--json --output`, a versioned summary with `--summary-output`, and a one-line capture report with `--stats`. |
 | [Completeness checks](docs/reference.md#viewer-status-reference) | Tracks lost events, dropped nested calls, and lost profile records, and shows `COMPLETE` only when the final summary reports the capture complete and matches the events received. CUDA error counts are reported but do not affect completeness. |
@@ -65,8 +65,6 @@ bindings, and PyTorch, so the host needs only:
   [Docker guide](examples/docker/README.md#build).
 - Docker with the NVIDIA Container Toolkit, and permission to run privileged
   containers.
-- Python 3.10 or later on the host for the dashboard, which uses only the
-  standard library.
 
 <a id="quick-start"></a>
 ## Quick start
@@ -106,58 +104,43 @@ Metagross prints one table row per traced CUDA call to stderr, and the
 workload's checksum goes to stdout. The [Docker guide](examples/docker/README.md)
 explains each flag and lists five more workloads.
 
-### 3. Trace your own script in the browser
+### 3. Trace your own script with the live dashboard
 
-The tracer writes the capture into `traces/`, and the dashboard on the host
-follows those files. `traces/` is ignored by Git. Use two terminals.
+```sh
+PROJECT_ROOT="/absolute/path/to/your/project"
+docker run --rm \
+  --gpus all \
+  --privileged \
+  --pid=host \
+  --network host \
+  -v /lib/modules:/lib/modules:ro \
+  -v /usr/src:/usr/src:ro \
+  -v /sys/kernel/debug:/sys/kernel/debug \
+  -v /sys/kernel/tracing:/sys/kernel/tracing \
+  -v "$PROJECT_ROOT:/workspace/project:ro" \
+  metagross-pytorch \
+  --web \
+  --project-root /workspace/project \
+  /workspace/project/path/to/workload.py
+```
 
-1. **Terminal one: start the dashboard.**
+Open the URL it prints and keep it private. The dashboard fills in as your
+script runs and keeps the capture after the script exits. Press Ctrl-C to stop
+it; the command then exits with your script's status.
 
-   ```sh
-   mkdir -p -m 700 traces
-   python3 -m metagross view --web \
-     --summary traces/live-summary.json traces/live.jsonl
-   ```
-
-   Open the URL it prints and keep it private. The page shows `WAITING` until
-   the trace file appears. To view the dashboard from another machine on a
-   trusted internal network, see the
-   [viewer access options](docs/reference.md#visual-trace-viewer).
-
-2. **Terminal two: run your script in the container.**
-
-   ```sh
-   PROJECT_ROOT="/absolute/path/to/your/project"
-   docker run --rm \
-     --gpus all \
-     --privileged \
-     --pid=host \
-     -v /lib/modules:/lib/modules:ro \
-     -v /usr/src:/usr/src:ro \
-     -v /sys/kernel/debug:/sys/kernel/debug \
-     -v /sys/kernel/tracing:/sys/kernel/tracing \
-     -v "$PWD/traces:/traces" \
-     -v "$PROJECT_ROOT:/workspace/project:ro" \
-     metagross-pytorch \
-     --json --output /traces/live.jsonl \
-     --summary-output /traces/live-summary.json \
-     --project-root /workspace/project \
-     /workspace/project/path/to/workload.py
-   ```
-
-   - Only functions under `--project-root` are attributed; the script must be a
-     regular `.py` file inside it.
-   - Put Metagross options before the script path and script arguments after it;
-     the arguments reach your script unchanged.
-   - Your script can import only what the image provides: PyTorch and NumPy.
-     Add other packages to [`examples/docker/Dockerfile`](examples/docker/Dockerfile)
-     and rebuild.
-
-Rerunning the container overwrites both files, and the open page starts over
-with the new run. Stop the dashboard with Ctrl-C. The files stay in `traces/`,
-so you can reopen them later with `view --web` or `view --snapshot`. They
-contain source paths and function names; delete them when you no longer need
-them.
+- Only functions under `--project-root` are attributed; the script must be a
+  regular `.py` file inside it.
+- Put Metagross options before the script path and script arguments after it;
+  the arguments reach your script unchanged.
+- Your script can import only what the image provides: PyTorch and NumPy.
+  Add other packages to [`examples/docker/Dockerfile`](examples/docker/Dockerfile)
+  and rebuild.
+- `--network host` lets your browser reach the dashboard on `127.0.0.1:8765`
+  (change the port with `--web-port`). It also removes Docker's network
+  isolation for this container, which already runs privileged in the host PID
+  namespace.
+- The capture is kept in memory only. To also save it to files, see
+  [Write JSONL to the host](examples/docker/README.md#write-jsonl-to-the-host).
 
 ## Read the dashboard
 
