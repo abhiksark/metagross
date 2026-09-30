@@ -110,53 +110,41 @@ sudo /usr/bin/python3 -B -m metagross --project-root "$PROJECT_ROOT" "$WORKLOAD"
 - Place Metagross options before `"$WORKLOAD"` and script arguments after it;
   the arguments reach your script unchanged.
 
-To keep a durable capture, add `--json --output /tmp/metagross.jsonl
---summary-output /tmp/metagross-summary.json` and open it later with the [viewers](docs/reference.md#visual-trace-viewer).
 See the [complete CLI and interpreter contract](docs/reference.md#usage) and the
 [prepared-container route](examples/docker/README.md).
 
 ### 3. Watch it live in the browser
 
-The live dashboard uses two terminals. A receiver running as your user serves
-the browser page, and the tracer running under `sudo` sends events to it. A
-shared token lets the receiver accept events only from your tracer.
+The tracer writes the capture to a file, and the dashboard follows that file.
+Use two terminals. `traces/` is ignored by Git.
 
-1. **Terminal one: start the receiver.**
+1. **Terminal one: start the dashboard.**
 
    ```sh
-   export METAGROSS_DASHBOARD_TOKEN="$(/usr/bin/python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
-   printf 'Copy this token into the tracing terminal: %s\n' "$METAGROSS_DASHBOARD_TOKEN"
-   /usr/bin/python3 -B -m metagross view --web --receive --port 8765
+   mkdir -p traces
+   /usr/bin/python3 -m metagross view --web \
+     --summary traces/live-summary.json traces/live.jsonl
    ```
 
-   Open the complete URL the receiver prints and keep it private; it carries a
-   separate browser credential. To view the dashboard from another machine on
-   a trusted internal network, see the
+   Open the URL it prints and keep it private. The page shows `WAITING` until
+   the trace file appears. To view the dashboard from another machine on a
+   trusted internal network, see the
    [viewer access options](docs/reference.md#visual-trace-viewer).
 
-2. **Terminal two: run the tracer with the same token.** Pass only this
-   variable through `sudo`:
+2. **Terminal two: run the tracer.**
 
    ```sh
-   export METAGROSS_DASHBOARD_TOKEN='paste the copied token here'
    PROJECT_ROOT="/absolute/path/to/your/project"
    WORKLOAD="$PROJECT_ROOT/path/to/workload.py"
-   sudo --preserve-env=METAGROSS_DASHBOARD_TOKEN \
-     /usr/bin/python3 -B -m metagross \
-     --dashboard-port 8765 \
-     --project-root "$PROJECT_ROOT" \
-     "$WORKLOAD"
+   sudo /usr/bin/python3 -B -m metagross --json \
+     --output traces/live.jsonl --summary-output traces/live-summary.json \
+     --project-root "$PROJECT_ROOT" "$WORKLOAD"
    ```
 
-Rerunning the tracer replaces the previous capture in the same browser tab. The
-receiver keeps the capture in memory only, so stopping it loses the capture; add
-`--output` and `--summary-output` to the tracer for a durable recording.
-
-When finished, stop the receiver with Ctrl-C and clear the token in both shells:
-
-```sh
-unset METAGROSS_DASHBOARD_TOKEN
-```
+Rerunning the tracer overwrites both files, and the open page starts over with
+the new run. Stop the dashboard with Ctrl-C. The files stay in `traces/`, so you
+can reopen them later with `view --web` or `view --snapshot`. They contain
+source paths and function names; delete them when you no longer need them.
 
 ## Read the dashboard
 
