@@ -649,6 +649,11 @@ target drops and counts records. Calls to frames beyond that count are counted
 as lost profile records, which marks the capture incomplete. Frame history older than the 100 ms hold window
 is discarded on every loop tick, whether or not the GPU is active.
 
+The dashboard server closes a connection that is silent for 10 seconds and
+serves at most 32 connections at once; further clients are disconnected. This
+bounds its threads and memory; it does not stop a local user from deliberately
+occupying every slot.
+
 The producer queue is bounded and its event offers do not block the trace loop.
 Delivery accepts at most 128 events per batch, 1 MiB per batch, and 64 KiB per
 event. Oversized or undeliverable events count as delivery drops. The producer

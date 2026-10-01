@@ -1807,15 +1807,39 @@ def _is_ipv4_literal(name: str) -> bool:
     return True
 
 
+_MAX_CONNECTIONS = 32
+_SOCKET_TIMEOUT_SECONDS = 10
+
+
 class _DashboardServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
     def __init__(self, *args, **kwargs):
         self.viewer_token = secrets.token_urlsafe(32)
+        self._slots = threading.BoundedSemaphore(_MAX_CONNECTIONS)
         super().__init__(*args, **kwargs)
         # A non-loopback bind (the --host opt-in) lets LAN viewers read state.
         self.lan_mode = not ipaddress.ip_address(self.server_address[0]).is_loopback
+
+
+    def process_request(self, request, client_address) -> None:
+        # One thread per connection: without a cap, idle clients could hold
+        # an unbounded number of them.
+        if not self._slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._slots.release()  # no thread was started to release it
+            raise
+
+    def process_request_thread(self, request, client_address) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
 
 
 class _IngestRequestError(Exception):
@@ -1829,6 +1853,7 @@ class _IngestRequestError(Exception):
 class _DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "MetagrossDashboard/1"
+    timeout = _SOCKET_TIMEOUT_SECONDS  # drop a client that goes quiet
 
     def log_message(self, _format: str, *_args) -> None:
         return

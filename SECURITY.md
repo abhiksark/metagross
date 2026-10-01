@@ -26,7 +26,9 @@ authentication boundary.
 
 The loopback dashboard requires a private viewer bearer token to read trace
 state. The separate producer token authorizes capture delivery only. Keep both
-private. Do not expose the server through a proxy or port forward. Trace files
-can contain source paths, function/kernel names, handles, and timing information.
-Review [file safety and the trust boundary](docs/reference.md) before sharing
-captures or changing privileged code.
+private. Do not expose the server through a proxy or port forward. The opt-in
+`view --web --host` mode serves plain HTTP: anyone who can observe that network
+can read the viewer token and the trace. Trace files can contain source paths,
+function/kernel names, handles, and timing information. Review
+[file safety and the trust boundary](docs/reference.md) before sharing captures
+or changing privileged code.

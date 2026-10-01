@@ -778,6 +778,49 @@ class WebDashboardTest(unittest.TestCase):
         self.addCleanup(stop_server)
         return state, server
 
+    def _closed_by_server(self, connection, within=2.0):
+        connection.settimeout(within)
+        try:
+            return connection.recv(1) == b""
+        except (socket.timeout, ConnectionResetError) as exc:
+            return isinstance(exc, ConnectionResetError)
+
+    def test_idle_connection_is_closed_after_the_timeout(self):
+        self.assertGreater(_web._DashboardRequestHandler.timeout or 0, 0)
+        with mock.patch.object(_web._DashboardRequestHandler, "timeout", 0.2):
+            _, server = self._start_ingest_server()
+            with socket.create_connection(server.server_address) as idle:
+                self.assertTrue(self._closed_by_server(idle))
+
+    def test_connections_beyond_the_cap_are_closed_at_once(self):
+        with mock.patch.object(_web, "_MAX_CONNECTIONS", 2):
+            _, server = self._start_ingest_server()
+        held = [socket.create_connection(server.server_address)
+                for _ in range(2)]
+        try:
+            for connection in held:
+                connection.sendall(b"GET / HTTP/1.1\r\n")   # keep it mid-request
+            deadline = time.monotonic() + 2.0
+            while server._slots._value and time.monotonic() < deadline:
+                time.sleep(0.01)
+            with socket.create_connection(server.server_address) as extra:
+                self.assertTrue(self._closed_by_server(extra))
+        finally:
+            for connection in held:
+                connection.close()
+        # A freed slot serves the next client normally.
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            with socket.create_connection(server.server_address) as client:
+                client.sendall(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                               b"Connection: close\r\n\r\n")
+                client.settimeout(2.0)
+                if client.recv(12).startswith(b"HTTP/1.1 200"):
+                    break
+            time.sleep(0.02)
+        else:
+            self.fail("no connection was served after slots were freed")
+
     def _post_json(
         self,
         server,
