@@ -21,7 +21,8 @@ sudo /usr/bin/python3 -m metagross examples/gpu_demo.py
 
 - **quicklook.py** is a smaller GPU workload with clearly named steps, meant
   to produce a readable trace. Run it bare with
-  `/usr/bin/python3 examples/quicklook.py` (no root required), or traced
+  `PYTHONPATH=. /usr/bin/python3 examples/quicklook.py` (no root required;
+  `PYTHONPATH` is unnecessary once Metagross is installed with pip), or traced
   with `sudo /usr/bin/python3 -m metagross examples/quicklook.py`. Its
   `run_kernel()` call runs inside `with metagross.span("compute"):`, so a
   traced run's events for that step carry `"compute"` in their `span` field;

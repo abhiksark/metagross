@@ -131,7 +131,9 @@ Metagross itself, and code with no source file (`exec`, frozen modules,
 generated code) do not replace the nearest project frame. A memory
 allocation performed inside a standard-library function, for example, remains
 attributable to the project function that initiated it. Imported project
-modules and Python threads are included.
+modules and threads started through `threading` are included; threads started
+with the low-level `_thread` module are not profiled, so their calls are
+`<unknown>`.
 
 The target remains behind a pipe barrier until every uprobe and uretprobe
 pair is attached for its exact process ID. API calls that occur before any
@@ -166,7 +168,9 @@ start with no span.
 
 A `metagross.span()` call outside a running trace (the script run bare, without
 `sudo /usr/bin/python3 -m metagross`) is a no-op — the `with` block still
-runs its body normally, so instrumented scripts stay runnable unmodified.
+runs its body normally, so instrumented scripts stay runnable unmodified as long
+as `import metagross` works there (install it with pip, or put the checkout on
+`PYTHONPATH`).
 Spans use the same profile pipe and interning writer as project-function
 attribution (see [Overhead and limits](#overhead-and-limits)) and fail closed
 rather than guess:
@@ -427,8 +431,10 @@ it is not a measurement of all memory owned by a framework or process.
 ## Overhead and limits
 
 The profiling callback runs for every Python call/return and emits records for
-project frames. Short-lived or Python-call-heavy programs can therefore slow
-down substantially; measure overhead on the target workload. Metagross is
+project frames. On one desktop machine it added roughly 4 to 5 µs to each call
+of a project function and 0.4 to 0.5 µs to every other Python call (Python 3.10
+and 3.13). Short-lived or Python-call-heavy programs can therefore slow down
+substantially; measure overhead on the target workload. Metagross is
 intended for local diagnosis rather than production monitoring and traces only
 the main Python process.
 
@@ -443,7 +449,26 @@ times.
 **Kernel names best-effort**: Kernel function names are available only if the
 target calls `cuModuleGetFunction`, `cuLibraryGetKernel`, or `cuKernelGetFunction`
 to register the kernel before launch. Unresolved handles use the table/JSON
-behavior described in [Output](#output).
+behavior described in [Output](#output). Names are cut at 127 bytes, so long
+C++ template instantiations that share that prefix are counted as one kernel in
+`top_kernels`.
+
+**Untraced driver APIs**: Only the APIs in the [table](#traced-api-table) are
+traced. In particular, kernels replayed through a CUDA graph (`cuGraphLaunch`)
+do not appear as launches, and `cuMemsetD*`, 2D, 3D, peer and batched copies,
+pooled, managed, host and pitched allocations, and `cuStreamWaitEvent` are not
+recorded. A capture of a workload that relies on these is partial even when it
+reports `complete`.
+
+**Calls in flight at exit**: An API call is reported when it returns. A call
+that is still running when the target exits or is killed never appears.
+
+**No device or context**: Events do not record which GPU or CUDA context a call
+used, so multi-GPU activity is not separated.
+
+**x86-64 only**: Launch arguments are read from the System V AMD64 stack
+layout and libcuda is looked up in x86-64 library paths. Other architectures,
+including arm64, are not supported.
 
 **Other profilers**: Attribution uses the Python profiling hook
 (`sys.setprofile`). If the script installs its own profile function, as
@@ -653,8 +678,8 @@ Viewer line reads are limited to 1 MiB and summary reads to 4 MiB. Aggregate
 storage is bounded to 512 APIs, 4,096 functions, and 4,096 kernels, with overflow
 folded into other groups. Memory history retains 2,000 samples. The configured
 recent-event bound is at most 10,000; the web payload can show a smaller subset.
-The browser timeline caps that retained window at 1,000 events, recent-event
-rows at 50, memory samples at 120, and each top-groups section at eight rows.
+The browser timeline and Events view cap that retained window at 1,000 events,
+memory samples at 120, and each top-groups section at eight rows.
 Display text and detail fields are capped and control characters are sanitized.
 These bounds keep inspection usable but do not make hostile input harmless.
 

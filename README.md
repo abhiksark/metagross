@@ -120,7 +120,8 @@ Open the URL it prints and keep it private. The dashboard fills in as your
 script runs and keeps the capture after the script exits. Press Ctrl-C to stop
 it; the command then exits with your script's status.
 
-- Drop `--web` to print the trace table to stderr instead.
+- The trace table prints to stderr in both cases; drop `--web` if you do not
+  want the dashboard.
 - The current directory is the project root: only functions in files under it
   are attributed, and the script must be a regular `.py` file inside it.
 - The current directory is mounted read-write at the same path and your script
@@ -186,7 +187,8 @@ See [op spans](docs/reference.md#op-spans) and the annotated
 - [Terminal snapshot and follow viewers](docs/reference.md#viewer-option-reference)
   for saved JSONL captures.
 
-Usage help runs on the host without Docker, root, BCC, CUDA, or a GPU:
+From the repository root, usage help runs on the host without Docker, root,
+BCC, CUDA, or a GPU:
 
 ```sh
 python3 -m metagross --help
@@ -196,8 +198,11 @@ python3 -m metagross view --help
 ## Limits
 
 - Metagross traces selected CUDA driver APIs in one launched Python process and
-  its Python threads. It does not attach to an existing process, follow
-  subprocesses, run `python -m` targets, or record framework-level events.
+  its Python threads, on x86-64 only. It does not attach to an existing
+  process, follow subprocesses, run `python -m` targets, or record
+  framework-level events.
+- Kernels replayed through a CUDA graph (`cuGraphLaunch`) and several other
+  driver APIs are not traced, and events do not say which GPU was used.
 - Timing is host-side API elapsed time, not GPU execution time or utilization.
 - Attribution and kernel names are best effort. Calls from C++ worker threads
   without an active project Python frame show as `<unknown>`.
