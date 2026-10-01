@@ -1167,6 +1167,16 @@ class RecordCodecTest(unittest.TestCase):
         self.assertEqual(reader.feed(named), [("span", 9, 100, "fwd")])
         self.assertEqual(reader.feed(none), [("span", 9, 150, None)])
 
+    def test_hook_replaced_is_a_gap_at_its_own_timestamp(self):
+        reader = self._reader_after_hello()
+        frame = _profile.encode_frame(_profile.CALL, 1, 100, "f", "/p/a.py", 1)
+        replaced = _profile.encode_hook_replaced(250)
+        self.assertEqual(reader.feed(frame + replaced),
+                         [("frame", _profile.CALL, 1, 100, "f", "/p/a.py", 1),
+                          ("gap", 250)])
+        self.assertEqual(reader.hook_replacements, 1)
+        self.assertEqual(reader.lost_records, 1)
+
     def test_unknown_rtype_does_not_raise(self):
         reader = self._reader_after_hello()
         garbage = _profile._COMMON.pack(99, reader._expected, 0) + b"\x00" * 8
@@ -1315,6 +1325,20 @@ class ProfileDropTest(unittest.TestCase):
         emitter.emit(_profile.CALL, 1, 10, "f", "/p/a.py", 1)
         self.assertEqual(writer.dropped, 1)               # the CALL dropped
         self.assertIn(_profile.FRAME_DEF, seen)            # the DEF survived
+
+    def test_hook_replaced_is_never_dropped(self):
+        attempts = []
+
+        def flaky_write(fd, data):
+            attempts.append(1)
+            if len(attempts) < 3:
+                raise BlockingIOError()
+            return len(data)
+
+        writer = _profile._DropCountWriter(7, os_write=flaky_write)
+        _profile._FrameEmitter(writer.write).hook_replaced(10)
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(writer.dropped, 0)
 
     def test_frame_def_retries_through_blocking_io_error_until_it_fits(self):
         attempts = []
@@ -1511,7 +1535,6 @@ class InstallHookTest(unittest.TestCase):
             "_profile.install(%d, d)\n"
             "import proj\n"
             "proj.hot()\n"
-            "sys.setprofile(None)\n"
         ) % (os.getcwd(), w)
         pid = os.fork()
         if pid == 0:
@@ -1531,6 +1554,58 @@ class InstallHookTest(unittest.TestCase):
         self.assertNotIn("gap", [rec[0] for rec in records])
         kinds = [rec[1] for rec in frames if rec[4] == "hot"]
         self.assertEqual(sorted(set(kinds)), [_profile.CALL, _profile.RETURN])
+
+    def test_replaced_hook_drops_the_frames_it_can_no_longer_close(self):
+        # The script swaps in its own profile function (as cProfile does on
+        # Python 3.11 and earlier) while a project frame is open. Nothing
+        # after that point may be attributed to the stale frame.
+        r, w = os.pipe()
+        project = (
+            "import sys\n"
+            "def before(): pass\n"
+            "def after(): pass\n"
+            "def outer():\n"
+            "    before()\n"
+            "    sys.setprofile(lambda *event: None)\n"
+            "    after()\n"
+            "    sys.setprofile(None)\n"
+        )
+        code = (
+            "import os, sys, tempfile\n"
+            "sys.path.insert(0, %r)\n"
+            "from metagross import _profile\n"
+            "d = tempfile.mkdtemp()\n"
+            "with open(os.path.join(d, 'proj.py'), 'w') as stream:\n"
+            "    stream.write(%r)\n"
+            "sys.path.insert(0, d)\n"
+            "_profile.install(%d, d)\n"
+            "import proj\n"
+            "proj.outer()\n"
+        ) % (os.getcwd(), project, w)
+        pid = os.fork()
+        if pid == 0:
+            os.close(r)
+            exec(code)  # noqa: S102 — test child
+            os._exit(0)
+        os.close(w)
+        data = b""
+        while chunk := os.read(r, 4096):
+            data += chunk
+        os.close(r)
+        os.waitpid(pid, 0)
+        reader = _profile.RecordReader()
+        records = reader.feed(data)
+        self.assertEqual(reader.hook_replacements, 1)
+        funcs = [rec[4] for rec in records if rec[0] == "frame"]
+        self.assertIn("before", funcs)
+        self.assertNotIn("after", funcs)
+        gap_ts = [rec[1] for rec in records if rec[0] == "gap"]
+        self.assertEqual(len(gap_ts), 1)
+        joiner = _events.Joiner()
+        for rec in records:
+            joiner.on_profile_record(rec)
+        tid = next(rec[2] for rec in records if rec[0] == "frame")
+        self.assertIsNone(joiner.timeline.attribute(tid, gap_ts[0] + 1))
 
     def test_asyncio_tasks_keep_their_own_spans(self):
         # Three tasks interleave on one thread: two hold their own span
@@ -1570,7 +1645,6 @@ class InstallHookTest(unittest.TestCase):
             "_profile.install(%d, d)\n"
             "import proj\n"
             "proj.run()\n"
-            "sys.setprofile(None)\n"
         ) % (os.getcwd(), project, w)
         pid = os.fork()
         if pid == 0:
@@ -1626,7 +1700,6 @@ class InstallHookTest(unittest.TestCase):
             "    os._exit(0)\n"
             "os.waitpid(child_pid, 0)\n"
             "proj.hot()\n"
-            "sys.setprofile(None)\n"
         ) % (os.getcwd(), w)
         pid = os.fork()
         if pid == 0:

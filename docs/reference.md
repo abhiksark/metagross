@@ -225,8 +225,9 @@ sudo /usr/bin/python3 -m metagross \
 Summary schema version 1 has top-level `schema_version`, `complete`, `capture`,
 `timing`, `memory`, `copies`, `apis`, `top_functions`, `top_kernels`,
 `top_spans`, `configuration`, and `target` fields. `complete` is false if BPF
-events were lost, nested calls were dropped, profile records were lost, event
-rendering failed, or the tracing loop failed. Unknown Python attribution does
+events were lost, nested calls were dropped, profile records were lost, the
+target replaced the profiling hook, event rendering failed, or the tracing loop
+failed. `lost_profile_records` counts one for each hook replacement. Unknown Python attribution does
 not by itself make capture incomplete. Allocation and byte totals describe
 successfully observed driver calls, not physical GPU usage or
 framework-level tensor allocations.
@@ -422,6 +423,15 @@ times.
 target calls `cuModuleGetFunction`, `cuLibraryGetKernel`, or `cuKernelGetFunction`
 to register the kernel before launch. Unresolved handles use the table/JSON
 behavior described in [Output](#output).
+
+**Other profilers**: Attribution uses the Python profiling hook
+(`sys.setprofile`). If the script installs its own profile function, as
+`cProfile` does on Python 3.11 and earlier, Metagross forgets the frames open at
+that moment, prints a warning, and marks the capture incomplete. Calls on that
+thread report `<unknown>` until the script restores the hook, which `cProfile`
+does not do. On Python 3.12 and later `cProfile` runs alongside the hook and
+attribution is unaffected. A replacement made from a thread that Metagross does
+not profile is not detected.
 
 **PyTorch autograd**: Some backward-pass kernels may report `<unknown>` because
 PyTorch can launch them from C++ worker threads without an active Python project

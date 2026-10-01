@@ -879,9 +879,14 @@ def _trace(cfg, creds, uid, gid, dashboard_port, dashboard_token) -> int:
             print(f"metagross: lost {lost} events (ring buffer full)", file=sys.stderr)
         if dropped:
             print(f"metagross: dropped {dropped} nested calls", file=sys.stderr)
-        if lost_profile:
-            print(f"metagross: lost {lost_profile} profile records "
-                  "(writer overrun)", file=sys.stderr)
+        hook_replacements = profile_reader.hook_replacements()
+        if hook_replacements:
+            print("metagross: the target replaced the profiling hook "
+                  f"{hook_replacements} time(s); calls made on that thread "
+                  "afterwards are unattributed", file=sys.stderr)
+        if lost_profile > hook_replacements:
+            print(f"metagross: lost {lost_profile - hook_replacements} profile "
+                  "records (writer overrun)", file=sys.stderr)
     except Exception as exc:
         trace_failed = True
         # Any unexpected failure here must not lose the target's exit

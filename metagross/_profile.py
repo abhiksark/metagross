@@ -28,6 +28,7 @@ _FRAME_CALL_RTYPE = 2
 _FRAME_RETURN_RTYPE = 3
 SPAN_SET = 4    # a thread's active span is now this name
 SPAN_CLEAR = 5  # a thread has no active span
+HOOK_REPLACED = 6  # the target swapped out the profiling hook
 
 _WIRE_VERSION = 3
 _SEQ_MOD = 2**32
@@ -42,6 +43,7 @@ _FRAME_DEF_PREFIX = struct.Struct("<IIIHH")  # frame_id, line, _pad, func_len, p
 _FRAME_REF_BODY = struct.Struct("<IQI")  # tid, ts_ns, frame_id
 _SPAN_SET_PREFIX = struct.Struct("<IQH")  # tid, ts_ns, name_len
 _SPAN_CLEAR_BODY = struct.Struct("<IQ")  # tid, ts_ns
+_HOOK_REPLACED_BODY = struct.Struct("<Q")  # ts_ns
 
 _FRAME_RTYPE_BY_KIND = {CALL: _FRAME_CALL_RTYPE, RETURN: _FRAME_RETURN_RTYPE}
 _KIND_BY_FRAME_RTYPE = {_FRAME_CALL_RTYPE: CALL, _FRAME_RETURN_RTYPE: RETURN}
@@ -154,6 +156,10 @@ class _FrameEmitter:
         with self._lock:
             self._write(encode_span(tid, ts, name))
 
+    def hook_replaced(self, ts) -> None:
+        with self._lock:
+            self._write(encode_hook_replaced(ts))
+
 
 class _DropCountWriter:
     """Write profile records through a non-blocking fd; drop-and-count
@@ -179,7 +185,8 @@ class _DropCountWriter:
         # is at most ~6 + 16 + 2*_MAX_STR bytes), so a successful os.write
         # on a pipe is always atomic here: the return value is never a
         # partial write that would itself desync the reader's byte stream.
-        if record_type(data) == FRAME_DEF:
+        if record_type(data) in (FRAME_DEF, HOOK_REPLACED):
+            # A lost HOOK_REPLACED would leave stale frames trusted.
             self._write_never_dropping(data)
             return
         try:
@@ -216,6 +223,11 @@ def encode_span(tid, ts_ns, name) -> bytes:
             + _SPAN_SET_PREFIX.pack(tid, ts_ns, len(name_bytes)) + name_bytes)
 
 
+def encode_hook_replaced(ts_ns) -> bytes:
+    seq = _next_seq()
+    return _COMMON.pack(HOOK_REPLACED, seq, 0) + _HOOK_REPLACED_BODY.pack(ts_ns)
+
+
 class RecordReader:
     """Decode the v2 profile wire format into tagged tuples.
 
@@ -245,6 +257,7 @@ class RecordReader:
         # testing the writer in isolation, because the child cannot
         # reliably flush a final count once its pipe is overrunning.
         self.lost_records = 0
+        self.hook_replacements = 0
         # A gap revealed on a record with no ts_ns of its own (FRAME_DEF,
         # HELLO) is not reported immediately: it is held here and emitted
         # with the ts of the next record that DOES carry a real ts_ns, so
@@ -338,6 +351,19 @@ class RecordReader:
                 self._note_seq(seq, out, ts_ns)
                 out.append(("span", tid, ts_ns, None))
                 continue
+            if rtype == HOOK_REPLACED:
+                need = _COMMON.size + _HOOK_REPLACED_BODY.size
+                if len(self._buf) < need:
+                    break
+                (ts_ns,) = _HOOK_REPLACED_BODY.unpack_from(self._buf, _COMMON.size)
+                self._buf = self._buf[need:]
+                self._note_seq(seq, out, ts_ns)
+                # Frames open on that thread will never be seen to return;
+                # treat it like lost records and forget what came before.
+                self.hook_replacements += 1
+                self.lost_records += 1
+                out.append(("gap", ts_ns))
+                continue
             # Unknown rtype: there is no length field we can trust, so the
             # stream cannot be resynchronized. Drop it and fail closed
             # rather than raise or spin forever on the same bytes.
@@ -430,6 +456,10 @@ class ProfileReader:
         isolation (see `_DropCountWriter`).
         """
         return self._reader.lost_records
+
+    def hook_replacements(self) -> int:
+        """Return how often the target replaced the profiling hook."""
+        return self._reader.hook_replacements
 
     def poll(self) -> list:
         out = []
@@ -657,10 +687,10 @@ def install(write_fd: int, project_root: str) -> None:
         # including this one. Do not relax that self-exclusion, or a lock
         # some other thread held at the moment of fork (and so is held
         # forever in this single-threaded child) would deadlock right here.
+        global _current_emitter
+        _current_emitter = None  # first: `audit` must not write from here
         sys.setprofile(None)
         threading.setprofile(None)
-        global _current_emitter
-        _current_emitter = None
         # AGENTS.md: be conservative with inherited file descriptors. A
         # long-lived non-exec worker holding the write end open would
         # otherwise delay the parent's EOF until the final-drain deadline.
@@ -671,5 +701,14 @@ def install(write_fd: int, project_root: str) -> None:
 
     os.register_at_fork(after_in_child=_disable_in_forked_child)
 
+    def audit(event, args):
+        # sys.setprofile is audited before it takes effect, from Python and
+        # from the C API alike. If the hook is still this thread's profile
+        # function, the target is about to replace it.
+        if (event == "sys.setprofile" and _current_emitter is emitter
+                and sys.getprofile() is hook):
+            emitter.hook_replaced(time.monotonic_ns())
+
     threading.setprofile(hook)
     sys.setprofile(hook)
+    sys.addaudithook(audit)
