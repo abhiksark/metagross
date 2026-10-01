@@ -301,12 +301,12 @@ class Joiner:
             out.append(AttributedEvent(
                 raw, api, self.timeline.attribute(raw.tid, returned_ns),
                 kernel, self.spans.attribute(raw.tid, returned_ns)))
-        if released:
-            # Held events and events still on their way to the controller
-            # all returned within the last hold window; keep that much.
-            horizon = now_ns - self.hold_ns
-            self.timeline.prune(horizon)
-            self.spans.prune(horizon)
+        # Held events and events still on their way to the controller all
+        # returned within the last hold window; keep that much. Prune even
+        # when nothing was released, or an idle GPU lets the log grow.
+        horizon = now_ns - self.hold_ns
+        self.timeline.prune(horizon)
+        self.spans.prune(horizon)
         return out
 
 

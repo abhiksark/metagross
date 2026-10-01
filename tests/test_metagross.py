@@ -1182,6 +1182,32 @@ class RecordCodecTest(unittest.TestCase):
         self.assertEqual(reader.hook_replacements, 1)
         self.assertEqual(reader.lost_records, 1)
 
+    def test_oversized_name_length_is_a_corrupt_stream(self):
+        # The hook never writes a name longer than _MAX_STR. A longer length
+        # can only come from a target writing to the pipe itself; the reader
+        # must not wait for, or keep, that much data.
+        reader = self._reader_after_hello()
+        big = _profile._MAX_STR + 1
+        header = _profile._COMMON.pack(_profile.FRAME_DEF, reader._expected, 0)
+        definition = _profile._FRAME_DEF_PREFIX.pack(0, 1, 0, big, 1)
+        self.assertEqual(reader.feed(header + definition), [("gap", None)])
+        self.assertEqual(reader._buf, b"")
+        reader = self._reader_after_hello()
+        header = _profile._COMMON.pack(_profile.SPAN_SET, reader._expected, 0)
+        named = _profile._SPAN_SET_PREFIX.pack(1, 10, big)
+        self.assertEqual(reader.feed(header + named), [("gap", None)])
+
+    def test_frame_definitions_are_capped(self):
+        reader = self._reader_after_hello()
+        with mock.patch.object(_profile, "_MAX_FRAMES", 2):
+            for frame_id in range(3):
+                reader.feed(_profile._encode_frame_def(
+                    frame_id, f"f{frame_id}", "/p/a.py", frame_id))
+            out = reader.feed(_profile._encode_frame_ref(_profile.CALL, 1, 10, 2))
+        self.assertEqual(len(reader._frames), 2)
+        self.assertEqual(out, [])              # frame 2 was never kept
+        self.assertEqual(reader.lost_records, 1)
+
     def test_unknown_rtype_does_not_raise(self):
         reader = self._reader_after_hello()
         garbage = _profile._COMMON.pack(99, reader._expected, 0) + b"\x00" * 8
@@ -1191,9 +1217,9 @@ class RecordCodecTest(unittest.TestCase):
         self.assertEqual(reader.feed(b""), [])
 
     def test_unknown_frame_id_drops_one_record_without_clearing_map(self):
-        # Defensive only: FRAME_DEF is undroppable, so a
-        # CALL/RETURN should never reference an id the reader has not
-        # seen. If it somehow does, the reader must fail closed -- drop
+        # A CALL/RETURN can reference an id the reader does not hold only
+        # past the frame cap or on a corrupt stream. The reader must fail
+        # closed -- drop
         # that one record and count it, never guess a frame, and never
         # clear the map on the strength of one bad id.
         reader = self._reader_after_hello()
@@ -1422,6 +1448,33 @@ class ProfileReaderTest(unittest.TestCase):
             time.sleep(0.005)
         self.assertIn(("gap", None), out)
         os.close(w)
+        os.close(r)
+
+    def test_backlog_is_bounded_when_the_controller_falls_behind(self):
+        r, w = os.pipe()
+        reader = _profile.ProfileReader(r, max_chunks=2)
+        reader.start()
+        os.set_blocking(w, False)
+        written = 0
+        deadline = time.monotonic() + 5.0
+        # With nobody polling, the reader thread must stop taking data, so
+        # the pipe fills and the writer sees it is full.
+        while time.monotonic() < deadline:
+            try:
+                written += os.write(w, b"\0" * 65536)
+            except BlockingIOError:
+                time.sleep(0.05)
+                try:
+                    os.write(w, b"\0")
+                except BlockingIOError:
+                    break
+                written += 1
+        else:
+            self.fail("the reader kept draining without bound")
+        self.assertLessEqual(reader._q.qsize(), 2)
+        os.close(w)
+        reader.drain_to_eof(time.monotonic() + 5.0)
+        self.assertTrue(reader.at_eof)
         os.close(r)
 
     def test_reads_records_across_threads_and_reaches_eof(self):
@@ -2141,6 +2194,16 @@ class JoinerTest(unittest.TestCase):
             j.on_profile_record(("frame", _profile.RETURN, 1, ts + 5, "f", "/p/a.py", 1))
         j.on_gpu_event(_raw(16, ts=12, dur=1, tid=1))
         j.flush(now_ns=1000)
+        self.assertEqual(j.timeline._logs[1], [])
+
+    def test_flush_prunes_history_while_the_gpu_is_idle(self):
+        # No GPU event is ever released here; the frame log must still not
+        # grow with every Python call the target makes.
+        j = _events.Joiner(hold_ns=100)
+        for ts in range(10, 400, 10):
+            j.on_profile_record(("frame", _profile.CALL, 1, ts, "f", "/p/a.py", 1))
+            j.on_profile_record(("frame", _profile.RETURN, 1, ts + 5, "f", "/p/a.py", 1))
+        self.assertEqual(j.flush(now_ns=1000), [])
         self.assertEqual(j.timeline._logs[1], [])
 
     def test_force_flush(self):

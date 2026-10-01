@@ -642,6 +642,13 @@ rows at 50, memory samples at 120, and each top-groups section at eight rows.
 Display text and detail fields are capped and control characters are sanitized.
 These bounds keep inspection usable but do not make hostile input harmless.
 
+The tracer bounds what it keeps from the target's profile pipe: names longer
+than 500 bytes are treated as a corrupt stream, at most 65,536 distinct project
+frames are kept, and unread profile data is capped at 16 MiB, after which the
+target drops and counts records. Calls to frames beyond that count are counted
+as lost profile records, which marks the capture incomplete. Frame history older than the 100 ms hold window
+is discarded on every loop tick, whether or not the GPU is active.
+
 The producer queue is bounded and its event offers do not block the trace loop.
 Delivery accepts at most 128 events per batch, 1 MiB per batch, and 64 KiB per
 event. Oversized or undeliverable events count as delivery drops. The producer

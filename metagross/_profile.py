@@ -32,6 +32,8 @@ HOOK_REPLACED = 6  # the target swapped out the profiling hook
 _WIRE_VERSION = 3
 _SEQ_MOD = 2**32
 _MAX_STR = 500
+_MAX_FRAMES = 1 << 16  # distinct frames the controller keeps per capture
+_MAX_QUEUED_CHUNKS = 256  # 64 KiB reads the controller may fall behind by
 
 # Every record starts with this 6-byte common header.
 _COMMON = struct.Struct("<BIB")  # rtype, seq, _reserved
@@ -295,6 +297,8 @@ class RecordReader:
                     break
                 frame_id, line, _pad, fl, pl = _FRAME_DEF_PREFIX.unpack_from(
                     self._buf, prefix_off)
+                if fl > _MAX_STR or pl > _MAX_STR:
+                    return self._corrupt(out)  # the hook never writes this
                 body_off = prefix_off + _FRAME_DEF_PREFIX.size
                 total = body_off + fl + pl
                 if len(self._buf) < total:
@@ -305,7 +309,8 @@ class RecordReader:
                 # FRAME_DEF carries no ts_ns of its own; a gap revealed here
                 # has an unknown ts until the next timestamped record.
                 self._note_seq(seq, out, None)
-                self._frames[frame_id] = (func, path, line)
+                if frame_id in self._frames or len(self._frames) < _MAX_FRAMES:
+                    self._frames[frame_id] = (func, path, line)
                 continue
             if rtype in (_FRAME_CALL_RTYPE, _FRAME_RETURN_RTYPE):
                 need = _COMMON.size + _FRAME_REF_BODY.size
@@ -317,10 +322,10 @@ class RecordReader:
                 self._note_seq(seq, out, ts_ns)
                 frame = self._frames.get(frame_id)
                 if frame is None:
-                    # Defensive only: FRAME_DEF is never dropped,
-                    # so this should not happen. Fail closed -- drop this
-                    # one record and count it, never guess a frame, and
-                    # never clear the map on the strength of one bad id.
+                    # A frame past the _MAX_FRAMES cap, or a corrupt id.
+                    # Fail closed -- drop this one record and count it,
+                    # never guess a frame, and never clear the map on the
+                    # strength of one bad id.
                     self.lost_records += 1
                     continue
                 kind = _KIND_BY_FRAME_RTYPE[rtype]
@@ -332,6 +337,8 @@ class RecordReader:
                     break
                 tid, ts_ns, nl = _SPAN_SET_PREFIX.unpack_from(
                     self._buf, prefix_off)
+                if nl > _MAX_STR:
+                    return self._corrupt(out)
                 body_off = prefix_off + _SPAN_SET_PREFIX.size
                 total = body_off + nl
                 if len(self._buf) < total:
@@ -363,12 +370,17 @@ class RecordReader:
                 self.lost_records += 1
                 out.append(("gap", ts_ns))
                 continue
-            # Unknown rtype: there is no length field we can trust, so the
-            # stream cannot be resynchronized. Drop it and fail closed
-            # rather than raise or spin forever on the same bytes.
-            self._buf = b""
-            out.append(("gap", None))
-            break
+            return self._corrupt(out)  # unknown rtype
+        return out
+
+    def _corrupt(self, out: list) -> list:
+        """Drop a stream that cannot be resynchronized, and fail closed.
+
+        An unknown rtype or an impossible length leaves no boundary to trust;
+        never raise, wait for more bytes, or spin on the same ones.
+        """
+        self._buf = b""
+        out.append(("gap", None))
         return out
 
     def _note_seq(self, seq: int, out: list, ts_ns) -> None:
@@ -402,10 +414,12 @@ class ProfileReader:
 
     The thread does nothing but blocking os.read into a queue, so the pipe
     empties as fast as the kernel delivers. RecordReader and every consumer
-    stay single-threaded on the caller (the main event loop).
+    stay single-threaded on the caller (the main event loop). The queue is
+    bounded: if the caller falls behind, the pipe fills and the target drops
+    and counts records instead of growing this process without limit.
     """
 
-    def __init__(self, fd: int):
+    def __init__(self, fd: int, max_chunks: int = _MAX_QUEUED_CHUNKS):
         # Own a PRIVATE dup of the read end. The main thread may close the
         # original profile_r (e.g. _cleanup_before_release); closing an fd
         # under a blocked os.read is undefined, and the number could be
@@ -413,7 +427,7 @@ class ProfileReader:
         # sees EOF when the child closes the write end, and the reader thread
         # closes only its own dup.
         self._fd = os.dup(fd)
-        self._q: queue.SimpleQueue = queue.SimpleQueue()
+        self._q: queue.Queue = queue.Queue(maxsize=max_chunks)
         self._reader = RecordReader()
         self._thread = threading.Thread(target=self._run, name="metagross-profile",
                                         daemon=True)
