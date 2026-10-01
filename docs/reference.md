@@ -117,7 +117,8 @@ The target remains behind a pipe barrier until every uprobe and uretprobe
 pair is attached for its exact process ID. API calls that occur before any
 project frame is active are attributed as unknown rather than suppressed.
 Events are held for 100 ms to tolerate cross-CPU and cross-stream delivery
-ordering. Long API calls appear after they complete.
+ordering. Long API calls appear after they complete, attributed to the frame
+that made them.
 
 ### Op spans
 

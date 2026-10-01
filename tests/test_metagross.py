@@ -1866,6 +1866,55 @@ class JoinerTest(unittest.TestCase):
         j.on_profile_record(("frame", _profile.CALL, 1, 10, "f", "/p/a.py", 1))
         self.assertEqual(j.flush(now_ns=200)[0].frame.function, "f")
 
+    def test_long_call_keeps_frame_and_span_after_an_earlier_release(self):
+        # A call that blocks past the hold window is delivered at return but
+        # stamped with its entry time. Releasing an earlier event must not
+        # put the frame it entered from out of reach.
+        j = _events.Joiner(hold_ns=100)
+        j.on_profile_record(("frame", _profile.CALL, 1, 10, "step", "/p/a.py", 1))
+        j.on_profile_record(("span_begin", 1, 12, "epoch"))
+        j.on_gpu_event(_raw(16, ts=20, dur=1, tid=1))
+        self.assertEqual(len(j.flush(now_ns=200)), 1)
+        j.on_gpu_event(_raw(15, ts=30, dur=470, tid=1))    # returned at 500
+        out = j.flush(now_ns=520)
+        self.assertEqual(out[0].frame.function, "step")
+        self.assertEqual(out[0].span, "epoch")
+
+    def test_long_call_is_attributed_to_the_frame_it_blocked_in(self):
+        # Another thread's releases prune while tid 1 is blocked, and tid 1
+        # moves on to a new frame before its own event is delivered.
+        j = _events.Joiner(hold_ns=100)
+        j.on_profile_record(("frame", _profile.CALL, 1, 10, "wait", "/p/a.py", 1))
+        j.on_profile_record(("frame", _profile.CALL, 2, 40, "other", "/p/a.py", 9))
+        j.on_gpu_event(_raw(16, ts=50, dur=1, tid=2))
+        self.assertEqual(len(j.flush(now_ns=200)), 1)
+        j.on_gpu_event(_raw(16, ts=300, dur=1, tid=2))
+        self.assertEqual(len(j.flush(now_ns=450)), 1)
+        j.on_profile_record(("frame", _profile.RETURN, 1, 505, "wait", "/p/a.py", 1))
+        j.on_profile_record(("frame", _profile.CALL, 1, 506, "next", "/p/a.py", 5))
+        j.on_gpu_event(_raw(15, ts=30, dur=470, tid=1))    # returned at 500
+        out = j.flush(now_ns=520)
+        self.assertEqual(out[0].frame.function, "wait")
+
+    def test_event_delivered_after_a_release_keeps_its_frame(self):
+        # An event that returned just before a flush but reaches the
+        # controller after it is still inside the delivery budget.
+        j = _events.Joiner(hold_ns=100)
+        j.on_profile_record(("frame", _profile.CALL, 1, 10, "f", "/p/a.py", 1))
+        j.on_gpu_event(_raw(16, ts=20, dur=1, tid=1))
+        self.assertEqual(len(j.flush(now_ns=1000)), 1)
+        j.on_gpu_event(_raw(16, ts=990, dur=2, tid=1))
+        self.assertEqual(j.flush(now_ns=1100)[0].frame.function, "f")
+
+    def test_flush_still_prunes_history_older_than_the_hold_window(self):
+        j = _events.Joiner(hold_ns=100)
+        for ts in range(10, 400, 10):
+            j.on_profile_record(("frame", _profile.CALL, 1, ts, "f", "/p/a.py", 1))
+            j.on_profile_record(("frame", _profile.RETURN, 1, ts + 5, "f", "/p/a.py", 1))
+        j.on_gpu_event(_raw(16, ts=12, dur=1, tid=1))
+        j.flush(now_ns=1000)
+        self.assertEqual(j.timeline._logs[1], [])
+
     def test_force_flush(self):
         j = _events.Joiner(hold_ns=10**12)
         j.on_gpu_event(_raw(16, ts=50, dur=5, tid=1))

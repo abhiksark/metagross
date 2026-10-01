@@ -374,11 +374,20 @@ class Joiner:
                 kept.append((ts, raw, api, kernel))
         self._pending = kept
         released.sort(key=lambda item: item[0])
-        out = [AttributedEvent(raw, api, self.timeline.attribute(raw.tid, ts),
-                               kernel, self.spans.attribute(raw.tid, ts))
-               for ts, raw, api, kernel in released]
+        out = []
+        for ts, raw, api, kernel in released:
+            # The calling thread stays inside the driver for the whole call,
+            # so its stack at return is its stack at entry. Query at return:
+            # a long call's entry can be older than the pruned history, but
+            # its return is always recent.
+            returned_ns = ts + raw.dur
+            out.append(AttributedEvent(
+                raw, api, self.timeline.attribute(raw.tid, returned_ns),
+                kernel, self.spans.attribute(raw.tid, returned_ns)))
         if released:
-            horizon = min(ts for ts, _, _, _ in kept) if kept else now_ns
+            # Held events and events still on their way to the controller
+            # all returned within the last hold window; keep that much.
+            horizon = now_ns - self.hold_ns
             self.timeline.prune(horizon)
             self.spans.prune(horizon)
         return out
