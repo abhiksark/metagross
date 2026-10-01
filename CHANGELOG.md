@@ -2,7 +2,7 @@
 
 User-visible changes to Metagross. Versions follow `metagross.__version__`.
 
-## 0.1.0 (unreleased)
+## 0.1.0 (2026-10-01)
 
 First public preview.
 
