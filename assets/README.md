@@ -15,5 +15,4 @@ The project name also appears in the
 [official Pokémon product](https://unite.pokemon.com/en-us/pokemon/metagross/).
 This project is independent and is not affiliated with or endorsed by Pokémon,
 Nintendo, Creatures, or GAME FREAK. These asset terms make no claim of ownership
-of third-party names or marks. Naming clearance or a rename is required before
-a stable release.
+of third-party names or marks.

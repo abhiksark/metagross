@@ -245,6 +245,5 @@ This preview ships from source, with no package release or stable-support promis
 
 Metagross is also the name of an [official Pokémon character](https://unite.pokemon.com/en-us/pokemon/metagross/).
 This independent project is not affiliated with or endorsed by Pokémon, Nintendo,
-Creatures, GAME FREAK, or NVIDIA. Naming clearance or a rename is required before
-a stable release. The software license does not grant rights to third-party names
-or marks.
+Creatures, GAME FREAK, or NVIDIA. The software license does not grant rights to
+third-party names or marks.
