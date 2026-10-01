@@ -49,6 +49,9 @@ Run the smallest affected test first, then the default unprivileged gate:
 git diff --check
 ```
 
+CI also runs `ruff check .` (ruff 0.16.8) for undefined names and unused
+imports; run it locally if you have ruff installed.
+
 Changes to live tracing, probe attachment, credentials, output ownership, or
 cleanup also need the privileged gate on a compatible host with BCC and NVIDIA
 driver support:
