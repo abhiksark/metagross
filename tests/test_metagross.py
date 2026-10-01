@@ -566,6 +566,17 @@ class OutputSafetyTest(unittest.TestCase):
         with open(path, "rb") as f:
             self.assertEqual(f.read(), b"n")
 
+    def test_existing_file_with_another_hard_link_is_preserved(self):
+        # Truncating it would also empty the file under its other name.
+        path, other = self._path("out.jsonl"), self._path("other-name")
+        with open(path, "wb") as f:
+            f.write(b"keep this")
+        os.link(path, other)
+        with self.assertRaisesRegex(MetagrossError, "hard link"):
+            open_trace_output(path, self.uid, self.gid)
+        with open(other, "rb") as f:
+            self.assertEqual(f.read(), b"keep this")
+
     def test_invalid_final_path_components_preserve_file(self):
         path = self._path("trace")
         for suffix in ("/", "/.", "/.."):
@@ -841,7 +852,15 @@ class OutputSafetyTest(unittest.TestCase):
         with open(trace, "wb") as handle:
             handle.write(b"keep this capture")
         os.link(trace, summary)
-        self._run_with_outputs(trace, summary, "must be different files")
+        self._run_with_outputs(trace, summary, "has another hard link")
+        with open(trace, "rb") as handle:
+            self.assertEqual(handle.read(), b"keep this capture")
+
+    def test_same_path_for_both_outputs_is_rejected(self):
+        trace = self._path("trace")
+        with open(trace, "wb") as handle:
+            handle.write(b"keep this capture")
+        self._run_with_outputs(trace, trace, "must be different files")
         with open(trace, "rb") as handle:
             self.assertEqual(handle.read(), b"keep this capture")
 
@@ -857,7 +876,7 @@ class OutputSafetyTest(unittest.TestCase):
             return real_open_output(path, *args, **kwargs)
 
         with mock.patch("metagross.open_trace_output", side_effect=alias_summary):
-            self._run_with_outputs(trace, summary, "must be different files")
+            self._run_with_outputs(trace, summary, "has another hard link")
         with open(trace, "rb") as handle:
             self.assertEqual(handle.read(), b"keep this capture")
 

@@ -73,7 +73,8 @@ sudo /usr/bin/python3 -m metagross \
 
 New trace and summary files have mode `0600` and are owned by the invoking user.
 Metagross truncates an existing output only when it is a regular, non-symlink
-file owned by that user, verified through the opened file descriptor. Trace
+file owned by that user with no other hard link, verified through the opened
+file descriptor. Trace
 and summary outputs must refer to different files, including through hard links;
 both are validated before either existing file is truncated.
 

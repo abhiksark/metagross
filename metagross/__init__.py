@@ -336,6 +336,8 @@ def open_trace_output(path: str, uid: int, gid: int, *, truncate: bool = True):
             os.fchown(fd, uid, gid)
         elif info.st_uid != uid:
             raise MetagrossError(f"output {path!r} is not owned by uid {uid}")
+        elif info.st_nlink != 1:
+            raise MetagrossError(f"output {path!r} has another hard link")
         if truncate:
             os.ftruncate(fd, 0)
         stream = os.fdopen(fd, "wb")
