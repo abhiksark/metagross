@@ -1064,29 +1064,60 @@ class SymbolResolutionTest(unittest.TestCase):
                          {"/opt/nvidia driver/libcuda.so.550.54.14"})
         self.assertEqual(_bpf.mapped_libcuda(""), set())
 
+    def _mapped(self, path):
+        """Map a file into this process, as a loaded library would be."""
+        stack = contextlib.ExitStack()
+        handle = stack.enter_context(open(path, "rb"))
+        stack.enter_context(mmap.mmap(handle.fileno(), 0, prot=mmap.PROT_READ))
+        return stack
+
+    def _library_file(self, *parts):
+        path = os.path.join(*parts)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as handle:
+            handle.write(b"\0" * 4096)
+        return path
+
     def test_target_that_loaded_another_libcuda_gets_a_warning(self):
         with tempfile.TemporaryDirectory() as tmp:
-            loaded = os.path.join(tmp, "libcuda.so.550.54.14")
-            other = os.path.join(tmp, "elsewhere", "libcuda.so.1")
-            os.mkdir(os.path.dirname(other))
-            for path in (loaded, other):
-                with open(path, "wb") as handle:
-                    handle.write(b"\0" * 4096)
-            stderr = io.StringIO()
-            with contextlib.redirect_stderr(stderr):
-                self.assertFalse(
-                    _bpf.target_loaded_libcuda(os.getpid(), loaded))
-                with open(loaded, "rb") as handle, mmap.mmap(
-                        handle.fileno(), 0, prot=mmap.PROT_READ):
-                    self.assertTrue(
-                        _bpf.target_loaded_libcuda(os.getpid(), loaded))
-                    self.assertEqual(stderr.getvalue(), "")
-                    self.assertTrue(
-                        _bpf.target_loaded_libcuda(os.getpid(), other))
-            self.assertIn(f"the script loaded {os.path.realpath(loaded)}, but "
-                          f"the probes are on {os.path.realpath(other)}",
-                          stderr.getvalue())
+            loaded = self._library_file(tmp, "libcuda.so.550.54.14")
+            other = self._library_file(tmp, "elsewhere", "libcuda.so.1")
+            self.assertEqual(_bpf.loaded_libcuda(os.getpid()), set())
+            with self._mapped(loaded):
+                mapped = _bpf.loaded_libcuda(os.getpid())
+            self.assertEqual(mapped, {os.path.realpath(loaded)})
+            self.assertIsNone(metagross._libcuda_mismatch_warning(set(), other))
+            self.assertIsNone(metagross._libcuda_mismatch_warning(mapped, loaded))
+            self.assertEqual(
+                metagross._libcuda_mismatch_warning(mapped, other),
+                f"metagross: the script loaded {os.path.realpath(loaded)}, but "
+                f"the probes are on {os.path.realpath(other)}; its CUDA calls "
+                "are not traced")
 
+    def test_libcuda_check_survives_a_mapped_file_with_a_non_utf8_name(self):
+        # The check is a diagnostic. An error here would end the capture and
+        # kill the script.
+        with tempfile.TemporaryDirectory() as tmp:
+            odd = os.path.join(os.fsencode(tmp), b"data-\xff\xfe.bin")
+            with open(odd, "wb") as handle:
+                handle.write(b"\0" * 4096)
+            loaded = self._library_file(tmp, "libcuda.so.1")
+            with self._mapped(odd), self._mapped(loaded):
+                self.assertEqual(_bpf.loaded_libcuda(os.getpid()),
+                                 {os.path.realpath(loaded)})
+
+    def test_libcuda_warning_keeps_escape_sequences_off_the_terminal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            loaded = self._library_file(
+                os.fsencode(tmp), b"x\x1b[2Jy\xff", b"libcuda.so.1")
+            with self._mapped(loaded):
+                mapped = _bpf.loaded_libcuda(os.getpid())
+            self.assertEqual(len(mapped), 1)
+            warning = metagross._libcuda_mismatch_warning(
+                mapped, "/nonexistent/libcuda.so.1")
+            self.assertIn("/x?[2Jy?/libcuda.so.1", warning)
+            self.assertNotIn("\x1b", warning)
+            warning.encode("utf-8")  # printable: no lone surrogates
 
 class BpfSourceTest(unittest.TestCase):
     def setUp(self):

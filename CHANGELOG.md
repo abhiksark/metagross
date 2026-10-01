@@ -2,6 +2,12 @@
 
 User-visible changes to Metagross. Versions follow `metagross.__version__`.
 
+## Unreleased
+
+- Fix: a mapped file with a name that is not valid UTF-8 no longer makes
+  the tracer fail and kill the script, and the wrong-`libcuda` warning no
+  longer prints control characters from the library path.
+
 ## 0.1.0 (2026-10-01)
 
 First public preview.

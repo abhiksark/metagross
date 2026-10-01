@@ -455,6 +455,23 @@ def _forbid_new_privileges() -> None:
         raise OSError(ct.get_errno(), "prctl(PR_SET_NO_NEW_PRIVS) failed")
 
 
+def _libcuda_mismatch_warning(mapped: set[str], lib_path: str) -> str | None:
+    """Return a warning if the target loaded a libcuda the probes are not on.
+
+    The loader may pick another copy than `find_libcuda` did, and uprobes only
+    fire for the probed file. The mapped path is the target's to choose, so
+    its control characters are kept off the terminal.
+    """
+    probed = os.path.realpath(lib_path)
+    if not mapped or probed in mapped:
+        return None
+    from metagross import _events
+
+    return _events.printable(
+        f"metagross: the script loaded {sorted(mapped)[0]}, but the probes "
+        f"are on {probed}; its CUDA calls are not traced")
+
+
 def _child_main(
     script, script_args, creds, barrier_r, profile_w, project_root, python_attribution
 ) -> NoReturn:
@@ -907,9 +924,13 @@ def _trace(cfg, creds, uid, gid, dashboard_port, dashboard_token) -> int:
                     _emit_all(joiner.flush(time.monotonic_ns()))
                     if (libcuda_check_due is not None
                             and time.monotonic() >= libcuda_check_due):
+                        mapped = _bpf.loaded_libcuda(pid)
                         libcuda_check_due = (
-                            None if _bpf.target_loaded_libcuda(pid, lib_path)
+                            None if mapped
                             else time.monotonic() + _LIBCUDA_CHECK_INTERVAL_S)
+                        warning = _libcuda_mismatch_warning(mapped, lib_path)
+                        if warning is not None:
+                            print(warning, file=sys.stderr)
                     wpid, status = os.waitpid(pid, os.WNOHANG)
                     reaped = wpid == pid
                 if reaped:

@@ -529,8 +529,8 @@ def shell_quote_details(details: dict) -> str:
     return " ".join(parts)
 
 
-def _printable(text: str) -> str:
-    """Replace control characters; names in a row come from the target."""
+def printable(text: str) -> str:
+    """Replace control characters; names and paths come from the target."""
     return "".join(
         "?" if unicodedata.category(character).startswith("C") else character
         for character in text)
@@ -603,7 +603,7 @@ class Renderer:
                  str(ev.raw.ret), f"{ev.raw.dur / 1e6:.2f}ms")
         row = "".join(c.ljust(w) if len(c) < w else c + " "
                       for c, (_, w) in zip(cells, _COLUMNS))
-        self._write(_printable(row + shell_quote_details(details)) + "\n")
+        self._write(printable(row + shell_quote_details(details)) + "\n")
 
     def flush(self) -> None:
         try:

@@ -7,7 +7,6 @@ import ctypes.util
 import dataclasses
 import os
 import subprocess
-import sys
 from typing import Callable
 
 from metagross import MetagrossError
@@ -181,23 +180,19 @@ def mapped_libcuda(maps_text: str) -> set[str]:
     return paths
 
 
-def target_loaded_libcuda(pid: int, lib_path: str) -> bool:
-    """Return True once the target has loaded a libcuda.
+def loaded_libcuda(pid: int) -> set[str]:
+    """Return the libcuda files a process has mapped; empty if it has none.
 
-    Warn if it is not the file the probes are on: the loader may pick another
-    copy than `find_libcuda` did, and uprobes only fire for the probed file.
+    A diagnostic only: it must never raise, because an error in the tracing
+    loop ends the capture and kills the target. File names are bytes the
+    target chose, so they are decoded without failing on invalid UTF-8.
     """
     try:
-        with open(f"/proc/{pid}/maps") as maps:
-            mapped = mapped_libcuda(maps.read())
-    except OSError:
-        return False
-    probed = os.path.realpath(lib_path)
-    if mapped and probed not in mapped:
-        print(f"metagross: the script loaded {sorted(mapped)[0]}, but the "
-              f"probes are on {probed}; its CUDA calls are not traced",
-              file=sys.stderr)
-    return bool(mapped)
+        with open(f"/proc/{pid}/maps", encoding="utf-8",
+                  errors="surrogateescape") as maps:
+            return mapped_libcuda(maps.read())
+    except (OSError, ValueError):
+        return set()
 
 
 _HEADER = r"""
