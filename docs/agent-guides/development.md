@@ -69,6 +69,7 @@ predictable, and diagnosable. Favor a boring core over clever tracing magic.
   parent has attached every required uprobe/uretprobe to the exact child PID and
   any explicitly requested dashboard has acknowledged capture start.
 - Drop credentials before exec and preserve the child PID across that boundary.
+  Set `no_new_privs` after the drop so the target cannot regain privileges.
   Use the controller's interpreter and locate the runner from this installation.
 - Allow the target interpreter to finalize normally. Reserve child `os._exit`
   for startup failure before exec, flushing startup diagnostics first.

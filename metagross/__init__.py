@@ -387,6 +387,17 @@ def _drop_privileges(creds) -> None:
     os.environ["LOGNAME"] = creds.user
 
 
+_PR_SET_NO_NEW_PRIVS = 38
+
+
+def _forbid_new_privileges() -> None:
+    """Keep the target from gaining privileges through setuid programs."""
+    libc = ct.CDLL(None, use_errno=True)
+    zero = ct.c_ulong(0)
+    if libc.prctl(_PR_SET_NO_NEW_PRIVS, ct.c_ulong(1), zero, zero, zero) != 0:
+        raise OSError(ct.get_errno(), "prctl(PR_SET_NO_NEW_PRIVS) failed")
+
+
 def _child_main(
     script, script_args, creds, barrier_r, profile_w, project_root, python_attribution
 ) -> NoReturn:
@@ -395,6 +406,7 @@ def _child_main(
 
     if creds is not None:
         _drop_privileges(creds)
+    _forbid_new_privileges()
 
     if os.read(barrier_r, 1) == b"":
         _exit_flushed(1)  # parent died before releasing the barrier

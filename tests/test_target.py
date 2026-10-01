@@ -245,6 +245,15 @@ class TargetExecutionTest(unittest.TestCase):
         )
         self.assertEqual((code, stdout, stderr), (0, "False\n", ""))
 
+    def test_target_cannot_gain_privileges(self):
+        source = (
+            "for line in open('/proc/self/status'):\n"
+            "    if line.startswith('NoNewPrivs'):\n"
+            "        print(line.split()[1])\n"
+        )
+        returncode, stdout, stderr, _ = self._run(source)
+        self.assertEqual((returncode, stdout), (0, "1\n"), stderr)
+
     def test_dropped_credentials_environment_survives_exec(self):
         # Exercise the real exec/environment path without privileged syscalls.
         setup = (

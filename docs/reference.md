@@ -649,7 +649,9 @@ uses numeric `127.0.0.1` without DNS, redirects, or HTTP proxy discovery.
 Run only trusted scripts and trusted local containers. The privileged controller
 loads BPF programs and attaches probes; the target runs as the validated sudo
 caller, or as root when invoked directly as root. The child drops credentials
-before entering a fresh interpreter with the same PID. Its profiling descriptor
+and sets `no_new_privs` before entering a fresh interpreter with the same PID,
+so the target and its descendants cannot gain privileges through setuid
+programs: a script that runs `sudo` works bare but fails under Metagross. Its profiling descriptor
 is restored to close-on-exec before target code runs; controller descriptors do
 not intentionally cross into target code. Arguments remain unchanged. The
 bootstrap removes the producer token before the target can inspect its environment.
