@@ -918,10 +918,15 @@ def _trace(cfg, creds, uid, gid, dashboard_port, dashboard_token) -> int:
         while True:
             try:
                 if not reaped:
+                    # Every call that returned before this instant is handed
+                    # over by the poll below. The profile drain after it can
+                    # take long, so history is pruned relative to this time.
+                    drained_ns = time.monotonic_ns()
                     b.ring_buffer_poll(50)
                     for rec in profile_reader.poll():
                         joiner.on_profile_record(rec)
-                    _emit_all(joiner.flush(time.monotonic_ns()))
+                    _emit_all(joiner.flush(time.monotonic_ns(),
+                                           delivered_until_ns=drained_ns))
                     if (libcuda_check_due is not None
                             and time.monotonic() >= libcuda_check_due):
                         mapped = _bpf.loaded_libcuda(pid)

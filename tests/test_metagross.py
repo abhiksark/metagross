@@ -2533,6 +2533,20 @@ class JoinerTest(unittest.TestCase):
         j.on_gpu_event(_raw(16, ts=990, dur=2, tid=1))
         self.assertEqual(j.flush(now_ns=1100)[0].frame.function, "f")
 
+    def test_call_delivered_after_a_slow_profile_drain_keeps_its_frame(self):
+        # The ring buffer is polled, then the profile drain takes 150 ms.
+        # A call that returned during the drain is delivered on the next
+        # tick; history must reach back to the poll, not to "now".
+        ms = 1_000_000
+        joiner = _events.Joiner()
+        joiner.on_profile_record(
+            ("frame", _profile.CALL, 1, 10 * ms, "train_step", "/p/train.py", 12))
+        self.assertEqual(
+            joiner.flush(160 * ms, delivered_until_ns=10 * ms), [])
+        joiner.on_gpu_event(_raw(1, ts=15 * ms, dur=1 * ms, tid=1))
+        (event,) = joiner.flush(170 * ms, delivered_until_ns=160 * ms)
+        self.assertEqual(event.frame.function, "train_step")
+
     def test_flush_still_prunes_history_older_than_the_hold_window(self):
         j = _events.Joiner(hold_ns=100)
         for ts in range(10, 400, 10):

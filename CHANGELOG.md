@@ -7,6 +7,8 @@ User-visible changes to Metagross. Versions follow `metagross.__version__`.
 - Fix: a mapped file with a name that is not valid UTF-8 no longer makes
   the tracer fail and kill the script, and the wrong-`libcuda` warning no
   longer prints control characters from the library path.
+- Fix: a call delivered after a slow read of the profile stream keeps its
+  function instead of becoming `<unknown>` in a capture reported complete.
 
 ## 0.1.0 (2026-10-01)
 

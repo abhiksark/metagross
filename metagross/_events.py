@@ -282,7 +282,14 @@ class Joiner:
             event.raw, event.api, event.frame, kernel, details, event.span
         )
 
-    def flush(self, now_ns: int, force: bool = False):
+    def flush(self, now_ns: int, force: bool = False,
+              delivered_until_ns: int | None = None):
+        """Release events held for a full window and prune old history.
+
+        `delivered_until_ns` is an instant by which every call that had
+        returned has been handed to `on_gpu_event`: the time just before the
+        ring buffer was last drained. It defaults to `now_ns`.
+        """
         released, kept = [], []
         for ts, raw, api, kernel in self._pending:
             if force or now_ns - ts >= self.hold_ns:
@@ -301,10 +308,14 @@ class Joiner:
             out.append(AttributedEvent(
                 raw, api, self.timeline.attribute(raw.tid, returned_ns),
                 kernel, self.spans.attribute(raw.tid, returned_ns)))
-        # Held events and events still on their way to the controller all
-        # returned within the last hold window; keep that much. Prune even
-        # when nothing was released, or an idle GPU lets the log grow.
-        horizon = now_ns - self.hold_ns
+        # Held events returned within the last hold window, and events not
+        # yet delivered returned after the ring buffer was last drained. The
+        # controller may have spent longer than a hold window since then, so
+        # history is kept back to that drain, not to now. Prune even when
+        # nothing was released, or an idle GPU lets the log grow.
+        if delivered_until_ns is None:
+            delivered_until_ns = now_ns
+        horizon = min(now_ns, delivered_until_ns) - self.hold_ns
         self.timeline.prune(horizon)
         self.spans.prune(horizon)
         return out

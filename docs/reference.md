@@ -711,11 +711,12 @@ The tracer bounds what it keeps from the target's profile pipe: names longer
 than 500 bytes are treated as a corrupt stream, at most 65,536 distinct project
 frames are kept, and unread profile data is capped at 16 MiB, after which the
 target drops and counts records. Calls to frames beyond that count are counted
-as lost profile records, which marks the capture incomplete. Frame history
-older than the 100 ms hold window is discarded on every loop tick, whether or
-not the GPU is active. If the tracer stops reading altogether, the script
-waits at most one second for it, then carries on and drops profile records
-until the tracer reads again; the capture is marked incomplete.
+as lost profile records, which marks the capture incomplete. On every loop
+tick, whether or not the GPU is active, frame history older than 100 ms before
+the last ring buffer drain is discarded. If the tracer stops reading
+altogether, the script waits at most one second for it, then carries on and
+drops profile records until the tracer reads again; the capture is marked
+incomplete.
 
 The dashboard server closes a connection that is silent for 10 seconds and
 serves at most 32 connections at once; further clients are disconnected. This
