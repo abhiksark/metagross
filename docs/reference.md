@@ -12,6 +12,20 @@ Run the included demonstration from the repository root:
 sudo /usr/bin/python3 -m metagross examples/gpu_demo.py
 ```
 
+Metagross can also be installed with pip from a checkout, which adds a
+`metagross` command and makes `import metagross` work from any directory:
+
+```sh
+/usr/bin/python3 -m pip install .
+metagross --version
+```
+
+Install it into the Python that has the BCC bindings if you want to trace with
+it; pip cannot install BCC. The installed command takes the same arguments as
+`python3 -m metagross` and never has the working directory on its import path.
+It has the same name as the Docker wrapper from the quick start, so whichever
+comes first on `PATH` runs.
+
 The tracing interface is:
 
 ```text
@@ -26,8 +40,9 @@ sudo /usr/bin/python3 -m metagross \
 Metagross options must appear before the script. Everything after the script is
 passed to it unchanged. `--project-root` defaults to the current directory.
 The script must resolve to a regular `.py` file inside that directory.
-Use `/usr/bin/python3 -m metagross --help` (or `-h`) for usage without root,
-BCC, CUDA, or a target script. Help flags after the script go to the target.
+Use `/usr/bin/python3 -m metagross --help` (or `-h`) for usage and `--version`
+for the version, without root, BCC, CUDA, or a target script. Help flags after
+the script go to the target.
 
 | Tracer option | Default and behavior |
 |---------------|----------------------|

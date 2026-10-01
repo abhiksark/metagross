@@ -62,6 +62,8 @@ import time
 import traceback
 from typing import NoReturn
 
+__version__ = "0.1.0"
+
 
 def __getattr__(name: str):
     """Lazily re-export `metagross.span` (PEP 562).
@@ -92,6 +94,7 @@ class UsageError(MetagrossError):
 @dataclasses.dataclass
 class Config:
     show_help: bool = False
+    show_version: bool = False
     json_output: bool = False
     output_path: str | None = None
     project_root: str = "."
@@ -130,7 +133,7 @@ _USAGE = (
     "       /usr/bin/python3 -m metagross [--trace FAMILIES] --ebpf\n"
     "       /usr/bin/python3 -m metagross view (--snapshot|--follow|--web) TRACE.jsonl\n"
     "       /usr/bin/python3 -m metagross view --web --receive [--port PORT]\n"
-    "       /usr/bin/python3 -m metagross [-h|--help]\n"
+    "       /usr/bin/python3 -m metagross [-h|--help] [--version]\n"
 )
 
 
@@ -178,6 +181,9 @@ def parse_args(argv: list[str]) -> Config:
         arg = argv[i]
         if arg in ("-h", "--help"):
             cfg.show_help = True
+            return cfg
+        if arg == "--version":
+            cfg.show_version = True
             return cfg
         if not arg.startswith("--"):
             cfg.script = arg
@@ -1049,6 +1055,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if cfg.show_help:
         print(_USAGE, end="")
+        return 0
+    if cfg.show_version:
+        print(f"metagross {__version__}")
         return 0
     if cfg.dump_ebpf:
         from metagross import _bpf

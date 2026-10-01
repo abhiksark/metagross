@@ -74,6 +74,8 @@ When packaging or distribution is introduced, make sure to document and test:
   findings, plans, or files that are not in the repository.
 - Make one logical change per commit. Fold a fix to the commit it repairs
   before pushing instead of adding a follow-up commit.
-- If a changelog is added later, update it for user-visible changes.
+- Update `CHANGELOG.md` for user-visible changes.
+- The version lives in `metagross/__init__.py` (`__version__`); `pyproject.toml`
+  reads it from there.
 - If semantic releases are added later, ensure commit messages match the release
   tooling's expectations.

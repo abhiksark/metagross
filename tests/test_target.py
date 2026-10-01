@@ -375,6 +375,16 @@ class TopLevelHelpTest(unittest.TestCase):
                 self.assertIn("usage:", stdout.getvalue())
                 self.assertEqual(stderr.getvalue(), "")
 
+    def test_version_is_unprivileged_and_matches_the_package(self):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout), \
+             mock.patch("metagross.run_live", side_effect=AssertionError):
+            code = metagross.main(["--version"])
+        self.assertEqual(code, 0)
+        self.assertEqual(stdout.getvalue(),
+                         f"metagross {metagross.__version__}\n")
+        self.assertRegex(metagross.__version__, r"^\d+\.\d+\.\d+$")
+
     def test_help_after_target_is_passed_through(self):
         cfg = metagross.parse_args(["target.py", "-h", "--help"])
         self.assertEqual(cfg.script_args, ["-h", "--help"])

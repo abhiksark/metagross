@@ -66,3 +66,5 @@ Verification; user-visible/product changes also require Documentation and releas
 - `tests/test_metagross.py`: unprivileged unit suite plus root/CUDA integration tests
   gated by `RUN_EBPF_INTEGRATION=1`.
 - `examples/`: lightweight runnable examples aligned with the README.
+- `pyproject.toml`: packaging metadata; the version is read from
+  `metagross.__version__`.

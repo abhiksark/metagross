@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "metagross"
+dynamic = ["version"]
+description = "Trace which function in a Python script caused each CUDA driver API call, using eBPF."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = [{name = "Abhik Sarkar"}]
+# No Python dependencies. Live tracing needs the BCC bindings from the
+# distribution (python3-bpfcc on Ubuntu), which pip cannot install.
+dependencies = []
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+]
+
+[project.scripts]
+metagross = "metagross:main"
+
+[project.urls]
+Repository = "https://github.com/abhiksark/metagross"
+
+[tool.setuptools]
+packages = ["metagross"]
+
+[tool.setuptools.dynamic]
+version = {attr = "metagross.__version__"}
