@@ -4,57 +4,57 @@
       "api": "cuCtxSynchronize",
       "count": 1,
       "errors": 0,
-      "max_duration_ns": 5550,
+      "max_duration_ns": 5340,
       "successful_bytes": 0,
-      "total_duration_ns": 5550
+      "total_duration_ns": 5340
     },
     {
       "api": "cuLaunchKernel",
       "count": 3,
       "errors": 0,
-      "max_duration_ns": 13074,
+      "max_duration_ns": 18424,
       "successful_bytes": 0,
-      "total_duration_ns": 32531
+      "total_duration_ns": 44473
     },
     {
       "api": "cuMemAlloc",
       "count": 6,
       "errors": 0,
-      "max_duration_ns": 129881,
+      "max_duration_ns": 328783,
       "successful_bytes": 52560896,
-      "total_duration_ns": 428046
+      "total_duration_ns": 805732
     },
     {
       "api": "cuMemFree",
       "count": 1,
       "errors": 0,
-      "max_duration_ns": 2745,
+      "max_duration_ns": 7444,
       "successful_bytes": 0,
-      "total_duration_ns": 2745
+      "total_duration_ns": 7444
     },
     {
       "api": "cuMemcpyDtoHAsync",
       "count": 1,
       "errors": 0,
-      "max_duration_ns": 21229,
+      "max_duration_ns": 25798,
       "successful_bytes": 64,
-      "total_duration_ns": 21229
+      "total_duration_ns": 25798
     },
     {
       "api": "cuMemcpyHtoDAsync",
       "count": 2,
       "errors": 0,
-      "max_duration_ns": 295099,
+      "max_duration_ns": 424242,
       "successful_bytes": 8388608,
-      "total_duration_ns": 566053
+      "total_duration_ns": 779986
     },
     {
       "api": "cuStreamSynchronize",
       "count": 3,
       "errors": 0,
-      "max_duration_ns": 43772,
+      "max_duration_ns": 39173,
       "successful_bytes": 0,
-      "total_duration_ns": 83806
+      "total_duration_ns": 73808
     }
   ],
   "capture": {
@@ -63,6 +63,7 @@
     "dropped_nested_calls": 0,
     "events": 17,
     "lost_events": 0,
+    "lost_profile_records": 0,
     "render_failed": false,
     "trace_failed": false,
     "unknown_attribution": 0
@@ -93,12 +94,12 @@
   "schema_version": 1,
   "target": {
     "exit_status": 0,
-    "pid": 964102,
+    "pid": 1922567,
     "script": "/workspace/workloads/basic_tensor_ops.py"
   },
   "timing": {
-    "synchronization_duration_ns": 89356,
-    "total_api_duration_ns": 1139960
+    "synchronization_duration_ns": 79148,
+    "total_api_duration_ns": 1742581
   },
   "top_functions": [
     {
@@ -107,9 +108,9 @@
       "file": "/workspace/workloads/basic_tensor_ops.py",
       "function": "compute",
       "line": 21,
-      "max_duration_ns": 69169,
+      "max_duration_ns": 106308,
       "successful_bytes": 29492224,
-      "total_duration_ns": 209340
+      "total_duration_ns": 287556
     },
     {
       "count": 5,
@@ -117,9 +118,9 @@
       "file": "/workspace/workloads/basic_tensor_ops.py",
       "function": "upload_inputs",
       "line": 12,
-      "max_duration_ns": 295099,
+      "max_duration_ns": 424242,
       "successful_bytes": 29360128,
-      "total_duration_ns": 777125
+      "total_duration_ns": 1079365
     },
     {
       "count": 4,
@@ -127,35 +128,36 @@
       "file": "/workspace/workloads/basic_tensor_ops.py",
       "function": "download_checksum",
       "line": 27,
-      "max_duration_ns": 121075,
+      "max_duration_ns": 328783,
       "successful_bytes": 2097216,
-      "total_duration_ns": 153495
+      "total_duration_ns": 375660
     }
   ],
   "top_kernels": [
     {
       "count": 1,
       "errors": 0,
-      "kernel": "_ZN2at6native29vectorized_elementwise_kernelILi4EZZZNS0_49_GLOBAL__N__d2ba64fb_16_TensorCompare_cu_71e06f4e19launch_clamp_scala",
-      "max_duration_ns": 13074,
+      "kernel": "_ZN2at6native18elementwise_kernelILi128ELi2EZNS0_22gpu_kernel_impl_nocastIZZZNS0_23direct_copy_kernel_cudaERNS_18TensorIterator",
+      "max_duration_ns": 18424,
       "successful_bytes": 0,
-      "total_duration_ns": 13074
+      "total_duration_ns": 18424
+    },
+    {
+      "count": 1,
+      "errors": 0,
+      "kernel": "_ZN2at6native29vectorized_elementwise_kernelILi4EZZZNS0_49_GLOBAL__N__d2ba64fb_16_TensorCompare_cu_71e06f4e19launch_clamp_scala",
+      "max_duration_ns": 13956,
+      "successful_bytes": 0,
+      "total_duration_ns": 13956
     },
     {
       "count": 1,
       "errors": 0,
       "kernel": "ampere_sgemm_128x64_nn",
-      "max_duration_ns": 10881,
+      "max_duration_ns": 12093,
       "successful_bytes": 0,
-      "total_duration_ns": 10881
-    },
-    {
-      "count": 1,
-      "errors": 0,
-      "kernel": "_ZN2at6native18elementwise_kernelILi128ELi2EZNS0_22gpu_kernel_impl_nocastIZZZNS0_23direct_copy_kernel_cudaERNS_18TensorIterator",
-      "max_duration_ns": 8576,
-      "successful_bytes": 0,
-      "total_duration_ns": 8576
+      "total_duration_ns": 12093
     }
-  ]
+  ],
+  "top_spans": []
 }

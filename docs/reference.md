@@ -209,7 +209,7 @@ treat saved JSONL files accordingly.
 table or JSONL event output:
 
 ```text
-metagross: stats events=541 attributed=276 unknown=265 errors=0 lost=0 dropped=0 complete=true
+metagross: stats events=541 attributed=276 unknown=265 errors=0 lost=0 dropped=0 lost_profile=0 complete=true
 ```
 
 `--summary-output FILE` writes a separate, versioned JSON document with capture

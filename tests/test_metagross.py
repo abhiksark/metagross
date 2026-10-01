@@ -2206,6 +2206,27 @@ class SpanJoinTest(unittest.TestCase):
         self.assertEqual(j.timeline._horizons.get(1), j.spans._horizons.get(1))
 
 
+class ExampleCaptureTest(unittest.TestCase):
+    def test_example_capture_has_the_current_record_and_summary_shape(self):
+        # The reference points readers at these files as complete examples.
+        raw = _raw(16, ts=1, dur=1, tid=1)
+        event = _events.EnrichedEvent(raw, _bpf.API_BY_ID[16], None, None, {})
+        record_keys = set(_events.event_record(event, 0, 1))
+        with open("examples/captures/basic.jsonl", encoding="utf-8") as stream:
+            for line in stream:
+                self.assertEqual(set(json.loads(line)), record_keys)
+        snapshot = _events.CaptureStats().snapshot(
+            lost_events=0, dropped_nested_calls=0,
+            observed_outstanding_bytes=0, render_failed=False,
+            trace_failed=False)
+        with open("examples/captures/basic-summary.json",
+                  encoding="utf-8") as stream:
+            summary = json.load(stream)
+        self.assertEqual(set(summary) - {"configuration", "target"},
+                         set(snapshot))
+        self.assertEqual(set(summary["capture"]), set(snapshot["capture"]))
+
+
 class RendererTest(unittest.TestCase):
     def _emit(self, ev, json_output):
         j = _events.Joiner()
