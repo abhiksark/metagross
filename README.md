@@ -21,7 +21,7 @@ their host-side elapsed time, not GPU kernel execution time or utilization.
 This is an experimental, source-only public preview for tracing one trusted
 Python workload on your own machine.
 
-<img src="assets/dashboard-demo.webp" alt="A terminal runs metagross --web run.py and streams CUDA driver calls, each labeled with its Python function; the web dashboard then fills with those calls grouped by function, shows one cuBLAS launch's details and the summary panels, and the video ends on the metagross run.py command" width="1000">
+<img src="assets/dashboard-demo.webp" alt="A terminal runs metagross --web run.py and streams CUDA driver calls, each labeled with its Python function; the web dashboard then fills with those calls grouped by function, shows one cuBLAS launch's details and the summary panels, and the video ends on the metagross run.py command and the line Trace it while it serves live traffic" width="1000">
 
 *The command traces the PyTorch pipeline example; the terminal shows a shortened
 stream of its trace rows. The dashboard section is a recorded trace of the same
