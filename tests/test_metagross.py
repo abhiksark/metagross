@@ -465,6 +465,11 @@ class DockerWrapperTest(unittest.TestCase):
         self.assertIn("--network=host", argv)
         self.assertEqual(argv[-2:], ["--web", "run.py"])
 
+    def test_web_after_the_script_is_a_script_argument(self):
+        _, argv = self._docker_argv("run.py", "--web")
+        self.assertNotIn("--network=host", argv)
+        self.assertEqual(argv[-2:], ["run.py", "--web"])
+
     def test_image_override(self):
         _, argv = self._docker_argv(image="metagross-pytorch:cu128")
         self.assertEqual(argv[-1], "metagross-pytorch:cu128")

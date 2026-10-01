@@ -100,7 +100,8 @@ docker run --rm -i --gpus all --privileged --pid=host \
   isolation: the container is privileged, shares the host PID namespace, and
   mounts host kernel directories, so running it is equivalent to root on the
   host.
-- `--web` adds `--network host` so your browser can reach the dashboard.
+- `--web` before the script adds `--network host` so your browser can reach the
+  dashboard. After the script it is one of the script's own arguments.
 - `METAGROSS_IMAGE` selects another image tag, for example
   `METAGROSS_IMAGE=metagross-pytorch:cu128 metagross run.py`.
 - `--output` and `--summary-output` refuse a directory that other users or

@@ -3,7 +3,10 @@
 # Runs Metagross from its Docker image on a script in the current directory.
 network=
 for arg in "$@"; do
-    [ "$arg" = --web ] && network=--network=host
+    case "$arg" in
+        --web) network=--network=host ;;
+        *.py) break ;;  # the script: what follows belongs to it
+    esac
 done
 exec docker run --rm -i --gpus all --privileged --pid=host $network \
     -v /lib/modules:/lib/modules:ro -v /usr/src:/usr/src:ro \
