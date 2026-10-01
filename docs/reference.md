@@ -132,18 +132,38 @@ with metagross.span("forward"):
     model(inputs)
 ```
 
-Every CUDA API call attributed while a span is open on the calling thread
-carries that span's name in its `span` field, alongside its usual project
-function attribution. Spans nest: the innermost open span on a thread is the
-one recorded, and closing one (`__exit__`) always closes the innermost still
-open on that thread, mirroring ordinary Python `with`-block nesting. A
-`metagross.span()` call outside a running trace (the script run bare, without
+Every CUDA API call made while a span is open carries that span's name in its
+`span` field, alongside its usual project function attribution. Spans nest:
+the innermost open span is the one recorded.
+
+Each thread and each `asyncio` task has its own spans. A span held open across
+an `await` labels only the calls its own task makes; other tasks that run on
+the same thread in the meantime keep their own span, or `null`. A task or
+thread started inside a span (for example with `asyncio.create_task` or
+`asyncio.to_thread`) is labelled with it only while the span stays open.
+Threads started any other way, including `loop.run_in_executor` workers,
+start with no span.
+
+A `metagross.span()` call outside a running trace (the script run bare, without
 `sudo /usr/bin/python3 -m metagross`) is a no-op — the `with` block still
 runs its body normally, so instrumented scripts stay runnable unmodified.
 Spans use the same profile pipe and interning writer as project-function
 attribution (see [Overhead and limits](#overhead-and-limits)) and fail closed
-the same way: a span left open across a lost or gapped record resolves to no
-span (`null`) rather than a guessed one.
+rather than guess:
+
+- After a lost profile record, a thread's span is `null` until its span next
+  changes.
+- Closing a span while another span opened later in the same task or thread is
+  still open (possible with interleaved generators or manual `__enter__` and
+  `__exit__` calls) makes every span open there report `null` until it closes.
+- Task switches are detected when the resumed task enters a Python function,
+  which `asyncio` always does. Schedulers that resume in the middle of a
+  function, such as greenlets and gevent, are not supported: their calls can
+  carry another greenlet's span.
+
+Once a script opens its first span, the profiling hook compares the running
+task's span with the last one reported on every Python call, which adds about
+0.1 µs per call. Scripts that never open a span do not pay this.
 
 ## Output
 
@@ -169,8 +189,9 @@ output displays only its basename. `line` is the function definition line.
 `return_code` is the signed raw CUDA driver `CUresult`. Timestamps are local ISO
 8601 values derived from the API call's monotonic start time and the parent
 startup wall-clock offset. `span` is the name of the innermost
-[`metagross.span()`](#op-spans) region active at API entry on the same thread,
-or `null` when no span was active; it is additive and always present.
+[`metagross.span()`](#op-spans) region active at API entry in the calling thread
+or `asyncio` task, or `null` when no span was active; it is additive and always
+present.
 
 For a launch with a resolved name, `kernel` contains that name. For non-launch
 events it is `null`. An unresolved launch is shown as `kernel@0x...` in table

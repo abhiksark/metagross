@@ -1,7 +1,8 @@
 # metagross/_profile.py
-"""Profiling hooks run inside the traced child; record codec (wire v2)."""
+"""Profiling hooks run inside the traced child; record codec (wire v3)."""
 from __future__ import annotations
 
+import contextvars
 import os
 import queue
 import struct
@@ -25,10 +26,10 @@ HELLO = 0
 FRAME_DEF = 1
 _FRAME_CALL_RTYPE = 2
 _FRAME_RETURN_RTYPE = 3
-SPAN_BEGIN = 4
-SPAN_END = 5
+SPAN_SET = 4    # a thread's active span is now this name
+SPAN_CLEAR = 5  # a thread has no active span
 
-_WIRE_VERSION = 2
+_WIRE_VERSION = 3
 _SEQ_MOD = 2**32
 _MAX_STR = 500
 
@@ -39,8 +40,8 @@ _FRAME_DEF_PREFIX = struct.Struct("<IIIHH")  # frame_id, line, _pad, func_len, p
 # CALL/RETURN carry only the interned frame_id; FRAME_DEF (above) is what
 # assigns func/path/line to that id, once, the first time a frame is seen.
 _FRAME_REF_BODY = struct.Struct("<IQI")  # tid, ts_ns, frame_id
-_SPAN_BEGIN_PREFIX = struct.Struct("<IQH")  # tid, ts_ns, name_len
-_SPAN_END_BODY = struct.Struct("<IQ")  # tid, ts_ns
+_SPAN_SET_PREFIX = struct.Struct("<IQH")  # tid, ts_ns, name_len
+_SPAN_CLEAR_BODY = struct.Struct("<IQ")  # tid, ts_ns
 
 _FRAME_RTYPE_BY_KIND = {CALL: _FRAME_CALL_RTYPE, RETURN: _FRAME_RETURN_RTYPE}
 _KIND_BY_FRAME_RTYPE = {_FRAME_CALL_RTYPE: CALL, _FRAME_RETURN_RTYPE: RETURN}
@@ -123,19 +124,13 @@ class _FrameEmitter:
     wants to inspect or drop-and-count individual records can do so.
 
     Owns its own lock, held across every `_next_seq()` + `write()` pair
-    (`emit`, `span_begin`, `span_end` alike): `emit` runs on the
-    `threading.setprofile` hook, firing on every target thread, while
-    `span_begin`/`span_end` run on whatever thread the target's own code
-    calls `metagross.span()` from -- with no shared closure to lock through
-    the way the hook alone used to. Without a single lock covering both
-    paths, a concurrent hook `emit` and a `span()` call race on the
-    module-global `_next_seq()` counter and the interleaving of their
-    writes, producing out-of-order or duplicate seqs on the wire and
-    manufacturing false gaps. No reentrancy hazard: everything this lock
-    guards ends in a write to `write_fd` via `_DropCountWriter`, and nothing
-    on that path is project code the profiling hook would itself trace (see
-    `_ProjectClassifier`'s `_SELF_DIR` exclusion in `install()`), so the
-    lock is never re-acquired from inside itself.
+    (`emit` and `span` alike). Both run on every target thread, so without
+    one lock they race on the module-global `_next_seq()` counter and the
+    interleaving of their writes, producing out-of-order or duplicate seqs
+    on the wire and manufacturing false gaps. No reentrancy hazard: `emit`
+    only runs inside the profiling hook, where Python does not re-enter the
+    hook, and `report_span` records a thread's new span before it calls
+    `span`, so the hook has nothing left to report from inside the write.
     """
 
     def __init__(self, write):
@@ -155,13 +150,9 @@ class _FrameEmitter:
                 self._write(_encode_frame_def(frame_id, func, path, line))
             self._write(_encode_frame_ref(kind, tid, ts, frame_id))
 
-    def span_begin(self, tid, ts, name) -> None:
+    def span(self, tid, ts, name) -> None:
         with self._lock:
-            self._write(encode_span_begin(tid, ts, name))
-
-    def span_end(self, tid, ts) -> None:
-        with self._lock:
-            self._write(encode_span_end(tid, ts))
+            self._write(encode_span(tid, ts, name))
 
 
 class _DropCountWriter:
@@ -214,16 +205,15 @@ class _DropCountWriter:
                 return  # broken trace pipe must never kill the target
 
 
-def encode_span_begin(tid, ts_ns, name) -> bytes:
+def encode_span(tid, ts_ns, name) -> bytes:
+    """Encode the span now active on a thread; `None` means no span."""
+    seq = _next_seq()
+    if name is None:
+        return (_COMMON.pack(SPAN_CLEAR, seq, 0)
+                + _SPAN_CLEAR_BODY.pack(tid, ts_ns))
     name_bytes = name.encode("utf-8", "replace")[:_MAX_STR]
-    seq = _next_seq()
-    return (_COMMON.pack(SPAN_BEGIN, seq, 0)
-            + _SPAN_BEGIN_PREFIX.pack(tid, ts_ns, len(name_bytes)) + name_bytes)
-
-
-def encode_span_end(tid, ts_ns) -> bytes:
-    seq = _next_seq()
-    return _COMMON.pack(SPAN_END, seq, 0) + _SPAN_END_BODY.pack(tid, ts_ns)
+    return (_COMMON.pack(SPAN_SET, seq, 0)
+            + _SPAN_SET_PREFIX.pack(tid, ts_ns, len(name_bytes)) + name_bytes)
 
 
 class RecordReader:
@@ -324,29 +314,29 @@ class RecordReader:
                 kind = _KIND_BY_FRAME_RTYPE[rtype]
                 out.append(("frame", kind, tid, ts_ns, *frame))
                 continue
-            if rtype == SPAN_BEGIN:
+            if rtype == SPAN_SET:
                 prefix_off = _COMMON.size
-                if len(self._buf) < prefix_off + _SPAN_BEGIN_PREFIX.size:
+                if len(self._buf) < prefix_off + _SPAN_SET_PREFIX.size:
                     break
-                tid, ts_ns, nl = _SPAN_BEGIN_PREFIX.unpack_from(
+                tid, ts_ns, nl = _SPAN_SET_PREFIX.unpack_from(
                     self._buf, prefix_off)
-                body_off = prefix_off + _SPAN_BEGIN_PREFIX.size
+                body_off = prefix_off + _SPAN_SET_PREFIX.size
                 total = body_off + nl
                 if len(self._buf) < total:
                     break
                 name = self._buf[body_off:total].decode("utf-8", "replace")
                 self._buf = self._buf[total:]
                 self._note_seq(seq, out, ts_ns)
-                out.append(("span_begin", tid, ts_ns, name))
+                out.append(("span", tid, ts_ns, name))
                 continue
-            if rtype == SPAN_END:
-                need = _COMMON.size + _SPAN_END_BODY.size
+            if rtype == SPAN_CLEAR:
+                need = _COMMON.size + _SPAN_CLEAR_BODY.size
                 if len(self._buf) < need:
                     break
-                tid, ts_ns = _SPAN_END_BODY.unpack_from(self._buf, _COMMON.size)
+                tid, ts_ns = _SPAN_CLEAR_BODY.unpack_from(self._buf, _COMMON.size)
                 self._buf = self._buf[need:]
                 self._note_seq(seq, out, ts_ns)
-                out.append(("span_end", tid, ts_ns))
+                out.append(("span", tid, ts_ns, None))
                 continue
             # Unknown rtype: there is no length field we can trust, so the
             # stream cannot be resynchronized. Drop it and fail closed
@@ -549,16 +539,52 @@ _current_emitter: "_FrameEmitter | None" = None
 def current_emitter() -> "_FrameEmitter | None":
     """Return the installed `_FrameEmitter`, or `None` if profiling is not
     installed (or has been disabled, e.g. in a forked child).
-
-    Task 5's `span()` context manager emits SPAN_BEGIN/SPAN_END through
-    this same interning, drop-counting emitter rather than opening a
-    second path to the pipe.
     """
     return _current_emitter
 
 
+class OpenSpan:
+    """One `metagross.span()` block; `name` becomes None once it closes."""
+
+    __slots__ = ("name",)
+
+    def __init__(self, name: str):
+        self.name = name
+
+
+# The spans open in the running context, outermost first. A context variable
+# gives every thread and every asyncio task its own stack.
+open_spans: contextvars.ContextVar[tuple[OpenSpan, ...]] = (
+    contextvars.ContextVar("metagross_open_spans", default=()))
+_reported_span = threading.local()  # the span last written for this thread
+_spans_used = False
+
+
+def report_span() -> None:
+    """Write this thread's active span if it changed since the last report.
+
+    `span()` calls this when a block opens and closes. From the first span
+    on, the profiling hook also calls it whenever the running context's
+    innermost span differs from the last report, which is how a switch
+    between asyncio tasks reaches the tracer.
+    """
+    global _spans_used
+    emitter = _current_emitter
+    if emitter is None:
+        return
+    _spans_used = True
+    stack = open_spans.get()
+    name = stack[-1].name if stack else None
+    if name != getattr(_reported_span, "name", None):
+        # Record the change before writing it: the write makes Python calls,
+        # and the hook must find nothing left to report from inside them.
+        _reported_span.name = name
+        emitter.span(threading.get_native_id(), time.monotonic_ns(), name)
+
+
 def install(write_fd: int, project_root: str) -> None:
-    global _current_emitter
+    global _current_emitter, _spans_used
+    _spans_used = False
     local = threading.local()
     classifier = _ProjectClassifier(project_root)
 
@@ -578,6 +604,13 @@ def install(write_fd: int, project_root: str) -> None:
     def hook(frame, event, arg):
         if event == "call":
             kind = CALL
+            if _spans_used:
+                # A resumed asyncio task starts with a call event in its own
+                # context, and any Python frame can be that first one.
+                stack = open_spans.get()
+                if ((stack[-1].name if stack else None)
+                        != getattr(_reported_span, "name", None)):
+                    report_span()
         elif event == "return":
             kind = RETURN
         else:
@@ -595,8 +628,8 @@ def install(write_fd: int, project_root: str) -> None:
         # together, or the reader sees seqs out of order and manufactures
         # false gaps (see _next_seq's docstring). emit() may issue two
         # writes (a first-sight FRAME_DEF, then the CALL/RETURN) that must
-        # land back-to-back -- and a concurrent metagross.span() call on
-        # another thread must not interleave with either. `emitter`'s own
+        # land back-to-back -- and a span report on another thread must
+        # not interleave with either. `emitter`'s own
         # lock (held inside `emit`) covers both concerns; there is no
         # separate lock here to take.
         emitter.emit(kind, tid, ts_ns, func, path, line)

@@ -47,7 +47,7 @@ To try the dashboard without root, BCC, CUDA, or a GPU, open the
 | [Driver call tracing](docs/reference.md#traced-api-table) | Reports 17 CUDA driver APIs through eBPF uprobes: kernel launches, allocations and frees, memory copies, and stream, context, and event synchronization. Three more probes read kernel names. Needs no changes to the traced script; `--trace` selects any of the `launch`, `memory`, `copy`, and `sync` families. |
 | [Python attribution](docs/reference.md#how-attribution-works) | Assigns each call to the function under the project root that was active at API entry, skipping standard-library, installed-package, and Metagross frames. Calls with no safe project frame stay `<unknown>`; `--no-attribution` turns function attribution off. |
 | [Call details](docs/reference.md#traced-api-table) | Records the return code, CPU-side duration, and per-API arguments: launch grid, block, shared memory, and stream; byte counts; pointers; and resolved kernel names. |
-| [Named regions](docs/reference.md#op-spans) | Labels the calls made inside `with metagross.span("name"):` on the same thread, in table and JSONL output. Spans need function attribution and do nothing when the script runs outside a trace. |
+| [Named regions](docs/reference.md#op-spans) | Labels the calls made inside `with metagross.span("name"):` by the same thread or `asyncio` task, in table and JSONL output. Spans need function attribution and do nothing when the script runs outside a trace. |
 | [Live web dashboard](#read-the-dashboard) | Shows the capture in a browser as it runs, started with `--web`: a function-grouped timeline with zoom, pan, and filters, an event table with a detail inspector, and API, function, kernel, and allocation summaries. |
 | [Terminal viewers](docs/reference.md#viewer-option-reference) | Prints a static dashboard with `view --snapshot` or follows a growing JSONL file with `view --follow`. Both run without root, BCC, CUDA, or a GPU. |
 | [Durable output](docs/reference.md#output) | Writes table rows to stderr by default, stable JSONL with `--json --output`, a versioned summary with `--summary-output`, and a one-line capture report with `--stats`. |
@@ -172,9 +172,10 @@ with metagross.span("step"):
     ...
 ```
 
-Calls made inside the block on the same thread carry `"step"` in the `span`
-field of table and JSONL output; the web dashboard does not show spans. Spans
-need function attribution and do nothing when the script runs outside a trace.
+Calls made inside the block by the same thread or `asyncio` task carry `"step"`
+in the `span` field of table and JSONL output; the web dashboard does not show
+spans. Spans need function attribution and do nothing when the script runs
+outside a trace.
 See [op spans](docs/reference.md#op-spans) and the annotated
 [`examples/quicklook.py`](examples/quicklook.py).
 

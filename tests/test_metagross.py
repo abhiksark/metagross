@@ -2,6 +2,7 @@
 """Tests for metagross. Unprivileged unless RUN_EBPF_INTEGRATION=1."""
 import collections
 import contextlib
+import contextvars
 import io
 import json
 import http.server
@@ -1134,7 +1135,7 @@ class RecordCodecTest(unittest.TestCase):
         reader = _profile.RecordReader()
         self.assertEqual(
             reader.feed(_profile.encode_hello(pid=4321, start_ns=99)), [])
-        self.assertEqual(reader.version, 2)
+        self.assertEqual(reader.version, 3)
 
     def test_missing_hello_emits_gap_then_frame(self):
         # No HELLO fed first: _expected starts as None, so the very first
@@ -1161,10 +1162,10 @@ class RecordCodecTest(unittest.TestCase):
 
     def test_span_roundtrip(self):
         reader = self._reader_after_hello()
-        begin = _profile.encode_span_begin(9, 100, "fwd")
-        end = _profile.encode_span_end(9, 150)
-        self.assertEqual(reader.feed(begin), [("span_begin", 9, 100, "fwd")])
-        self.assertEqual(reader.feed(end), [("span_end", 9, 150)])
+        named = _profile.encode_span(9, 100, "fwd")
+        none = _profile.encode_span(9, 150, None)
+        self.assertEqual(reader.feed(named), [("span", 9, 100, "fwd")])
+        self.assertEqual(reader.feed(none), [("span", 9, 150, None)])
 
     def test_unknown_rtype_does_not_raise(self):
         reader = self._reader_after_hello()
@@ -1228,9 +1229,8 @@ class FrameEmitterConcurrencyTest(unittest.TestCase):
         _profile._reset_seq()
 
     def test_concurrent_emit_and_span_do_not_desync_seq(self):
-        # emit() runs on the threading.setprofile hook (fires on every
-        # target thread); span_begin/span_end run on whatever thread the
-        # target's own code calls metagross.span() from. Without a single
+        # emit() and span() both run on the threading.setprofile hook, which
+        # fires on every target thread. Without a single
         # lock covering _next_seq() + write() for both paths, a race
         # between them interleaves or duplicates seqs on the wire and the
         # reader manufactures false gaps. list.append is itself atomic
@@ -1259,8 +1259,8 @@ class FrameEmitterConcurrencyTest(unittest.TestCase):
 
             def span_worker():
                 for i in range(3000):
-                    emitter.span_begin(2, i, "op")
-                    emitter.span_end(2, i)
+                    emitter.span(2, i, "op")
+                    emitter.span(2, i, None)
 
             threads = [threading.Thread(target=emit_worker),
                        threading.Thread(target=span_worker)]
@@ -1278,10 +1278,7 @@ class FrameEmitterConcurrencyTest(unittest.TestCase):
         self.assertNotIn("gap", [rec[0] for rec in records])
         self.assertEqual(reader.lost_records, 0)
 
-    def test_span_begin_and_span_end_hold_the_lock_across_the_write(self):
-        # A direct assertion the coordinator's finding also asked for: the
-        # write for span_begin/span_end happens while the emitter's lock is
-        # held, not released beforehand.
+    def test_span_holds_the_lock_across_the_write(self):
         emitter = _profile._FrameEmitter(lambda data: None)
         held = []
 
@@ -1289,8 +1286,8 @@ class FrameEmitterConcurrencyTest(unittest.TestCase):
             held.append(emitter._lock.locked())
 
         emitter._write = write
-        emitter.span_begin(1, 10, "op")
-        emitter.span_end(1, 20)
+        emitter.span(1, 10, "op")
+        emitter.span(1, 20, None)
         self.assertEqual(held, [True, True])
 
 
@@ -1527,6 +1524,75 @@ class InstallHookTest(unittest.TestCase):
         kinds = [rec[1] for rec in frames if rec[4] == "hot"]
         self.assertEqual(sorted(set(kinds)), [_profile.CALL, _profile.RETURN])
 
+    def test_asyncio_tasks_keep_their_own_spans(self):
+        # Three tasks interleave on one thread: two hold their own span
+        # across awaits and one has none. Each probe call must see the span
+        # of the task that made it.
+        r, w = os.pipe()
+        project = (
+            "import asyncio\n"
+            "import metagross\n"
+            "def probe_a(): pass\n"
+            "def probe_b(): pass\n"
+            "def probe_c(): pass\n"
+            "async def spanned(name, probe):\n"
+            "    with metagross.span(name):\n"
+            "        for _ in range(3):\n"
+            "            await asyncio.sleep(0)\n"
+            "            probe()\n"
+            "async def bare(probe):\n"
+            "    for _ in range(3):\n"
+            "        await asyncio.sleep(0)\n"
+            "        probe()\n"
+            "async def main():\n"
+            "    await asyncio.gather(spanned('request-a', probe_a),\n"
+            "                         spanned('request-b', probe_b),\n"
+            "                         bare(probe_c))\n"
+            "def run():\n"
+            "    asyncio.run(main())\n"
+        )
+        code = (
+            "import os, sys, tempfile\n"
+            "sys.path.insert(0, %r)\n"
+            "from metagross import _profile\n"
+            "d = tempfile.mkdtemp()\n"
+            "with open(os.path.join(d, 'proj.py'), 'w') as stream:\n"
+            "    stream.write(%r)\n"
+            "sys.path.insert(0, d)\n"
+            "_profile.install(%d, d)\n"
+            "import proj\n"
+            "proj.run()\n"
+            "sys.setprofile(None)\n"
+        ) % (os.getcwd(), project, w)
+        pid = os.fork()
+        if pid == 0:
+            os.close(r)
+            exec(code)  # noqa: S102 — test child
+            os._exit(0)
+        os.close(w)
+        data = b""
+        while chunk := os.read(r, 4096):
+            data += chunk
+        os.close(r)
+        os.waitpid(pid, 0)
+        records = _profile.RecordReader().feed(data)
+        self.assertNotIn("gap", [rec[0] for rec in records])
+        joiner = _events.Joiner()
+        for rec in records:
+            joiner.on_profile_record(rec)
+        seen = {}
+        for rec in records:
+            if rec[0] == "frame" and rec[1] == _profile.CALL:
+                _, _, tid, ts, func, _, _ = rec
+                if func.startswith("probe_"):
+                    seen.setdefault(func, []).append(
+                        joiner.spans.attribute(tid, ts))
+        self.assertEqual(seen, {
+            "probe_a": ["request-a"] * 3,
+            "probe_b": ["request-b"] * 3,
+            "probe_c": [None] * 3,
+        })
+
     def test_forked_child_stops_profiling_and_does_not_corrupt_seq(self):
         # A target that forks without exec (multiprocessing/DataLoader
         # workers) inherits the hook, the pipe fd, and the seq counter's
@@ -1575,27 +1641,109 @@ class SpanApiTest(unittest.TestCase):
         with metagross.span("anything"):
             pass  # no profiling handle installed -> no-op
 
+    def _capture_span_reports(self):
+        """Install a recording emitter; return the decoded span names."""
+        _profile._reset_seq()
+        written = []
+        self.addCleanup(setattr, _profile, "_current_emitter",
+                        _profile._current_emitter)
+        self.addCleanup(vars(_profile._reported_span).clear)
+        vars(_profile._reported_span).clear()
+        _profile._current_emitter = _profile._FrameEmitter(written.append)
+        hello = _profile.encode_hello(pid=1, start_ns=0)
+
+        def names():
+            reader = _profile.RecordReader()
+            records = reader.feed(hello + b"".join(written))
+            self.assertNotIn("gap", [rec[0] for rec in records])
+            return [rec[3] for rec in records if rec[0] == "span"]
+
+        return names
+
+    def test_nested_spans_report_the_innermost_open_span(self):
+        names = self._capture_span_reports()
+        with metagross.span("forward"):
+            with metagross.span("matmul"):
+                pass
+        self.assertEqual(names(), ["forward", "matmul", "forward", None])
+
+    def test_span_closed_out_of_order_reports_none_until_unwound(self):
+        # Two generators interleave in one context, so the first span closes
+        # while the second is innermost. Neither can be trusted afterwards.
+        names = self._capture_span_reports()
+
+        def holder(name):
+            with metagross.span(name):
+                yield
+
+        first, second = holder("first"), holder("second")
+        next(first)
+        next(second)
+        first.close()
+        second.close()
+        with metagross.span("later"):
+            pass
+        self.assertEqual(names(), ["first", "second", None, "later", None])
+
+    def test_inherited_span_stops_reporting_once_it_closes(self):
+        names = self._capture_span_reports()
+        with metagross.span("request"):
+            inherited = contextvars.copy_context()
+        # A task or thread started inside the span still holds it, but the
+        # span is closed: it must not label that work.
+        inherited.run(_profile.report_span)
+        self.assertEqual(names(), ["request", None])
+
+    def test_span_closed_from_another_context_leaves_that_context_alone(self):
+        names = self._capture_span_reports()
+        other = contextvars.copy_context()
+        stranded = metagross.span("stranded")
+        other.run(stranded.__enter__)
+        with metagross.span("mine"):
+            stranded.__exit__(None, None, None)
+            _profile.report_span()
+            self.assertEqual(names(), ["stranded", "mine"])
+        other.run(_profile.report_span)
+        self.assertEqual(names(), ["stranded", "mine", None])
+
 
 class OpSpanTimelineTest(unittest.TestCase):
-    def test_innermost_enclosing_span_at_ts(self):
+    def test_active_span_is_the_last_report_at_or_before_ts(self):
         t = _events.OpSpanTimeline()
-        t.on_span(0, 7, 10, "forward")     # SPAN_BEGIN
-        t.on_span(0, 7, 20, "matmul")
-        # SPAN_END matmul: the wire record carries no name (see
-        # _profile.encode_span_end / Joiner.on_profile_record), so the
-        # production path always calls on_span(1, tid, ts, None) here --
-        # never the closed span's name. Feeding a name back in would mask
-        # the unconditional-pop requirement `_apply` relies on.
-        t.on_span(1, 7, 30, None)
+        t.on_span(7, 10, "forward")
+        t.on_span(7, 20, "matmul")
+        t.on_span(7, 30, "forward")
+        t.on_span(7, 40, None)
+        self.assertIsNone(t.attribute(7, 5))
         self.assertEqual(t.attribute(7, 25), "matmul")
         self.assertEqual(t.attribute(7, 35), "forward")
+        self.assertIsNone(t.attribute(7, 45))
+        self.assertIsNone(t.attribute(8, 25))
 
-    def test_gap_fails_closed(self):
+    def test_gap_fails_closed_until_the_next_report(self):
         t = _events.OpSpanTimeline()
-        t.on_span(0, 7, 10, "forward")
-        t.attribute(7, 10)
+        t.on_span(7, 10, "forward")
         t.on_gap(50)
         self.assertIsNone(t.attribute(7, 20))
+        self.assertIsNone(t.attribute(7, 60))
+        t.on_span(7, 70, "matmul")
+        self.assertEqual(t.attribute(7, 80), "matmul")
+
+    def test_prune_keeps_the_span_active_at_the_horizon(self):
+        t = _events.OpSpanTimeline()
+        t.on_span(7, 10, "warmup")
+        t.on_span(7, 20, "forward")
+        t.prune(100)
+        self.assertEqual(t._logs[7], [(20, "forward")])
+        self.assertEqual(t.attribute(7, 150), "forward")
+        self.assertIsNone(t.attribute(7, 50))
+
+    def test_prune_drops_a_closed_history(self):
+        t = _events.OpSpanTimeline()
+        t.on_span(7, 10, "forward")
+        t.on_span(7, 20, None)
+        t.prune(100)
+        self.assertEqual(t._logs[7], [])
 
 
 class AttributionTest(unittest.TestCase):
@@ -1834,20 +1982,14 @@ class GapHandlingTest(unittest.TestCase):
 
 
 class JoinerTest(unittest.TestCase):
-    def test_span_end_through_joiner_pops_the_innermost_span(self):
-        # The production path: Joiner.on_profile_record feeds the wire
-        # ("span_end", tid, ts) shape -- no name -- into
-        # OpSpanTimeline.on_span, which must still pop the innermost open
-        # span. This is the case test_innermost_enclosing_span_at_ts alone
-        # did not cover (it hand-fed the closed span's name, a shape
-        # production never produces).
+    def test_span_reports_reach_the_span_timeline(self):
         j = _events.Joiner()
-        j.on_profile_record(("span_begin", 7, 10, "forward"))
-        j.on_profile_record(("span_begin", 7, 20, "matmul"))
-        j.on_profile_record(("span_end", 7, 30))       # ends matmul
+        j.on_profile_record(("span", 7, 10, "forward"))
+        j.on_profile_record(("span", 7, 20, "matmul"))
+        j.on_profile_record(("span", 7, 30, "forward"))
+        j.on_profile_record(("span", 7, 40, None))
         self.assertEqual(j.spans.attribute(7, 25), "matmul")
-        self.assertEqual(j.spans.attribute(7, 35), "forward")  # enclosing span
-        j.on_profile_record(("span_end", 7, 40))       # ends forward
+        self.assertEqual(j.spans.attribute(7, 35), "forward")
         self.assertIsNone(j.spans.attribute(7, 45))
 
     def test_hold_then_release(self):
@@ -1872,7 +2014,7 @@ class JoinerTest(unittest.TestCase):
         # put the frame it entered from out of reach.
         j = _events.Joiner(hold_ns=100)
         j.on_profile_record(("frame", _profile.CALL, 1, 10, "step", "/p/a.py", 1))
-        j.on_profile_record(("span_begin", 1, 12, "epoch"))
+        j.on_profile_record(("span", 1, 12, "epoch"))
         j.on_gpu_event(_raw(16, ts=20, dur=1, tid=1))
         self.assertEqual(len(j.flush(now_ns=200)), 1)
         j.on_gpu_event(_raw(15, ts=30, dur=470, tid=1))    # returned at 500
@@ -1949,7 +2091,7 @@ class JoinerTest(unittest.TestCase):
 class SpanJoinTest(unittest.TestCase):
     def test_event_resolves_enclosing_span(self):
         j = _events.Joiner(hold_ns=100)
-        j.on_profile_record(("span_begin", 1, 5, "forward"))
+        j.on_profile_record(("span", 1, 5, "forward"))
         # a launch at ts=10, tid=1, inside the "forward" span
         j.on_gpu_event(_raw(1, ts=10, tid=1,
                             args=(0xF00, 1, 1, 1, 1, 1, 1, 0, 0)))
@@ -1971,8 +2113,8 @@ class SpanJoinTest(unittest.TestCase):
     def test_flush_prunes_span_timeline_with_same_horizon_as_frame_timeline(self):
         j = _events.Joiner(hold_ns=100)
         j.on_profile_record(("frame", _profile.CALL, 1, 4, "f", "/p/a.py", 1))
-        j.on_profile_record(("span_begin", 1, 5, "forward"))
-        j.on_profile_record(("span_end", 1, 8))
+        j.on_profile_record(("span", 1, 5, "forward"))
+        j.on_profile_record(("span", 1, 8, None))
         j.on_gpu_event(_raw(1, ts=10, tid=1,
                             args=(0xF00, 1, 1, 1, 1, 1, 1, 0, 0)))
         j.flush(10_000, force=True)

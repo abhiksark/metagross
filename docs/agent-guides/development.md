@@ -176,7 +176,7 @@ per-`rtype` body. `RecordReader.feed` decodes it into tagged tuples that
 record type, update all relevant pieces together:
 
 1. The `rtype` constant and its body `struct.Struct` in `_profile.py`.
-2. The encoder (e.g. `encode_frame`, `encode_span_begin`) that packs the
+2. The encoder (e.g. `encode_frame`, `encode_span`) that packs the
    common header plus the body.
 3. `RecordReader.feed`'s dispatch: parse-or-wait-for-more-bytes, advance the
    buffer only once the whole record is present, run it through the seq/gap

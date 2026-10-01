@@ -3,21 +3,31 @@
 from __future__ import annotations
 
 import contextlib
-import threading
-import time
 
 from metagross import _profile
 
 
 @contextlib.contextmanager
 def span(name: str):
-    emit = _profile.current_emitter()
-    if emit is None:
+    if _profile.current_emitter() is None:
         yield  # not running under metagross: no-op, keep the script runnable
         return
-    tid = threading.get_native_id()
-    emit.span_begin(tid, time.monotonic_ns(), str(name))
+    entry = _profile.OpenSpan(str(name))
+    outer = _profile.open_spans.get()
+    mine = outer + (entry,)
+    _profile.open_spans.set(mine)
+    _profile.report_span()
     try:
         yield
     finally:
-        emit.span_end(tid, time.monotonic_ns())
+        # Tasks and threads that inherited this span stop reporting it.
+        entry.name = None
+        current = _profile.open_spans.get()
+        if current is mine:
+            _profile.open_spans.set(outer)
+        elif entry in current:
+            # Closed while another span was innermost: none of the spans
+            # open in this context can be trusted any more.
+            for other in current:
+                other.name = None
+        _profile.report_span()
