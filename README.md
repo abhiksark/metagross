@@ -44,7 +44,7 @@ To try the dashboard without root, BCC, CUDA, or a GPU, open the
 
 | Capability | What it does |
 |------------|--------------|
-| [Driver call tracing](docs/reference.md#traced-api-table) | Reports 17 CUDA driver APIs through eBPF uprobes: kernel launches, allocations and frees, memory copies, and stream, context, and event synchronization. Three more probes read kernel names. Needs no changes to the traced script; `--trace` selects any of the `launch`, `memory`, `copy`, and `sync` families. |
+| [Driver call tracing](docs/reference.md#traced-api-table) | Reports 18 CUDA driver APIs through eBPF uprobes: kernel and graph launches, allocations and frees, memory copies, and stream, context, and event synchronization. Three more probes read kernel names. Needs no changes to the traced script; `--trace` selects any of the `launch`, `memory`, `copy`, and `sync` families. |
 | [Python attribution](docs/reference.md#how-attribution-works) | Assigns each call to the function under the project root that was active at API entry, skipping standard-library, installed-package, and Metagross frames. Calls with no safe project frame stay `<unknown>`; `--no-attribution` turns function attribution off. |
 | [Call details](docs/reference.md#traced-api-table) | Records the return code, CPU-side duration, and per-API arguments: launch grid, block, shared memory, and stream; byte counts; pointers; and resolved kernel names. |
 | [Named regions](docs/reference.md#op-spans) | Labels the calls made inside `with metagross.span("name"):` by the same thread or `asyncio` task, in table and JSONL output. Spans need function attribution and do nothing when the script runs outside a trace. |
@@ -201,8 +201,9 @@ python3 -m metagross view --help
   its Python threads, on x86-64 only. It does not attach to an existing
   process, follow subprocesses, run `python -m` targets, or record
   framework-level events.
-- Kernels replayed through a CUDA graph (`cuGraphLaunch`) and several other
-  driver APIs are not traced, and events do not say which GPU was used.
+- A CUDA graph replay (`cuGraphLaunch`) is one row; the kernels inside the
+  graph are not listed. Several other driver APIs are not traced, and events
+  do not say which GPU was used.
 - Timing is host-side API elapsed time, not GPU execution time or utilization.
 - Attribution and kernel names are best effort. Calls from C++ worker threads
   without an active project Python frame show as `<unknown>`.

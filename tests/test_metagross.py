@@ -100,6 +100,16 @@ class DescribeTest(unittest.TestCase):
         kernel, _ = _events.describe(_bpf.API_BY_ID[1], ev, self.reg, self.allocs)
         self.assertEqual(kernel, "kernel@0xdead")
 
+    def test_graph_launch_details_name_no_kernel(self):
+        # A graph replays many kernels in one call; none of them is "the"
+        # kernel, so the row carries the graph and stream handles only.
+        api = _bpf.API_BY_ID[21]
+        self.assertEqual(api.base, "cuGraphLaunch")
+        kernel, det = _events.describe(
+            api, _raw(21, args=(0xABC0, 0x77)), self.reg, self.allocs)
+        self.assertIsNone(kernel)
+        self.assertEqual(det, {"graph_exec": "0xabc0", "stream": "0x77"})
+
     def test_alloc_free_tracking(self):
         _, det = _events.describe(_bpf.API_BY_ID[3],
                                   _raw(3, args=(0, 4096), out=0x9000),
@@ -1001,7 +1011,11 @@ class SymbolResolutionTest(unittest.TestCase):
     def test_select_launch_apis_includes_registration_dependency(self):
         selected = _bpf.select_apis(frozenset(("launch",)))
         categories = {api.category for api in selected}
-        self.assertEqual(categories, {"launch", "launch_ex", "register"})
+        self.assertEqual(
+            categories, {"launch", "launch_ex", "graph_launch", "register"})
+        source = _bpf.build_source(4242, selected)
+        self.assertIn("enter_cuGraphLaunch", source)
+        self.assertIn("exit_cuGraphLaunch", source)
 
     def test_select_multiple_api_families(self):
         selected = _bpf.select_apis(frozenset(("copy", "sync")))

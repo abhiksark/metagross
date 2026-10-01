@@ -752,6 +752,12 @@ class LiveDashboardRendererTest(unittest.TestCase):
 class WebDashboardTest(unittest.TestCase):
     TOKEN = "receiver-token-" + ("r" * 32)
 
+
+    def test_graph_launch_is_in_the_launch_family(self):
+        self.assertEqual(_web._api_family("cuLaunchKernel"), "launch")
+        self.assertEqual(_web._api_family("cuGraphLaunch"), "launch")
+        self.assertEqual(_web._api_family("cuMemcpyHtoD"), "copy")
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)

@@ -410,7 +410,7 @@ Metagross observes the following CUDA driver API families:
 
 | Family | APIs |
 |--------|------|
-| Kernel launches | `cuLaunchKernel`, `cuLaunchKernelEx` |
+| Kernel launches | `cuLaunchKernel`, `cuLaunchKernelEx`, `cuGraphLaunch` |
 | Memory management | `cuMemAlloc`, `cuMemAllocAsync`, `cuMemFree`, `cuMemFreeAsync` |
 | Memory transfers | `cuMemcpyHtoD` (host to device), `cuMemcpyDtoH` (device to host), `cuMemcpyDtoD` (device to device), `cuMemcpyHtoDAsync`, `cuMemcpyDtoHAsync`, `cuMemcpyDtoDAsync`, `cuMemcpy`, `cuMemcpyAsync` |
 | Synchronization | `cuStreamSynchronize`, `cuCtxSynchronize`, `cuEventSynchronize` |
@@ -421,6 +421,7 @@ Details captured depend on the API:
 | API | Details |
 |-----|---------|
 | Kernel launches | `grid`, `block`, `shared`, `stream`, `function_handle` |
+| Graph launches | `graph_exec`, `stream` |
 | Allocations | `bytes`, `ptr`, `stream` (async only), `gpu_total` |
 | Deallocations | `ptr`, `gpu_total`, plus `bytes` when the pointer is known and `stream` for async calls |
 | Memory transfers | `bytes`, `stream` (async only) |
@@ -459,9 +460,14 @@ behavior described in [Output](#output). Names are cut at 127 bytes, so long
 C++ template instantiations that share that prefix are counted as one kernel in
 `top_kernels`.
 
+**CUDA graphs**: Replaying a graph is one `cuGraphLaunch` row with no kernel
+name; the kernels inside the graph are not listed, because the driver replays
+them without calling `cuLaunchKernel`. While a graph is being captured, each
+kernel recorded into it appears as an ordinary launch row, although it only
+runs when the graph is replayed.
+
 **Untraced driver APIs**: Only the APIs in the [table](#traced-api-table) are
-traced. In particular, kernels replayed through a CUDA graph (`cuGraphLaunch`)
-do not appear as launches, and `cuMemsetD*`, 2D, 3D, peer and batched copies,
+traced. In particular, `cuMemsetD*`, 2D, 3D, peer and batched copies,
 pooled, managed, host and pitched allocations, and `cuStreamWaitEvent` are not
 recorded. A capture of a workload that relies on these is partial even when it
 reports `complete`.

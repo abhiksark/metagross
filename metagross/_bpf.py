@@ -44,12 +44,13 @@ APIS = [
     Api(18, "cuModuleGetFunction", "register"),
     Api(19, "cuLibraryGetKernel", "register"),
     Api(20, "cuKernelGetFunction", "register"),
+    Api(21, "cuGraphLaunch", "graph_launch"),
 ]
 
 API_BY_ID = {a.api_id: a for a in APIS}
 
 _TRACE_CATEGORY_MAP = {
-    "launch": frozenset(("launch", "launch_ex", "register")),
+    "launch": frozenset(("launch", "launch_ex", "graph_launch", "register")),
     "memory": frozenset(("alloc", "alloc_async", "free", "free_async")),
     "copy": frozenset(("copy_h2d", "copy_d2h", "copy_d2d", "copy_generic")),
     "sync": frozenset(("sync",)),

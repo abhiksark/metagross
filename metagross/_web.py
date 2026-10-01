@@ -1415,7 +1415,7 @@ def _timestamp_ns(timestamp: str) -> int | None:
 
 
 def _api_family(api: str) -> str:
-    if api.startswith("cuLaunch"):
+    if api.startswith("cuLaunch") or api == "cuGraphLaunch":
         return "launch"
     if api.startswith("cuMemcpy"):
         return "copy"

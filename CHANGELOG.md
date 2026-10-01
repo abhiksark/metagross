@@ -19,3 +19,5 @@ First public preview.
   through `os._exit` each mark the capture incomplete.
 - A warning when the script loads a different `libcuda.so.1` than the one
   the probes are attached to.
+- CUDA graph replays (`cuGraphLaunch`) appear as one launch row each, with
+  the graph and stream handles and no kernel name.

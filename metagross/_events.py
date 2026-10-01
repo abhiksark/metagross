@@ -354,6 +354,11 @@ def describe(api, ev, registry: KernelRegistry, allocs: AllocTracker,
         else:
             kernel = kernel_override or f"kernel@{handle:#x}"
         det["function_handle"] = _hex(handle)
+    elif cat == "graph_launch":
+        # One call replays every kernel captured in the graph, so there is
+        # no single kernel to name.
+        det["graph_exec"] = _hex(ev.args[0])
+        det["stream"] = _hex(ev.args[1])
     elif cat in ("alloc", "alloc_async"):
         det["bytes"] = ev.args[1]
         det["ptr"] = _hex(ev.out)
