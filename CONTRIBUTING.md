@@ -52,6 +52,10 @@ git diff --check
 CI also runs `ruff check .` (ruff 0.16.8) for undefined names and unused
 imports; run it locally if you have ruff installed.
 
+CI also runs the tracer against a stub driver library, with root and BCC but no
+GPU; see the stub live gate in the
+[verification guide](docs/agent-guides/verification.md).
+
 Changes to live tracing, probe attachment, credentials, output ownership, or
 cleanup also need the privileged gate on a compatible host with BCC and NVIDIA
 driver support:

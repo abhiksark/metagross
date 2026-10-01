@@ -38,6 +38,25 @@ jobs:
       - name: Undefined names and unused imports
         run: ruff check .
 
+  stub-live:
+    # The real tracer against tests/stub_libcuda.c: root and BCC, no GPU.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install BCC and kernel headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-bpfcc "linux-headers-$(uname -r)"
+      - name: Install the stub driver library
+        run: |
+          sudo gcc -O0 -shared -fPIC \
+            -o /usr/lib/x86_64-linux-gnu/libcuda.so.1 tests/stub_libcuda.c
+          sudo ldconfig
+      - name: Trace the stub workload
+        run: |
+          sudo env RUN_STUB_INTEGRATION=1 \
+            /usr/bin/python3 -m unittest -v tests.test_stub_live
+
   coverage:
     runs-on: ubuntu-22.04
     steps:

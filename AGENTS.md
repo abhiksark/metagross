@@ -66,6 +66,9 @@ Verification; user-visible/product changes also require Documentation and releas
   allocation tracking, detail enrichment, table rendering, and JSONL rendering.
 - `tests/test_metagross.py`: unprivileged unit suite plus root/CUDA integration tests
   gated by `RUN_EBPF_INTEGRATION=1`.
+- `tests/test_stub_live.py`, `tests/stub_libcuda.c`: the real tracer run against
+  a stub driver library, gated by `RUN_STUB_INTEGRATION=1`; needs root and BCC
+  but no GPU.
 - `examples/`: lightweight runnable examples aligned with the README.
 - `pyproject.toml`: packaging metadata; the version is read from
   `metagross.__version__`.

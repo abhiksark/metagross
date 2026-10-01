@@ -53,6 +53,25 @@ synchronization, process credentials, output file handling, direct dashboard
 delivery and startup rejection, and eBPF cleanup. When `bpftool` is available,
 it should also verify no extra BPF program remains after shutdown.
 
+## Stub live gate
+
+`tests/test_stub_live.py` runs the real tracer against `tests/stub_libcuda.c`, a
+stand-in driver library with no GPU behind it. It needs root and BCC, and a
+machine without an NVIDIA driver, because the stub is installed as the
+`libcuda.so.1` Metagross finds. CI runs it in the `stub-live` job; locally, use
+a disposable container or machine:
+
+```sh
+gcc -O0 -shared -fPIC -o /usr/lib/x86_64-linux-gnu/libcuda.so.1 \
+  tests/stub_libcuda.c && ldconfig
+sudo env RUN_STUB_INTEGRATION=1 \
+  /usr/bin/python3 -m unittest -v tests.test_stub_live
+```
+
+It covers probe attachment, the privilege drop, the ring buffer and profile
+pipe, attribution, and the JSONL and summary output. It does not replace the
+live integration gate: the stub accepts any arguments and never fails.
+
 ## Direct Docker dashboard gate
 
 Rebuild the source-baked image. In the host terminal, generate one token and
