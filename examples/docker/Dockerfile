@@ -1,5 +1,5 @@
 # examples/docker/Dockerfile
-# Pinned Metagross + PyTorch userspace for a CUDA-capable Linux host.
+# Version-pinned Metagross + PyTorch userspace for a CUDA-capable Linux host.
 FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
 
 ARG DEBIAN_FRONTEND=noninteractive

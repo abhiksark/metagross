@@ -63,6 +63,10 @@ docker save --platform linux/amd64 -o cuda-base.tar nvidia/cuda:12.4.1-runtime-u
 docker load -i cuda-base.tar
 ```
 
+The base image, PyTorch, NumPy, and pip are pinned by version, not by image
+digest or package hash, so the transfer above keeps working. Pin them yourself
+if you need a reproducible supply chain.
+
 ## Use the metagross command
 
 [`metagross`](metagross) is a short shell script that runs the image on a script
