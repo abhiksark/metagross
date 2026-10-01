@@ -664,7 +664,7 @@ def _web_host(value: str) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = _ViewerParser(
-        prog="python3 -m metagross view",
+        prog="metagross view",
         description="View a Metagross trace without root, BCC, or CUDA.",
     )
     parser.add_argument("trace", nargs="?", type=Path)

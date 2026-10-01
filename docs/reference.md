@@ -29,13 +29,17 @@ comes first on `PATH` runs.
 The tracing interface is:
 
 ```text
-sudo /usr/bin/python3 -m metagross \
+metagross \
   [--json] [--output FILE] [--stats] [--summary-output FILE] \
   [--project-root DIR] [--trace FAMILIES] [--no-attribution] \
   [--allow-root-target] \
   [--dashboard-port PORT | --web [--web-port PORT]] \
   script.py [script arguments...]
 ```
+
+Here `metagross` stands for whichever way you start it: the installed
+command, `/usr/bin/python3 -m metagross` from the checkout, or the
+[path form](#privilege-and-trust-boundary). Tracing a script needs root.
 
 Metagross options must appear before the script. Everything after the script is
 passed to it unchanged. `--project-root` defaults to the current directory.

@@ -125,15 +125,18 @@ _DEFAULT_WEB_PORT = 8765
 _TRACE_FAMILIES = frozenset(("launch", "memory", "copy", "sync"))
 
 _USAGE = (
-    "usage: sudo /usr/bin/python3 -m metagross [--json] [--output FILE]\n"
+    "usage: metagross [--json] [--output FILE]\n"
     "           [--stats] [--summary-output FILE] [--project-root DIR]\n"
     "           [--trace FAMILIES] [--no-attribution] [--allow-root-target]\n"
     "           [--dashboard-port PORT | --web [--web-port PORT]]\n"
     "           script.py [script arguments...]\n"
-    "       /usr/bin/python3 -m metagross [--trace FAMILIES] --ebpf\n"
-    "       /usr/bin/python3 -m metagross view (--snapshot|--follow|--web) TRACE.jsonl\n"
-    "       /usr/bin/python3 -m metagross view --web --receive [--port PORT]\n"
-    "       /usr/bin/python3 -m metagross [-h|--help] [--version]\n"
+    "       metagross [--trace FAMILIES] --ebpf\n"
+    "       metagross view (--snapshot|--follow|--web) TRACE.jsonl\n"
+    "       metagross view --web --receive [--port PORT]\n"
+    "       metagross [-h|--help] [--version]\n"
+    "\n"
+    "Tracing a script needs root. Without an installed command, start\n"
+    "Metagross as: sudo /usr/bin/python3 /path/to/checkout/metagross\n"
 )
 
 
