@@ -265,6 +265,11 @@ class CaptureStatsTest(unittest.TestCase):
 
 
 class ParseArgsTest(unittest.TestCase):
+    def test_allow_root_target_is_off_by_default(self):
+        self.assertFalse(parse_args(["t.py"]).allow_root_target)
+        self.assertTrue(
+            parse_args(["--allow-root-target", "t.py"]).allow_root_target)
+
     def test_minimal(self) -> None:
         cfg: Config = parse_args(["script.py"])
         self.assertEqual(cfg.script, "script.py")
@@ -3114,7 +3119,7 @@ class PrivateDashboardTest(unittest.TestCase):
 
     def _run_live_web(self, trace_effect, cfg=None):
         cfg = cfg or Config(script=__file__, project_root=os.path.dirname(__file__),
-                            web=True)
+                            web=True, allow_root_target=True)
         fake = metagross._Dashboard(mock.Mock(), 1, "t" * 43)
         with mock.patch("metagross.os.geteuid", return_value=0), \
                 mock.patch("metagross.validate_sudo", return_value=None), \
@@ -3130,6 +3135,16 @@ class PrivateDashboardTest(unittest.TestCase):
                 result = exc
         return result, fake, start, trace, serve, stop
 
+    def test_run_live_refuses_a_root_target_unless_allowed(self):
+        # No sudo caller to drop to: the script would run as root.
+        cfg = Config(script=__file__, project_root=os.path.dirname(__file__),
+                     web=True)
+        result, _, start, trace, _, _ = self._run_live_web([0], cfg)
+        self.assertIsInstance(result, MetagrossError)
+        self.assertIn("--allow-root-target", str(result))
+        start.assert_not_called()
+        trace.assert_not_called()
+
     def test_run_live_serves_then_returns_the_target_status(self):
         result, fake, start, trace, serve, stop = self._run_live_web([3])
         self.assertEqual(result, 3)
@@ -3142,7 +3157,7 @@ class PrivateDashboardTest(unittest.TestCase):
         result, fake, start, _, serve, stop = self._run_live_web(
             MetagrossError("attach failed"),
             Config(script=__file__, project_root=os.path.dirname(__file__),
-                   web=True, web_port=0),
+                   web=True, web_port=0, allow_root_target=True),
         )
         self.assertIsInstance(result, MetagrossError)
         start.assert_called_once_with(None, 0)

@@ -18,10 +18,11 @@ without publishing vulnerability details. There is no promised response deadline
 ## Scope and trust model
 
 Metagross is a local diagnostic for trusted scripts. The controller is privileged;
-under validated sudo metadata the target runs as the invoking user. Direct root
-execution also runs the target as root. Neither tracing nor the Docker examples
-sandbox untrusted code. A compromised invoking account, root process, or browser
-is outside the protection offered by the viewer authentication boundary.
+under validated sudo metadata the target runs as the invoking user. Without it
+the target runs as root only when `--allow-root-target` is given. Neither tracing
+nor the Docker examples sandbox untrusted code. A compromised invoking account,
+root process, or browser is outside the protection offered by the viewer
+authentication boundary.
 
 The loopback dashboard requires a private viewer bearer token to read trace
 state. The separate producer token authorizes capture delivery only. Keep both

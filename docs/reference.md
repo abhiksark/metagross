@@ -18,6 +18,7 @@ The tracing interface is:
 sudo /usr/bin/python3 -m metagross \
   [--json] [--output FILE] [--stats] [--summary-output FILE] \
   [--project-root DIR] [--trace FAMILIES] [--no-attribution] \
+  [--allow-root-target] \
   [--dashboard-port PORT | --web [--web-port PORT]] \
   script.py [script arguments...]
 ```
@@ -37,6 +38,7 @@ BCC, CUDA, or a target script. Help flags after the script go to the target.
 | `--project-root DIR` | Current directory; project attribution and target validation boundary. |
 | `--trace FAMILIES` | `all`; comma-separated `launch`, `memory`, `copy`, `sync`. |
 | `--no-attribution` | Off; disable the Python profile hook. |
+| `--allow-root-target` | Off; when there is no sudo caller to drop to, run the script as root instead of refusing. |
 | `--dashboard-port PORT` | Disabled; integer 1 to 65,535 for direct loopback delivery to a separately started receiver. |
 | `--web` | Off; start a [built-in dashboard](#built-in-web-dashboard) for this capture. Rejects `--dashboard-port`. |
 | `--web-port PORT` | 8765; built-in dashboard port, 0 to 65,535, where zero selects a free port. Requires `--web`. |
@@ -84,8 +86,9 @@ with permission to rename your files can still move or unlink the capture;
 keep its directory private when stable paths matter.
 
 Under sudo, the controller retains the privileges needed for BPF while the
-target runs as the validated invoking user. Direct root execution runs the
-target as root and emits a warning.
+target runs as the validated invoking user. Without a sudo caller to drop to,
+Metagross refuses to start; `--allow-root-target` runs the script as root and
+emits a warning.
 After probes attach, the child enters a fresh Python interpreter with the same
 PID, preserving interpreter options such as `-O`/`-OO`, `-B`, `-u`, `-W`, and `-X utf8`.
 Normal interpreter shutdown waits for non-daemon threads, runs `atexit`
@@ -648,7 +651,7 @@ uses numeric `127.0.0.1` without DNS, redirects, or HTTP proxy discovery.
 
 Run only trusted scripts and trusted local containers. The privileged controller
 loads BPF programs and attaches probes; the target runs as the validated sudo
-caller, or as root when invoked directly as root. The child drops credentials
+caller, or as root only with `--allow-root-target`. The child drops credentials
 and sets `no_new_privs` before entering a fresh interpreter with the same PID,
 so the target and its descendants cannot gain privileges through setuid
 programs: a script that runs `sudo` works bare but fails under Metagross. Its profiling descriptor

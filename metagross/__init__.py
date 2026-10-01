@@ -103,6 +103,7 @@ class Config:
     dashboard_port: int | None = None
     web: bool = False
     web_port: int | None = None
+    allow_root_target: bool = False
     script: str | None = None
     script_args: list[str] = dataclasses.field(default_factory=list)
 
@@ -123,7 +124,7 @@ _TRACE_FAMILIES = frozenset(("launch", "memory", "copy", "sync"))
 _USAGE = (
     "usage: sudo /usr/bin/python3 -m metagross [--json] [--output FILE]\n"
     "           [--stats] [--summary-output FILE] [--project-root DIR]\n"
-    "           [--trace FAMILIES] [--no-attribution]\n"
+    "           [--trace FAMILIES] [--no-attribution] [--allow-root-target]\n"
     "           [--dashboard-port PORT | --web [--web-port PORT]]\n"
     "           script.py [script arguments...]\n"
     "       /usr/bin/python3 -m metagross [--trace FAMILIES] --ebpf\n"
@@ -195,6 +196,8 @@ def parse_args(argv: list[str]) -> Config:
             cfg.python_attribution = False
         elif arg == "--web":
             cfg.web = True
+        elif arg == "--allow-root-target":
+            cfg.allow_root_target = True
         elif arg in (
             "--output",
             "--summary-output",
@@ -602,7 +605,7 @@ def _serve_until_stopped(dashboard: _Dashboard) -> None:
 
 
 def run_live(cfg: Config) -> int:
-    # 1. Root check; validate sudo metadata, or warn and run as root.
+    # 1. Root check; validate sudo metadata, or refuse to run the target as root.
     if os.geteuid() != 0:
         raise MetagrossError("must run as root (use sudo)")
     dashboard_token = None
@@ -615,6 +618,10 @@ def run_live(cfg: Config) -> int:
             raise MetagrossError(str(exc)) from None
     creds = validate_sudo(os.environ, pwd.getpwnam)
     if creds is None:
+        if not cfg.allow_root_target:
+            raise MetagrossError(
+                "no sudo caller to run the script as; run through sudo, or "
+                "pass --allow-root-target to run the script as root")
         print("metagross: running target as root", file=sys.stderr)
         uid, gid = 0, 0
     else:
