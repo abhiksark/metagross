@@ -663,8 +663,8 @@ def _trace(cfg, creds, uid, gid, dashboard_port, dashboard_token) -> int:
     barrier_r, barrier_w = os.pipe()
     for fd in (profile_r, profile_w, barrier_r, barrier_w):
         os.set_inheritable(fd, False)
-    # Controller ruling: bump the profile pipe's capacity beyond the default
-    # 64KiB to mitigate its throughput cap; a failed bump is fine.
+    # Raise the profile pipe's capacity beyond the default 64KiB to
+    # mitigate its throughput cap; a failed bump is fine.
     try:
         fcntl.fcntl(profile_r, fcntl.F_SETPIPE_SZ, 1 << 20)
     except OSError:

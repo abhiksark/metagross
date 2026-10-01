@@ -303,7 +303,7 @@ def parse_event(record) -> ViewerEvent:
     line = record.get("line")
     if line is not None and not _is_bounded_int(line):
         raise ValueError("line must be an integer within range or null")
-    # "span" (Task 6) is additive: older records omit it entirely, and a
+    # "span" is additive: older records omit it entirely, and a
     # present value must be an optional string like kernel/function. The
     # value itself is not carried onto ViewerEvent -- the viewer does not
     # render spans yet -- so this call exists purely to validate the type.

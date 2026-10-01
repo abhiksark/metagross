@@ -12,7 +12,6 @@ or unsanitized traces. Include the affected commit, host and Python versions,
 reproduction steps, expected and observed behavior, and the privilege boundary
 involved. Share only the minimum sanitized evidence needed to reproduce it.
 
-Private reporting must be enabled by the repository owner before public preview.
 If the private reporting form is unavailable, request a private reporting channel
 without publishing vulnerability details. There is no promised response deadline.
 

@@ -11,17 +11,16 @@ import threading
 import time
 
 # Frame "kind" values used by FrameTimeline.on_record and everywhere a
-# decoded frame record is consumed. These are UNCHANGED from Phase A: they
-# are not the wire rtype (see below), just call-vs-return direction.
+# decoded frame record is consumed. They are not the wire rtype (see below),
+# just call-vs-return direction.
 CALL, RETURN = 0, 1
 
 # Wire record types (the `rtype` byte in the common header). CALL and RETURN
 # here are deliberately not reused as names: `_FRAME_CALL_RTYPE` /
 # `_FRAME_RETURN_RTYPE` carry the CALL/RETURN distinction on the wire, kept
 # private because nothing outside this module needs the raw byte value; the
-# public `CALL`/`RETURN` kind constants above must stay 0/1 for Phase A
-# compatibility (FrameTimeline.on_record and the many tests that call it
-# directly).
+# public `CALL`/`RETURN` kind constants above must stay 0/1 for
+# FrameTimeline.on_record and the many tests that call it directly.
 HELLO = 0
 FRAME_DEF = 1
 _FRAME_CALL_RTYPE = 2
@@ -318,7 +317,7 @@ class RecordReader:
                 self._note_seq(seq, out, ts_ns)
                 frame = self._frames.get(frame_id)
                 if frame is None:
-                    # Defensive only: FRAME_DEF is never dropped (Task 4),
+                    # Defensive only: FRAME_DEF is never dropped,
                     # so this should not happen. Fail closed -- drop this
                     # one record and count it, never guess a frame, and
                     # never clear the map on the strength of one bad id.

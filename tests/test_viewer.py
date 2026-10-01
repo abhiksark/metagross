@@ -149,9 +149,9 @@ class ViewerModelTest(unittest.TestCase):
             _viewer.parse_event(_record(details=[]))
 
     def test_parse_event_accepts_additive_span_field_with_and_without(self):
-        # Task 6 adds an ADDITIVE "span" key to the JSONL record. A record
-        # that carries it and a record that omits it (the old, pre-Task-6
-        # shape) must both still parse without error.
+        # "span" is an ADDITIVE key in the JSONL record. A record that
+        # carries it and a record that omits it (the older shape) must both
+        # still parse without error.
         with_span = _viewer.parse_event(_record(span="forward"))
         without_span = _viewer.parse_event(_record())
         self.assertEqual(with_span.function, "compute")

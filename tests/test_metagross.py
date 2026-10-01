@@ -1186,7 +1186,7 @@ class RecordCodecTest(unittest.TestCase):
         self.assertEqual(reader.feed(b""), [])
 
     def test_unknown_frame_id_drops_one_record_without_clearing_map(self):
-        # Defensive only: once Task 4 makes FRAME_DEF undroppable, a
+        # Defensive only: FRAME_DEF is undroppable, so a
         # CALL/RETURN should never reference an id the reader has not
         # seen. If it somehow does, the reader must fail closed -- drop
         # that one record and count it, never guess a frame, and never
@@ -1956,7 +1956,7 @@ class GapHandlingTest(unittest.TestCase):
         # A gap revealed on a FRAME_DEF (no ts_ns of its own) must not be
         # reported with an unknown ts: it is held pending and reported with
         # the ts of the next record that DOES carry a real one (the tighter
-        # horizon Task 2 intended), not left for the Joiner's much wider
+        # horizon), not left for the Joiner's much wider
         # "now at decode time" monotonic fallback.
         reader = _profile.RecordReader()
         out = reader.feed(_profile.encode_hello(pid=1, start_ns=1))

@@ -15,7 +15,6 @@ Replay without root, BCC, CUDA, or a GPU:
   examples/captures/basic.jsonl
 ```
 
-Open the private URL printed by the server. A screenshot must be taken from
-this actual dashboard in a real browser, with no synthetic or edited trace UI.
-The public capture contains no viewer or producer token. Stop the server after
-inspection and do not publish its private URL.
+Open the private URL printed by the server. The public capture contains no
+viewer or producer token. Stop the server after inspection and do not publish
+its private URL.
