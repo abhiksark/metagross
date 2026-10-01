@@ -498,7 +498,10 @@ class _ProjectClassifier:
         if cached is not None:
             return cached
         real = os.path.realpath(path)
-        included = real.startswith(self.root_prefix)
+        # "<string>", "<frozen ...>" and similar names belong to code with no
+        # source file; resolved as a path they would land under the cwd.
+        included = (not path.startswith("<")
+                    and real.startswith(self.root_prefix))
         if included and real.startswith(_SELF_DIR + os.sep):
             included = False
         if included:

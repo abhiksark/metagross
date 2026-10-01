@@ -108,7 +108,8 @@ and the shared monotonic clock, then attributes each API call to the project
 frame that was active at API entry.
 
 Calls in the standard library, site packages, virtual-environment packages,
-and Metagross itself do not replace the nearest project frame. A memory
+Metagross itself, and code with no source file (`exec`, frozen modules,
+generated code) do not replace the nearest project frame. A memory
 allocation performed inside a standard-library function, for example, remains
 attributable to the project function that initiated it. Imported project
 modules and Python threads are included.

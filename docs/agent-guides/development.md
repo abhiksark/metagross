@@ -206,7 +206,8 @@ Rules:
 - Do not use wall time for ordering profile and GPU events.
 - Keep the GPU-event hold window unless replacing it with an equally conservative
   ordering strategy.
-- Project-file detection must exclude Metagross itself, site packages,
+- Project-file detection must exclude Metagross itself, code with no source
+  file (names such as `<string>`), site packages,
   dist-packages, virtual-environment packages, and files outside the project
   root.
 - Unknown or ambiguous attribution should render as unknown, not guessed.

@@ -1475,6 +1475,14 @@ class ProjectFileTest(unittest.TestCase):
         root = os.path.dirname(os.path.dirname(path))
         self.assertFalse(_profile.is_project_file(path, root))
 
+    def test_code_without_a_source_file_is_not_project_code(self):
+        # exec(), frozen modules and generated code carry names like
+        # "<string>", which resolve to a path under the working directory.
+        root = os.getcwd()
+        for name in ("<string>", "<stdin>", "<frozen importlib._bootstrap>",
+                     "<eval_with_key>.0"):
+            self.assertFalse(_profile.is_project_file(name, root), name)
+
     def test_filesystem_root_accepts_project_file(self):
         self.assertTrue(_profile.is_project_file("/tmp/project.py", "/"))
 
