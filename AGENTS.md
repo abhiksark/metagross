@@ -49,8 +49,9 @@ Verification; user-visible/product changes also require Documentation and releas
 - `metagross/__main__.py`: thin `python -m metagross` entry point.
 - `metagross/__init__.py`: CLI parsing, validation, privilege handling, forked
   target runner, BCC orchestration, output opening, event loop, and exit behavior.
-- `metagross/_bpf.py`: CUDA API table, libcuda discovery, symbol resolution,
-  generated eBPF C source, BCC loading, probe attachment, and raw event structs.
+- `metagross/_bpf.py`: CUDA API table, libcuda discovery and the loaded-libcuda
+  check, symbol resolution, generated eBPF C source, BCC loading, probe
+  attachment, and raw event structs.
 - `metagross/_dashboard.py`: private runner for `--web` that serves the
   in-memory dashboard as the unprivileged target user.
 - `metagross/_profile.py`: profiling hook installed in the traced child and the

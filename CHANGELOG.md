@@ -17,3 +17,5 @@ First public preview.
 - Completeness checks: lost events, dropped nested calls, lost profile
   records, a replaced profiling hook, and a script that is killed or leaves
   through `os._exit` each mark the capture incomplete.
+- A warning when the script loads a different `libcuda.so.1` than the one
+  the probes are attached to.

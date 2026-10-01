@@ -7,6 +7,7 @@ import fcntl
 import io
 import json
 import http.server
+import mmap
 import os
 import runpy
 import shutil
@@ -1032,6 +1033,45 @@ class SymbolResolutionTest(unittest.TestCase):
             path = _bpf.find_libcuda()
         self.assertEqual(path, expected)
         self.assertTrue(path.startswith("/"), f"not absolute: {path!r}")
+
+    def test_mapped_libcuda_lists_the_driver_files_in_a_maps_listing(self):
+        maps = (
+            "55d0c0a00000-55d0c0a01000 r--p 00000000 08:02 131 /usr/bin/python3.10\n"
+            "7f10a0000000-7f10a0021000 rw-p 00000000 00:00 0 \n"
+            "7f10b0000000-7f10b0400000 r-xp 00000000 08:02 977 "
+            "/opt/nvidia driver/libcuda.so.550.54.14\n"
+            "7f10b0400000-7f10b0500000 rw-p 00400000 08:02 977 "
+            "/opt/nvidia driver/libcuda.so.550.54.14\n"
+            "7f10c0000000-7f10c0100000 r-xp 00000000 08:02 978 "
+            "/usr/lib/x86_64-linux-gnu/libcudart.so.12\n"
+            "7ffd5a1f0000-7ffd5a211000 rw-p 00000000 00:00 0 [stack]\n"
+        )
+        self.assertEqual(_bpf.mapped_libcuda(maps),
+                         {"/opt/nvidia driver/libcuda.so.550.54.14"})
+        self.assertEqual(_bpf.mapped_libcuda(""), set())
+
+    def test_target_that_loaded_another_libcuda_gets_a_warning(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            loaded = os.path.join(tmp, "libcuda.so.550.54.14")
+            other = os.path.join(tmp, "elsewhere", "libcuda.so.1")
+            os.mkdir(os.path.dirname(other))
+            for path in (loaded, other):
+                with open(path, "wb") as handle:
+                    handle.write(b"\0" * 4096)
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                self.assertFalse(
+                    _bpf.target_loaded_libcuda(os.getpid(), loaded))
+                with open(loaded, "rb") as handle, mmap.mmap(
+                        handle.fileno(), 0, prot=mmap.PROT_READ):
+                    self.assertTrue(
+                        _bpf.target_loaded_libcuda(os.getpid(), loaded))
+                    self.assertEqual(stderr.getvalue(), "")
+                    self.assertTrue(
+                        _bpf.target_loaded_libcuda(os.getpid(), other))
+            self.assertIn(f"the script loaded {os.path.realpath(loaded)}, but "
+                          f"the probes are on {os.path.realpath(other)}",
+                          stderr.getvalue())
 
 
 class BpfSourceTest(unittest.TestCase):

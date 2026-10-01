@@ -120,6 +120,7 @@ class Credentials:
 
 
 _FINAL_DRAIN_TIMEOUT_S = 2.0
+_LIBCUDA_CHECK_INTERVAL_S = 1.0
 _DASHBOARD_READY_TIMEOUT_S = 5.0
 _DEFAULT_WEB_PORT = 8765
 _TRACE_FAMILIES = frozenset(("launch", "memory", "copy", "sync"))
@@ -894,6 +895,7 @@ def _trace(cfg, creds, uid, gid, dashboard_port, dashboard_token) -> int:
     lost = 0
     dropped = 0
     lost_profile = 0
+    libcuda_check_due = time.monotonic() + _LIBCUDA_CHECK_INTERVAL_S
     try:
         renderer.header()
         while True:
@@ -903,6 +905,11 @@ def _trace(cfg, creds, uid, gid, dashboard_port, dashboard_token) -> int:
                     for rec in profile_reader.poll():
                         joiner.on_profile_record(rec)
                     _emit_all(joiner.flush(time.monotonic_ns()))
+                    if (libcuda_check_due is not None
+                            and time.monotonic() >= libcuda_check_due):
+                        libcuda_check_due = (
+                            None if _bpf.target_loaded_libcuda(pid, lib_path)
+                            else time.monotonic() + _LIBCUDA_CHECK_INTERVAL_S)
                     wpid, status = os.waitpid(pid, os.WNOHANG)
                     reaped = wpid == pid
                 if reaped:

@@ -7,6 +7,7 @@ import ctypes.util
 import dataclasses
 import os
 import subprocess
+import sys
 from typing import Callable
 
 from metagross import MetagrossError
@@ -166,6 +167,36 @@ def find_libcuda() -> str:
         return ldconfig_path
     raise MetagrossError(
         "libcuda.so.1 not found; is the NVIDIA driver installed?")
+
+
+
+def mapped_libcuda(maps_text: str) -> set[str]:
+    """Return the libcuda files named in a `/proc/<pid>/maps` listing."""
+    paths = set()
+    for line in maps_text.splitlines():
+        fields = line.split(None, 5)
+        if len(fields) == 6 and os.path.basename(fields[5]).startswith("libcuda.so"):
+            paths.add(fields[5])
+    return paths
+
+
+def target_loaded_libcuda(pid: int, lib_path: str) -> bool:
+    """Return True once the target has loaded a libcuda.
+
+    Warn if it is not the file the probes are on: the loader may pick another
+    copy than `find_libcuda` did, and uprobes only fire for the probed file.
+    """
+    try:
+        with open(f"/proc/{pid}/maps") as maps:
+            mapped = mapped_libcuda(maps.read())
+    except OSError:
+        return False
+    probed = os.path.realpath(lib_path)
+    if mapped and probed not in mapped:
+        print(f"metagross: the script loaded {sorted(mapped)[0]}, but the "
+              f"probes are on {probed}; its CUDA calls are not traced",
+              file=sys.stderr)
+    return bool(mapped)
 
 
 _HEADER = r"""

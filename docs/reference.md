@@ -482,6 +482,12 @@ used, so multi-GPU activity is not separated.
 layout and libcuda is looked up in x86-64 library paths. Other architectures,
 including arm64, are not supported.
 
+**One libcuda**: Probes are attached to the `libcuda.so.1` Metagross finds
+in the standard library paths or the loader cache. If the script loads a
+different copy, for example through `LD_LIBRARY_PATH`, none of its calls are
+traced; Metagross checks the script's loaded libraries about once a second and
+warns on stderr when that happens.
+
 **Other profilers**: Attribution uses the Python profiling hook
 (`sys.setprofile`). If the script installs its own profile function, as
 `cProfile` does on Python 3.11 and earlier, Metagross forgets the frames open at
