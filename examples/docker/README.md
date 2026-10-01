@@ -108,10 +108,13 @@ docker run --rm -i --gpus all --privileged --pid=host \
   dashboard. After the script it is one of the script's own arguments.
 - `METAGROSS_IMAGE` selects another image tag, for example
   `METAGROSS_IMAGE=metagross-pytorch:cu128 metagross run.py`.
-- `--output` and `--summary-output` refuse a directory that other users or
-  your group can write to. If your umask leaves project directories
-  group-writable, write traces to a private subdirectory made with
-  `mkdir -m 700 traces`.
+- `--output` and `--summary-output` refuse a path if your group or other
+  users can write to the current directory or to any directory between it and
+  the output file. With a umask of 002, the default on Ubuntu, the current
+  directory is itself group-writable, so a private subdirectory inside it does
+  not help. Run `chmod g-w .` in the project directory first, or use the full
+  `docker run` form in [Write JSONL to the host](#write-jsonl-to-the-host),
+  which mounts a private `traces` directory by itself.
 
 The sections below use the full `docker run` form and explain each flag.
 

@@ -795,6 +795,27 @@ class OutputSafetyTest(unittest.TestCase):
                 pass
         self.assertFalse(os.path.exists(os.path.join(directory, "trace")))
 
+    def test_private_folder_under_a_group_writable_one_is_refused(self):
+        # With umask 002 a project folder is group-writable, and a private
+        # subfolder inside it does not make the path safe. The message must
+        # name the folder to fix.
+        project = self._path("project")
+        os.mkdir(project)
+        os.chmod(project, 0o775)
+        traces = os.path.join(project, "traces")
+        os.mkdir(traces, 0o700)
+        path = os.path.join(traces, "trace.jsonl")
+        with self.assertRaises(MetagrossError) as caught:
+            with open_trace_output(path, self.uid, self.gid):
+                pass
+        self.assertIn(repr(os.path.realpath(project)), str(caught.exception))
+        self.assertIn("chmod go-w", str(caught.exception))
+        self.assertFalse(os.path.exists(path))
+        os.chmod(project, 0o755)
+        with open_trace_output(path, self.uid, self.gid):
+            pass
+        self.assertTrue(os.path.exists(path))
+
     def test_owned_sticky_parent_is_supported(self):
         directory = self._path("sticky")
         os.mkdir(directory)

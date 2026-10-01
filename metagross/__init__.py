@@ -294,19 +294,23 @@ def _open_output_parent(path: str, uid: int) -> int:
     fd = os.open(os.path.sep, flags)
     try:
         parent = os.path.dirname(path)
+        current = os.path.sep
         # The leading empty component validates the already-open root.
         for component in parent.rstrip(os.path.sep).split(os.path.sep):
             if component:
                 next_fd = os.open(component, flags, dir_fd=fd)
                 os.close(fd)
                 fd = next_fd
+                current = os.path.join(current, component)
             info = os.fstat(fd)
             if info.st_uid not in (0, uid):
                 raise MetagrossError(f"output {path!r} has an untrusted parent owner")
             if (info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
                     and not info.st_mode & stat.S_ISVTX):
                 raise MetagrossError(
-                    f"output {path!r} has a writable non-sticky parent directory"
+                    f"output {path!r} is under {current!r}, which your group or "
+                    "other users can write to; remove that permission "
+                    "(chmod go-w) or write somewhere else"
                 )
         return fd
     except BaseException:

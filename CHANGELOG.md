@@ -9,6 +9,9 @@ User-visible changes to Metagross. Versions follow `metagross.__version__`.
   longer prints control characters from the library path.
 - Fix: a call delivered after a slow read of the profile stream keeps its
   function instead of becoming `<unknown>` in a capture reported complete.
+- Fix: the error for an output path under a group-writable directory names
+  that directory and the remedy, and the Docker guide no longer recommends a
+  workaround that did not work.
 
 ## 0.1.0 (2026-10-01)
 

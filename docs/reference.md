@@ -99,8 +99,9 @@ both are validated before either existing file is truncated.
 
 Output parent directories must be owned by root or the invoking user. Symlinked
 parents and group- or other-writable non-sticky parents are rejected. Standard
-sticky directories such as `/tmp` are supported; use a private directory when
-working in a shared writable project directory. Ownership changes apply only
+sticky directories such as `/tmp` are supported. The check covers every
+directory from `/` down to the output file, so a private directory inside a
+group-writable one is still refused; the error names the directory to fix. Ownership changes apply only
 to newly created open files, never to a replacement pathname. Another process
 with permission to rename your files can still move or unlink the capture;
 keep its directory private when stable paths matter.
