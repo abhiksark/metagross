@@ -95,8 +95,11 @@ docker run --rm -i --gpus all --privileged --pid=host \
 - The current directory is mounted read-write at the same path and becomes the
   working directory. The default `--project-root .` is therefore your project,
   relative paths resolve as they do on the host, and files your script writes
-  there belong to the build-time UID and GID. Files outside the current
-  directory are not visible.
+  there belong to the build-time UID and GID. Other host directories are not
+  mounted, so paths outside the current directory do not resolve. That is not
+  isolation: the container is privileged, shares the host PID namespace, and
+  mounts host kernel directories, so running it is equivalent to root on the
+  host.
 - `--web` adds `--network host` so your browser can reach the dashboard.
 - `METAGROSS_IMAGE` selects another image tag, for example
   `METAGROSS_IMAGE=metagross-pytorch:cu128 metagross run.py`.

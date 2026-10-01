@@ -65,7 +65,7 @@ bindings, and PyTorch, so the host needs only:
   Blackwell GPUs need the CUDA 12.8 build described in the
   [Docker guide](examples/docker/README.md#build).
 - Docker with the NVIDIA Container Toolkit, and permission to run privileged
-  containers.
+  containers, which is equivalent to root on the host.
 
 <a id="quick-start"></a>
 ## Quick start
@@ -124,8 +124,9 @@ it; the command then exits with your script's status.
 - The current directory is the project root: only functions in files under it
   are attributed, and the script must be a regular `.py` file inside it.
 - The current directory is mounted read-write at the same path and your script
-  runs there, so relative paths work as they do with `python run.py`. Files
-  outside it are not visible to your script.
+  runs there, so relative paths work as they do with `python run.py`. Other
+  host directories are not mounted, so paths outside it do not resolve. That is
+  a convenience limit, not isolation: see [Limits](#limits).
 - Put Metagross options before the script path and script arguments after it;
   the arguments reach your script unchanged.
 - Your script can import only what the image provides: PyTorch and NumPy.
@@ -204,10 +205,11 @@ python3 -m metagross view --help
   them, and VMM and expandable-segment allocations are outside the traced API set.
 - Profiling adds overhead. High call rates and nested driver re-entry can lose
   events, so check warnings and the final summary.
-- The container runs privileged and shares the host PID namespace. Metagross
-  loads its probes as root inside it, then runs your script as the image's
-  unprivileged account. Use it only with trusted local code; it is not a
-  sandbox or a production monitor. Keep captures and the private viewer URL
+- The container runs privileged and shares the host PID namespace, so running
+  it is equivalent to root on the host. Metagross loads its probes as root
+  inside it, then runs your script as the image's unprivileged account, which
+  can still see host processes. Use it only with trusted local code; it is not
+  a sandbox or a production monitor. Keep captures and the private viewer URL
   private.
 
 See the [full limits](docs/reference.md#overhead-and-limits) and the
