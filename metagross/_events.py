@@ -9,6 +9,7 @@ import json as _json
 import os
 import shlex
 import time
+import unicodedata
 
 from metagross import _bpf, MetagrossError
 
@@ -523,6 +524,13 @@ def shell_quote_details(details: dict) -> str:
     return " ".join(parts)
 
 
+def _printable(text: str) -> str:
+    """Replace control characters; names in a row come from the target."""
+    return "".join(
+        "?" if unicodedata.category(character).startswith("C") else character
+        for character in text)
+
+
 _COLUMNS = (("TIME", 12), ("FUNCTION", 18), ("LOCATION", 20),
             ("API", 16), ("RET", 5), ("DURATION", 9))
 
@@ -585,7 +593,7 @@ class Renderer:
                  str(ev.raw.ret), f"{ev.raw.dur / 1e6:.2f}ms")
         row = "".join(c.ljust(w) if len(c) < w else c + " "
                       for c, (_, w) in zip(cells, _COLUMNS))
-        self._write(row + shell_quote_details(details) + "\n")
+        self._write(_printable(row + shell_quote_details(details)) + "\n")
 
     def flush(self) -> None:
         try:

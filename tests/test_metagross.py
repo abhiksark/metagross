@@ -2237,6 +2237,23 @@ class RendererTest(unittest.TestCase):
                          json_output=False)
         self.assertIn("<unknown>", out)
 
+    def test_table_row_replaces_control_characters(self):
+        # Kernel, span and file names come from the target. A newline or an
+        # escape sequence in one must not forge rows or drive the terminal.
+        raw = _raw(1, args=(0xF00, 1, 1, 1, 1, 1, 1, 0, 0),
+                   ts=3_600_000_000_000, dur=20_000, tid=1)
+        ev = _events.AttributedEvent(
+            raw, _bpf.API_BY_ID[1],
+            _events.FrameInfo("step", "/p/a\nb.py", 3),
+            kernel_at_enqueue="evil\x1b[2J\nFAKE ROW", span="be\x07ll")
+        out = self._emit(ev, json_output=False)
+        self.assertEqual(out.count("\n"), 2)   # the header and one row
+        self.assertNotIn("\x1b", out)
+        self.assertNotIn("\x07", out)
+        self.assertIn("a?b.py:3", out)
+        self.assertIn("kernel='evil?[2J?FAKE ROW'", out)
+        self.assertIn("span='be?ll'", out)
+
     def test_table_row_shows_span_when_present(self):
         raw = _raw(1, args=(0xF00, 256, 1, 1, 128, 1, 1, 0, 0x77),
                    ts=3_600_000_000_000, dur=20_000, tid=1)
