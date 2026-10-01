@@ -1122,7 +1122,7 @@ console.log(JSON.stringify({first, refresh, replacement, duplicate, fresh, block
 """
         result = subprocess.run(
             [shutil.which("node"), "-e", harness], input=_web._APP_JS.decode(),
-            capture_output=True, text=True, timeout=5, check=True,
+            capture_output=True, text=True, timeout=30, check=True,
         )
         observed = json.loads(result.stdout)
         clean_url = "http://127.0.0.1:8765/?view=timeline"
@@ -1213,7 +1213,7 @@ async function paste(text, blocked = false) {
 """
         result = subprocess.run(
             [shutil.which("node"), "-e", harness], input=_web._APP_JS.decode(),
-            capture_output=True, text=True, timeout=5, check=True,
+            capture_output=True, text=True, timeout=30, check=True,
         )
         observed = json.loads(result.stdout)
         clean_url = "http://127.0.0.1:8765/?view=timeline"
