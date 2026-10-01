@@ -67,6 +67,13 @@ When packaging or distribution is introduced, make sure to document and test:
   - `feat: trace cuda async allocation calls`
   - `test: cover output symlink rejection`
   - `docs: document live integration requirements`
+- Write the subject as `type: summary`: imperative, lowercase after the colon,
+  at most 72 characters, no trailing period.
+- Add a body only when the reason is not obvious from the subject: at most four
+  lines wrapped at 72, saying why rather than how. Do not reference internal
+  findings, plans, or files that are not in the repository.
+- Make one logical change per commit. Fold a fix to the commit it repairs
+  before pushing instead of adding a follow-up commit.
 - If a changelog is added later, update it for user-visible changes.
 - If semantic releases are added later, ensure commit messages match the release
   tooling's expectations.
