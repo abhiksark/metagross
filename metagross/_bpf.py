@@ -203,7 +203,7 @@ def target_loaded_libcuda(pid: int, lib_path: str) -> bool:
 _HEADER = r"""
 #include <uapi/linux/ptrace.h>
 
-#define NAME_MAX_LEN 128
+#define NAME_MAX_LEN 1024
 
 struct inflight_t {
     u64 ts;
@@ -220,6 +220,13 @@ struct event_t {
     u32 _pad;
     u64 args[9];
     u64 out;
+};
+
+// Sent only by the probes that read a kernel name: the same fields, then
+// the name. Keeping the name out of every other event leaves the ring
+// buffer room for about twice as many of them.
+struct name_event_t {
+    struct event_t event;
     char name[NAME_MAX_LEN];
 };
 
@@ -263,7 +270,7 @@ int exit_{base}(struct pt_regs *ctx) {{
     struct inflight_t *f = inflight.lookup(&tid);
     if (!f) return 0;
     if (f->api_id != {api_id}) {{ return 0; }}
-    struct event_t *e = events.ringbuf_reserve(sizeof(struct event_t));
+    {reserve}
     if (!e) {{ bump(0); inflight.delete(&tid); return 0; }}
     e->ts = f->ts;
     e->dur = bpf_ktime_get_ns() - f->ts;
@@ -273,9 +280,8 @@ int exit_{base}(struct pt_regs *ctx) {{
     e->_pad = 0;
     __builtin_memcpy(e->args, f->args, sizeof(e->args));
     e->out = 0;
-    e->name[0] = 0;
 {exit_extra}
-    events.ringbuf_submit(e, 0);
+    events.ringbuf_submit({record}, 0);
     inflight.delete(&tid);
     return 0;
 }}
@@ -316,9 +322,17 @@ _READ_OUT_PARAM = r"""
 """
 
 _READ_OUT_AND_NAME = _READ_OUT_PARAM + r"""
+    named->name[0] = 0;
     if (e->ret == 0 && f->args[2])
-        bpf_probe_read_user_str(&e->name, NAME_MAX_LEN, (void *)f->args[2]);
+        bpf_probe_read_user_str(&named->name, NAME_MAX_LEN, (void *)f->args[2]);
 """
+
+_RESERVE_EVENT = (
+    "struct event_t *e = events.ringbuf_reserve(sizeof(struct event_t));")
+_RESERVE_NAME_EVENT = (
+    "struct name_event_t *named ="
+    " events.ringbuf_reserve(sizeof(struct name_event_t));\n"
+    "    struct event_t *e = named ? &named->event : 0;")
 
 _ENTER_EXTRA = {
     "launch": _LAUNCH_STACK_READS,
@@ -336,14 +350,16 @@ def build_source(target_tgid: int, apis: list[Api] | None = None) -> str:
     parts = [_HEADER]
     for api in selected:
         exit_extra = _EXIT_EXTRA.get(api.category, "")
+        reserve, record = _RESERVE_EVENT, "e"
         if api.base in ("cuModuleGetFunction", "cuLibraryGetKernel"):
             exit_extra = _READ_OUT_AND_NAME
+            reserve, record = _RESERVE_NAME_EVENT, "named"
         parts.append(_ENTER.format(
             base=api.base, tgid=target_tgid, api_id=api.api_id,
             enter_extra=_ENTER_EXTRA.get(api.category, "")))
         parts.append(_EXIT.format(
             base=api.base, tgid=target_tgid, api_id=api.api_id,
-            exit_extra=exit_extra))
+            reserve=reserve, record=record, exit_extra=exit_extra))
     return "".join(parts)
 
 
@@ -353,9 +369,10 @@ class RawEvent(ct.Structure):
         ("tid", ct.c_uint32), ("api_id", ct.c_uint32),
         ("ret", ct.c_int32), ("_pad", ct.c_uint32),
         ("args", ct.c_uint64 * 9), ("out", ct.c_uint64),
-        ("name", ct.c_char * 128),
+        ("name", ct.c_char * 1024),
     ]
 
 
 def decode_event(data: bytes) -> RawEvent:
-    return RawEvent.from_buffer_copy(data)
+    """Decode either record the probes send; most carry no name field."""
+    return RawEvent.from_buffer_copy(data.ljust(ct.sizeof(RawEvent), b"\0"))

@@ -21,3 +21,5 @@ First public preview.
   the probes are attached to.
 - CUDA graph replays (`cuGraphLaunch`) appear as one launch row each, with
   the graph and stream handles and no kernel name.
+- Kernel names up to 1,023 bytes are kept whole in JSONL and the summary;
+  table rows show the first 124 characters followed by `...`.

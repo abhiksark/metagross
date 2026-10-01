@@ -456,9 +456,9 @@ times.
 **Kernel names best-effort**: Kernel function names are available only if the
 target calls `cuModuleGetFunction`, `cuLibraryGetKernel`, or `cuKernelGetFunction`
 to register the kernel before launch. Unresolved handles use the table/JSON
-behavior described in [Output](#output). Names are cut at 127 bytes, so long
-C++ template instantiations that share that prefix are counted as one kernel in
-`top_kernels`.
+behavior described in [Output](#output). Names are C++ mangled symbols and can
+be several hundred characters long. JSONL and the summary keep up to 1,023
+bytes of a name; table rows show the first 124 characters followed by `...`.
 
 **CUDA graphs**: Replaying a graph is one `cuGraphLaunch` row with no kernel
 name; the kernels inside the graph are not listed, because the driver replays

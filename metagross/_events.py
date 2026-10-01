@@ -565,6 +565,9 @@ def event_record(
     }
 
 
+_TABLE_KERNEL_CHARS = 127  # a table row stays readable; JSONL has the full name
+
+
 class Renderer:
     def __init__(self, stream, json_output, wall_minus_mono_ns, pid):
         self.stream = stream
@@ -586,6 +589,8 @@ class Renderer:
         wall_ns = ev.raw.ts + self.wall_minus_mono_ns
         moment = datetime.datetime.fromtimestamp(wall_ns / 1e9).astimezone()
         if kernel is not None:
+            if len(kernel) > _TABLE_KERNEL_CHARS:
+                kernel = kernel[:_TABLE_KERNEL_CHARS - 3] + "..."
             details = {"kernel": kernel, **details}
             details.pop("function_handle", None)
         if ev.span is not None:

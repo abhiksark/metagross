@@ -1127,6 +1127,36 @@ class BpfSourceTest(unittest.TestCase):
         self.assertEqual(ev.args[0], 0xAB)
         self.assertEqual(ev.name, b"vec_add")
 
+    def test_decode_event_without_a_name_field(self):
+        # Only the name-reading probes send the long record; every other
+        # event stops before the name.
+        raw = _bpf.RawEvent(ts=7, dur=9, tid=5, api_id=3, ret=0, out=0x9000)
+        short = bytes(bytearray(raw))[:_bpf.RawEvent.name.offset]
+        self.assertEqual(len(short), 112)
+        ev = _bpf.decode_event(short)
+        self.assertEqual((ev.ts, ev.api_id, ev.out), (7, 3, 0x9000))
+        self.assertEqual(ev.name, b"")
+
+    def test_decode_event_keeps_a_long_kernel_name(self):
+        name = b"_ZN2at6native" + b"x" * 600
+        raw = _bpf.RawEvent(ts=1, api_id=18, out=0xF00, name=name)
+        ev = _bpf.decode_event(bytes(bytearray(raw)))
+        self.assertEqual(ev.name, name)
+
+    def test_only_name_reading_probes_reserve_the_long_record(self):
+        src = _bpf.build_source(4242)
+        self.assertIn("#define NAME_MAX_LEN 1024", src)
+        blocks = src.split("\nint exit_")[1:]
+        long_record = {block.split("(", 1)[0] for block in blocks
+                       if "sizeof(struct name_event_t)" in block}
+        self.assertEqual(long_record,
+                         {"cuModuleGetFunction", "cuLibraryGetKernel"})
+        for block in blocks:
+            base = block.split("(", 1)[0]
+            if base not in long_record:
+                self.assertIn("sizeof(struct event_t)", block)
+                self.assertNotIn("->name", block)
+
     def test_ebpf_flag_prints_source(self):
         import metagross
         buf = io.StringIO()
@@ -2604,6 +2634,18 @@ class RendererTest(unittest.TestCase):
         self.assertIn("train.py:31", out)
         self.assertIn("kernel=vec_add", out)
         self.assertIn("0.02ms", out)
+
+    def test_table_cuts_a_long_kernel_name_but_json_keeps_it(self):
+        name = "_ZN2at6native" + "x" * 600
+        raw = _raw(1, args=(0xF00, 256, 1, 1, 128, 1, 1, 0, 0x77),
+                   ts=3_600_000_000_000, dur=20_000, tid=1)
+        ev = _events.AttributedEvent(raw, _bpf.API_BY_ID[1],
+                                     _events.FrameInfo("train_step", "/p/train.py", 31),
+                                     kernel_at_enqueue=name)
+        table = self._emit(ev, json_output=False)
+        self.assertIn("kernel=" + name[:124] + "... grid=", table)
+        record = json.loads(self._emit(ev, json_output=True))
+        self.assertEqual(record["kernel"], name)
 
     def test_table_unknown_attribution(self):
         raw = _raw(16, ts=1, dur=1, tid=1)
