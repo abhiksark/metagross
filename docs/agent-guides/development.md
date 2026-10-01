@@ -192,6 +192,9 @@ record type, update all relevant pieces together:
 
 Rules:
 
+- The target writes `END` from an exit handler. `RecordReader.end_of_stream`
+  treats a started stream without it as cut short, because records dropped
+  after the last one that arrived leave no `seq` hole to detect.
 - Every record's `seq` must flow through `RecordReader`'s gap check
   (`_note_seq`) exactly once, even for record types the reader currently
   discards (e.g. `FRAME_DEF` bodies before a consumer for it exists);

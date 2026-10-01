@@ -956,9 +956,15 @@ def _trace(cfg, creds, uid, gid, dashboard_port, dashboard_token) -> int:
             print("metagross: the target replaced the profiling hook "
                   f"{hook_replacements} time(s); calls made on that thread "
                   "afterwards are unattributed", file=sys.stderr)
-        if lost_profile > hook_replacements:
-            print(f"metagross: lost {lost_profile - hook_replacements} profile "
-                  "records (writer overrun)", file=sys.stderr)
+        ended_early = profile_reader.ended_early()
+        if ended_early:
+            print("metagross: the profile stream stopped before the script's "
+                  "normal exit (the script was killed, or the tracer fell "
+                  "behind); its last calls are unattributed", file=sys.stderr)
+        overrun = lost_profile - hook_replacements - ended_early
+        if overrun > 0:
+            print(f"metagross: lost {overrun} profile records (writer overrun)",
+                  file=sys.stderr)
     except Exception as exc:
         trace_failed = True
         # Any unexpected failure here must not lose the target's exit

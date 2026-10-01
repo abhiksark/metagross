@@ -255,9 +255,11 @@ Summary schema version 1 has top-level `schema_version`, `complete`, `capture`,
 `timing`, `memory`, `copies`, `apis`, `top_functions`, `top_kernels`,
 `top_spans`, `configuration`, and `target` fields. `complete` is false if BPF
 events were lost, nested calls were dropped, profile records were lost, the
-target replaced the profiling hook, event rendering failed, or the tracing loop
-failed. `lost_profile_records` counts one for each hook replacement. Unknown Python attribution does
-not by itself make capture incomplete. Allocation and byte totals describe
+target replaced the profiling hook, the script ended without a normal
+interpreter exit, event rendering failed, or the tracing loop failed.
+`lost_profile_records` counts one for each hook replacement and one for a
+profile stream that stopped before the script's normal exit. Unknown Python
+attribution does not by itself make capture incomplete. Allocation and byte totals describe
 successfully observed driver calls, not physical GPU usage or
 framework-level tensor allocations.
 
@@ -466,6 +468,12 @@ reports `complete`.
 
 **Calls in flight at exit**: An API call is reported when it returns. A call
 that is still running when the target exits or is killed never appears.
+
+**Abnormal exit**: If the script is killed by a signal or leaves through
+`os._exit`, Metagross cannot confirm that its last profile records arrived.
+The capture is marked incomplete and the calls not yet printed, about the last
+100 ms, are `<unknown>`. An exception, `sys.exit`, or Ctrl-C ends the script
+normally.
 
 **No device or context**: Events do not record which GPU or CUDA context a call
 used, so multi-GPU activity is not separated.
@@ -691,8 +699,11 @@ The tracer bounds what it keeps from the target's profile pipe: names longer
 than 500 bytes are treated as a corrupt stream, at most 65,536 distinct project
 frames are kept, and unread profile data is capped at 16 MiB, after which the
 target drops and counts records. Calls to frames beyond that count are counted
-as lost profile records, which marks the capture incomplete. Frame history older than the 100 ms hold window
-is discarded on every loop tick, whether or not the GPU is active.
+as lost profile records, which marks the capture incomplete. Frame history
+older than the 100 ms hold window is discarded on every loop tick, whether or
+not the GPU is active. If the tracer stops reading altogether, the script
+waits at most one second for it, then carries on and drops profile records
+until the tracer reads again; the capture is marked incomplete.
 
 The dashboard server closes a connection that is silent for 10 seconds and
 serves at most 32 connections at once; further clients are disconnected. This

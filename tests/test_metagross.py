@@ -3,12 +3,14 @@
 import collections
 import contextlib
 import contextvars
+import fcntl
 import io
 import json
 import http.server
 import os
 import runpy
 import shutil
+import signal
 import stat
 import socket
 import subprocess
@@ -1164,7 +1166,7 @@ class RecordCodecTest(unittest.TestCase):
         reader = _profile.RecordReader()
         self.assertEqual(
             reader.feed(_profile.encode_hello(pid=4321, start_ns=99)), [])
-        self.assertEqual(reader.version, 3)
+        self.assertEqual(reader.version, 4)
 
     def test_missing_hello_emits_gap_then_frame(self):
         # No HELLO fed first: _expected starts as None, so the very first
@@ -1205,6 +1207,24 @@ class RecordCodecTest(unittest.TestCase):
                           ("gap", 250)])
         self.assertEqual(reader.hook_replacements, 1)
         self.assertEqual(reader.lost_records, 1)
+
+    def test_end_record_closes_the_stream_cleanly(self):
+        reader = self._reader_after_hello()
+        frame = _profile.encode_frame(_profile.CALL, 1, 100, "f", "/p/a.py", 1)
+        end = _profile.encode_end(300)
+        self.assertEqual(reader.feed(frame + end[:5]),
+                         [("frame", _profile.CALL, 1, 100, "f", "/p/a.py", 1)])
+        self.assertEqual(reader.feed(end[5:]), [])
+        self.assertEqual(reader.end_of_stream(), [])
+        self.assertFalse(reader.ended_early)
+        self.assertEqual(reader.lost_records, 0)
+
+    def test_end_record_after_dropped_records_is_a_gap(self):
+        reader = self._reader_after_hello()
+        _profile.encode_frame(_profile.CALL, 1, 100, "f", "/p/a.py", 1)  # dropped
+        self.assertEqual(reader.feed(_profile.encode_end(300)), [("gap", 300)])
+        self.assertEqual(reader.end_of_stream(), [])
+        self.assertEqual(reader.lost_records, 2)  # the DEF and the CALL
 
     def test_oversized_name_length_is_a_corrupt_stream(self):
         # The hook never writes a name longer than _MAX_STR. A longer length
@@ -1395,6 +1415,20 @@ class ProfileDropTest(unittest.TestCase):
         self.assertEqual(len(attempts), 3)
         self.assertEqual(writer.dropped, 0)
 
+    def test_end_record_is_retried_like_a_frame_definition(self):
+        attempts = []
+
+        def flaky_write(fd, data):
+            attempts.append(1)
+            if len(attempts) < 3:
+                raise BlockingIOError()
+            return len(data)
+
+        writer = _profile._DropCountWriter(7, os_write=flaky_write)
+        _profile._FrameEmitter(writer.write).end(10)
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(writer.dropped, 0)
+
     def test_frame_def_retries_through_blocking_io_error_until_it_fits(self):
         attempts = []
 
@@ -1411,6 +1445,54 @@ class ProfileDropTest(unittest.TestCase):
         # succeeds on the fd's first (4th overall) try.
         self.assertEqual(len(attempts), 4)
         self.assertEqual(writer.dropped, 0)
+
+    def test_frame_def_gives_up_when_the_pipe_stays_full(self):
+        ticks = iter(range(1000))
+        full = [True]
+        written = []
+
+        def stalled_write(fd, data):
+            if full[0]:
+                raise BlockingIOError()
+            written.append(data)
+            return len(data)
+
+        writer = _profile._DropCountWriter(
+            7, os_write=stalled_write, clock=lambda: float(next(ticks)))
+        emitter = _profile._FrameEmitter(writer.write)
+        emitter.emit(_profile.CALL, 1, 10, "f", "/p/a.py", 1)  # must return
+        self.assertEqual(writer.dropped, 1)  # the DEF; its CALL was not sent
+
+        full[0] = False
+        emitter.emit(_profile.CALL, 1, 20, "f", "/p/a.py", 1)
+        self.assertEqual(
+            [_profile.record_type(data) for data in written],
+            [_profile.FRAME_DEF, _profile._FRAME_CALL_RTYPE])
+        # The reader sees the hole and fails closed before the new frame.
+        reader = _profile.RecordReader()
+        reader._expected = _profile._COMMON.unpack_from(written[0])[1] - 1
+        records = reader.feed(b"".join(written))
+        self.assertEqual(records, [
+            ("gap", 20), ("frame", _profile.CALL, 1, 20, "f", "/p/a.py", 1)])
+        self.assertEqual(reader.lost_records, 1)
+
+    def test_stalled_pipe_is_waited_for_only_once(self):
+        attempts = []
+
+        def stalled_write(fd, data):
+            attempts.append(1)
+            raise BlockingIOError()
+
+        ticks = iter(range(1000))
+        writer = _profile._DropCountWriter(
+            7, os_write=stalled_write, clock=lambda: next(ticks) / 4)
+        emitter = _profile._FrameEmitter(writer.write)
+        emitter.emit(_profile.CALL, 1, 10, "f", "/p/a.py", 1)
+        waited = len(attempts)
+        self.assertGreater(waited, 1)
+        emitter.emit(_profile.CALL, 1, 20, "g", "/p/a.py", 2)
+        self.assertEqual(len(attempts), waited + 1)  # one try, no second wait
+        self.assertEqual(writer.dropped, 2)
 
     def test_other_oserror_on_frame_def_is_swallowed_not_dropped_or_raised(self):
         def broken_write(fd, data):
@@ -1514,10 +1596,42 @@ class ProfileReaderTest(unittest.TestCase):
             got.extend(reader.poll())
             time.sleep(0.005)
         self.assertEqual(got, [("frame", _profile.CALL, 7, 100, "run", "/p/a.py", 3)])
+        os.write(w, _profile.encode_end(200))
         os.close(w)  # child gone -> EOF
         tail = reader.drain_to_eof(time.monotonic() + 2.0)
         self.assertEqual(tail, [])
         self.assertTrue(reader.at_eof)
+        self.assertFalse(reader.ended_early())
+        os.close(r)
+
+    def test_eof_without_the_end_record_is_a_cut_short_stream(self):
+        # A killed target, or one whose last records were dropped on a full
+        # pipe, never writes END. Nothing after the last record is trusted.
+        r, w = os.pipe()
+        os.set_blocking(r, True)
+        reader = _profile.ProfileReader(r)
+        reader.start()
+        os.write(w, _profile.encode_hello(pid=1, start_ns=0))
+        os.write(w, _profile.encode_frame(_profile.CALL, 7, 100, "run", "/p/a.py", 3))
+        os.close(w)
+        records = reader.drain_to_eof(time.monotonic() + 2.0)
+        self.assertEqual(records, [
+            ("frame", _profile.CALL, 7, 100, "run", "/p/a.py", 3),
+            ("gap", None)])
+        self.assertTrue(reader.ended_early())
+        self.assertEqual(reader.lost_records(), 1)
+        os.close(r)
+
+    def test_a_stream_that_never_started_is_not_cut_short(self):
+        # --no-attribution installs no hook, so the pipe carries nothing.
+        r, w = os.pipe()
+        os.set_blocking(r, True)
+        reader = _profile.ProfileReader(r)
+        reader.start()
+        os.close(w)
+        self.assertEqual(reader.drain_to_eof(time.monotonic() + 2.0), [])
+        self.assertFalse(reader.ended_early())
+        self.assertEqual(reader.lost_records(), 0)
         os.close(r)
 
     def test_lost_records_passthrough(self):
@@ -1688,6 +1802,99 @@ class InstallHookTest(unittest.TestCase):
             joiner.on_profile_record(rec)
         tid = next(rec[2] for rec in records if rec[0] == "frame")
         self.assertIsNone(joiner.timeline.attribute(tid, gap_ts[0] + 1))
+
+    def _run_hooked_script(self, project, pipe_size=None):
+        """Run `proj.run()` under the real hook in a fresh interpreter.
+
+        Nothing reads the pipe while the script runs. Return its exit status
+        and whatever the pipe held once it exited.
+        """
+        r, w = os.pipe()
+        if pipe_size is not None:
+            fcntl.fcntl(w, fcntl.F_SETPIPE_SZ, pipe_size)
+        code = (
+            "import os, sys, tempfile\n"
+            "sys.path.insert(0, %r)\n"
+            "from metagross import _profile\n"
+            "d = tempfile.mkdtemp()\n"
+            "with open(os.path.join(d, 'proj.py'), 'w') as stream:\n"
+            "    stream.write(%r)\n"
+            "sys.path.insert(0, d)\n"
+            "_profile.install(%d, d)\n"
+            "import proj\n"
+            "proj.run()\n"
+        ) % (os.getcwd(), project, w)
+        process = subprocess.Popen([sys.executable, "-c", code], pass_fds=(w,))
+        os.close(w)
+        try:
+            status = process.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            status = None
+        os.set_blocking(r, False)
+        data = b""
+        with contextlib.suppress(BlockingIOError):
+            while chunk := os.read(r, 65536):
+                data += chunk
+        os.close(r)
+        return status, data
+
+    def test_target_finishes_when_the_controller_stops_reading(self):
+        # Nobody reads the pipe, so it fills while the script still has new
+        # functions to define. The script must run to its end regardless.
+        count = 300
+        project = (
+            "".join(f"def f{i}(): pass\n" for i in range(count))
+            + "def run():\n"
+            + "".join(f"    f{i}()\n" for i in range(count))
+        )
+        status, data = self._run_hooked_script(project, pipe_size=4096)
+        self.assertEqual(status, 0, "the script hung on a full profile pipe")
+        # Everything after the pipe filled was dropped with no later record
+        # to show a seq hole; only the missing END gives the loss away.
+        reader = _profile.RecordReader()
+        records = reader.feed(data) + reader.end_of_stream()
+        self.assertEqual(records[-1], ("gap", None))
+        self.assertTrue(reader.ended_early)
+        self.assertGreater(reader.lost_records, 0)
+
+    def test_normal_exit_ends_the_stream_once(self):
+        # The script forks a child that also exits normally. Only the
+        # script itself may end the stream.
+        project = (
+            "import os, sys\n"
+            "def work(): pass\n"
+            "def run():\n"
+            "    work()\n"
+            "    pid = os.fork()\n"
+            "    if pid == 0:\n"
+            "        sys.exit(0)\n"
+            "    os.waitpid(pid, 0)\n"
+            "    work()\n"
+        )
+        status, data = self._run_hooked_script(project)
+        self.assertEqual(status, 0)
+        reader = _profile.RecordReader()
+        records = reader.feed(data) + reader.end_of_stream()
+        self.assertNotIn("gap", [rec[0] for rec in records])
+        self.assertFalse(reader.ended_early)
+        self.assertEqual(reader.lost_records, 0)
+        self.assertEqual(
+            [rec[4] for rec in records if rec[0] == "frame"].count("work"), 4)
+
+    def test_killed_script_leaves_a_cut_short_stream(self):
+        project = (
+            "import os, signal\n"
+            "def run():\n"
+            "    os.kill(os.getpid(), signal.SIGKILL)\n"
+        )
+        status, data = self._run_hooked_script(project)
+        self.assertEqual(status, -signal.SIGKILL)
+        reader = _profile.RecordReader()
+        records = reader.feed(data) + reader.end_of_stream()
+        self.assertEqual(records[-1], ("gap", None))
+        self.assertTrue(reader.ended_early)
 
     def test_asyncio_tasks_keep_their_own_spans(self):
         # Three tasks interleave on one thread: two hold their own span

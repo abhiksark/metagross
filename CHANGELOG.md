@@ -14,3 +14,6 @@ First public preview.
 - Docker image and a `metagross` wrapper that traces a script in the current
   directory.
 - `pip install .` adds a `metagross` command; `--version` prints the version.
+- Completeness checks: lost events, dropped nested calls, lost profile
+  records, a replaced profiling hook, and a script that is killed or leaves
+  through `os._exit` each mark the capture incomplete.

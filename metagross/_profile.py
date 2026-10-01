@@ -1,7 +1,8 @@
 # metagross/_profile.py
-"""Profiling hooks run inside the traced child; record codec (wire v3)."""
+"""Profiling hooks run inside the traced child; record codec (wire v4)."""
 from __future__ import annotations
 
+import atexit
 import contextvars
 import os
 import queue
@@ -28,12 +29,14 @@ _FRAME_RETURN_RTYPE = 3
 SPAN_SET = 4    # a thread's active span is now this name
 SPAN_CLEAR = 5  # a thread has no active span
 HOOK_REPLACED = 6  # the target swapped out the profiling hook
+END = 7  # the target is exiting normally; the stream is whole up to here
 
-_WIRE_VERSION = 3
+_WIRE_VERSION = 4
 _SEQ_MOD = 2**32
 _MAX_STR = 500
 _MAX_FRAMES = 1 << 16  # distinct frames the controller keeps per capture
 _MAX_QUEUED_CHUNKS = 256  # 64 KiB reads the controller may fall behind by
+_MUST_DELIVER_TIMEOUT_S = 1.0  # wait on a full pipe for a record that must arrive
 
 # Every record starts with this 6-byte common header.
 _COMMON = struct.Struct("<BIB")  # rtype, seq, _reserved
@@ -45,6 +48,7 @@ _FRAME_REF_BODY = struct.Struct("<IQI")  # tid, ts_ns, frame_id
 _SPAN_SET_PREFIX = struct.Struct("<IQH")  # tid, ts_ns, name_len
 _SPAN_CLEAR_BODY = struct.Struct("<IQ")  # tid, ts_ns
 _HOOK_REPLACED_BODY = struct.Struct("<Q")  # ts_ns
+_END_BODY = struct.Struct("<Q")  # ts_ns
 
 _FRAME_RTYPE_BY_KIND = {CALL: _FRAME_CALL_RTYPE, RETURN: _FRAME_RETURN_RTYPE}
 _KIND_BY_FRAME_RTYPE = {_FRAME_CALL_RTYPE: CALL, _FRAME_RETURN_RTYPE: RETURN}
@@ -148,9 +152,14 @@ class _FrameEmitter:
             frame_id = self._frames.get(key)
             if frame_id is None:
                 frame_id = self._next_id
+                if self._write(
+                        _encode_frame_def(frame_id, func, path, line)) is False:
+                    # The definition never left, so a reference to it would
+                    # name a frame the reader does not know. Its unused seq
+                    # shows the reader a gap; define the frame again later.
+                    return
                 self._next_id += 1
                 self._frames[key] = frame_id
-                self._write(_encode_frame_def(frame_id, func, path, line))
             self._write(_encode_frame_ref(kind, tid, ts, frame_id))
 
     def span(self, tid, ts, name) -> None:
@@ -161,48 +170,67 @@ class _FrameEmitter:
         with self._lock:
             self._write(encode_hook_replaced(ts))
 
+    def end(self, ts) -> None:
+        with self._lock:
+            self._write(encode_end(ts))
+
 
 class _DropCountWriter:
     """Write profile records through a non-blocking fd; drop-and-count
-    ordinary records under pipe overrun, but never a FRAME_DEF.
+    ordinary records under pipe overrun, and wait briefly for the ones that
+    must arrive.
 
-    A FRAME_DEF assigns the frame_id later CALL/RETURN records reference;
-    dropping one would desync the reader's intern map forever (a CALL for
-    an id the reader never saw defined), so it is retried until it fits.
-    That can briefly block the target -- accepted, since definitions are
-    rare and small and the alternative (a permanently wrong frame_id) is
-    far worse. Every other record type is best-effort: on `BlockingIOError`
-    (EAGAIN, pipe full) it is dropped and counted rather than blocking the
-    target's own thread on tracer backpressure.
+    A FRAME_DEF assigns the frame_id later CALL/RETURN records reference,
+    a HOOK_REPLACED tells the reader to stop trusting open frames, and an
+    END tells it nothing was dropped at the tail, so these are retried while
+    the pipe is full. The wait is bounded: a controller that has stopped
+    reading must not hang the target. Once a wait times out, later ones are
+    skipped until one of these records is written again, so a stalled
+    controller costs the target one timeout, not one per record.
+    Every other record type is best-effort: on `BlockingIOError` (EAGAIN,
+    pipe full) it is dropped and counted rather than blocking the target's
+    own thread on tracer backpressure.
+
+    `write` returns False when the record did not go out, so the emitter can
+    skip a reference to a frame whose definition was dropped.
     """
 
-    def __init__(self, fd: int, os_write=os.write):
+    def __init__(self, fd: int, os_write=os.write, clock=time.monotonic):
         self._fd = fd
         self._os_write = os_write
+        self._clock = clock
+        self._stalled = False
         self.dropped = 0
 
-    def write(self, data: bytes) -> None:
+    def write(self, data: bytes) -> bool:
         # Every record is well under PIPE_BUF (the largest, a FRAME_DEF,
         # is at most ~6 + 16 + 2*_MAX_STR bytes), so a successful os.write
         # on a pipe is always atomic here: the return value is never a
         # partial write that would itself desync the reader's byte stream.
-        if record_type(data) in (FRAME_DEF, HOOK_REPLACED):
-            # A lost HOOK_REPLACED would leave stale frames trusted.
-            self._write_never_dropping(data)
-            return
+        if record_type(data) in (FRAME_DEF, HOOK_REPLACED, END):
+            return self._write_or_time_out(data)
         try:
             self._os_write(self._fd, data)
         except BlockingIOError:
             self.dropped += 1
+            return False
         except OSError:
             pass  # broken trace pipe must never kill the target
+        return True
 
-    def _write_never_dropping(self, data: bytes) -> None:
+    def _write_or_time_out(self, data: bytes) -> bool:
+        deadline = self._clock() + (
+            0 if self._stalled else _MUST_DELIVER_TIMEOUT_S)
         while True:
             try:
                 self._os_write(self._fd, data)
-                return
             except BlockingIOError:
+                if self._clock() >= deadline:
+                    # The reader learns of this from the seq hole a later
+                    # record shows, or from the stream ending without END.
+                    self._stalled = True
+                    self.dropped += 1
+                    return False
                 # Pipe momentarily full: retry until it drains. This runs
                 # under `_FrameEmitter`'s lock, so yield the GIL between
                 # attempts rather than busy-spinning and starving other
@@ -210,7 +238,9 @@ class _DropCountWriter:
                 time.sleep(0)
                 continue
             except OSError:
-                return  # broken trace pipe must never kill the target
+                return True  # broken trace pipe must never kill the target
+            self._stalled = False
+            return True
 
 
 def encode_span(tid, ts_ns, name) -> bytes:
@@ -229,8 +259,13 @@ def encode_hook_replaced(ts_ns) -> bytes:
     return _COMMON.pack(HOOK_REPLACED, seq, 0) + _HOOK_REPLACED_BODY.pack(ts_ns)
 
 
+def encode_end(ts_ns) -> bytes:
+    seq = _next_seq()
+    return _COMMON.pack(END, seq, 0) + _END_BODY.pack(ts_ns)
+
+
 class RecordReader:
-    """Decode the v2 profile wire format into tagged tuples.
+    """Decode the profile wire format into tagged tuples.
 
     Every record carries a per-child `seq`. A `seq` that does not match what
     this reader expects next means one or more records never arrived (a
@@ -247,9 +282,9 @@ class RecordReader:
         self._expected = None
         self.version = None
         # frame_id -> (func, path, line). Never cleared, including on a
-        # gap: FRAME_DEF is never dropped (_DropCountWriter makes it
-        # undroppable), so a definition always precedes its use and ids
-        # never desync.
+        # gap: the emitter references a frame only after its FRAME_DEF was
+        # written, so a definition always precedes its use and ids never
+        # desync.
         self._frames: dict[int, tuple] = {}
         # Total records lost to gaps: the sum of seq deltas across every
         # detected gap, plus the (should-not-happen) defensive drops below.
@@ -259,6 +294,11 @@ class RecordReader:
         # reliably flush a final count once its pipe is overrunning.
         self.lost_records = 0
         self.hook_replacements = 0
+        # Records dropped after the last one that arrived leave no seq hole
+        # to find. The target writes END when it exits normally, so a stream
+        # that began but has no END is missing its tail.
+        self._ended = False
+        self.ended_early = False
         # A gap revealed on a record with no ts_ns of its own (FRAME_DEF,
         # HELLO) is not reported immediately: it is held here and emitted
         # with the ts of the next record that DOES carry a real ts_ns, so
@@ -370,6 +410,15 @@ class RecordReader:
                 self.lost_records += 1
                 out.append(("gap", ts_ns))
                 continue
+            if rtype == END:
+                need = _COMMON.size + _END_BODY.size
+                if len(self._buf) < need:
+                    break
+                (ts_ns,) = _END_BODY.unpack_from(self._buf, _COMMON.size)
+                self._buf = self._buf[need:]
+                self._note_seq(seq, out, ts_ns)
+                self._ended = True
+                continue
             return self._corrupt(out)  # unknown rtype
         return out
 
@@ -407,6 +456,20 @@ class RecordReader:
             return []
         self._pending_gap = False
         return [("gap", None)]
+
+    def end_of_stream(self) -> list:
+        """Flush once no more bytes will come.
+
+        A stream that started but never reached END was cut short: the
+        target was killed, or its last records were dropped on a full pipe.
+        Either way nothing after the last record received can be trusted.
+        """
+        if self._expected is not None and not self._ended:
+            self._ended = True  # count it once
+            self.ended_early = True
+            self.lost_records += 1
+            self._pending_gap = True
+        return self.finalize()
 
 
 class ProfileReader:
@@ -458,7 +521,7 @@ class ProfileReader:
     def _consume(self, item) -> list:
         if not item:
             self.at_eof = True
-            return self._reader.finalize()
+            return self._reader.end_of_stream()
         return self._reader.feed(item)
 
     def lost_records(self) -> int:
@@ -473,6 +536,10 @@ class ProfileReader:
     def hook_replacements(self) -> int:
         """Return how often the target replaced the profiling hook."""
         return self._reader.hook_replacements
+
+    def ended_early(self) -> bool:
+        """Return whether the stream stopped without the target's END."""
+        return self._reader.ended_early
 
     def poll(self) -> list:
         out = []
@@ -517,8 +584,9 @@ class ProfileReader:
             # joiner's final forced flush, so a gap still pending -- one
             # revealed on a no-ts record with no later real-ts record to
             # resolve it -- must be flushed now rather than left to
-            # silently vanish (fail-closed).
-            out.extend(self._reader.finalize())
+            # silently vanish (fail-closed). The target itself has exited,
+            # so its END would have arrived by now.
+            out.extend(self._reader.end_of_stream())
         return out
 
 
@@ -722,6 +790,13 @@ def install(write_fd: int, project_root: str) -> None:
                 and sys.getprofile() is hook):
             emitter.hook_replaced(time.monotonic_ns())
 
+    def end_stream() -> None:
+        # Registered before the script runs, so it runs after the script's
+        # own exit handlers. A forked child must not end its parent's stream.
+        if _current_emitter is emitter:
+            emitter.end(time.monotonic_ns())
+
     threading.setprofile(hook)
     sys.setprofile(hook)
     sys.addaudithook(audit)
+    atexit.register(end_stream)
