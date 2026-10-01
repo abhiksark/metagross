@@ -3,19 +3,61 @@
 
 from __future__ import annotations
 
+import os
+import sys
+
+
+def _launched_as_module() -> bool:
+    """Return whether this is `python -m metagross`, however it was spelled.
+
+    A program that merely imports Metagross must keep its own import path,
+    so the module being launched has to be this one.
+    """
+    if sys.argv[0] != "-m":  # set only while Python locates the -m module
+        return False
+    arguments = sys.orig_argv
+    for index, argument in enumerate(arguments):
+        if not argument.startswith("-") or argument.startswith("--"):
+            continue
+        if argument.endswith("mmetagross"):  # -mmetagross, -Bmmetagross
+            return True
+        if argument.endswith("m") and arguments[index + 1:index + 2] == ["metagross"]:
+            return True  # -m metagross, -Bm metagross
+    return False
+
+
+def _pin_import_path() -> None:
+    """Keep `python -m metagross` from importing out of a foreign directory.
+
+    `-m` puts the working directory first on `sys.path`, and the controller
+    normally runs as root. Drop that entry unless it is this installation,
+    before anything else is imported.
+    """
+    if not _launched_as_module():
+        return
+    try:
+        cwd = os.path.realpath(os.getcwd())
+    except OSError:
+        return
+    package_root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    if (sys.path and os.path.realpath(sys.path[0] or ".") == cwd
+            and cwd != package_root):
+        del sys.path[0]
+
+
+_pin_import_path()  # must run before the imports below
+
 import contextlib
 import ctypes as ct
 import dataclasses
 import fcntl
 import io
 import json
-import os
 import pwd
 import select
 import signal
 import stat
 import subprocess
-import sys
 import time
 import traceback
 from typing import NoReturn

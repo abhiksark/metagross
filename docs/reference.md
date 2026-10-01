@@ -656,6 +656,19 @@ is restored to close-on-exec before target code runs; controller descriptors do
 not intentionally cross into target code. Arguments remain unchanged. The
 bootstrap removes the producer token before the target can inspect its environment.
 
+`python -m` puts the working directory first on Python's import path, and the
+interpreter imports some of its own modules from there (`types`, and `runpy` on
+Python 3.10) before any Metagross code runs. Metagross removes a working
+directory that is not its own checkout from the path before importing anything
+itself, but it cannot undo what the interpreter already loaded. Run
+`sudo /usr/bin/python3 -m metagross` only from the checkout. To start Metagross
+from any other directory, launch it by path, which never puts the working
+directory on the import path:
+
+```sh
+sudo /usr/bin/python3 /path/to/metagross-checkout/metagross [options] script.py
+```
+
 This is a local diagnostic, not a sandbox, multi-user service, production
 monitor, or isolation boundary. A malicious target, compromised invoking account,
 root process, or compromised browser is outside its protection. Local trace data

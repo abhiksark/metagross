@@ -294,6 +294,73 @@ class TargetExecutionTest(unittest.TestCase):
                 self.assertEqual(code, -signum, stderr)
 
 
+class ModuleLaunchImportPathTest(unittest.TestCase):
+    def _launch(self, cwd, arguments=("-m", "metagross", "--help"),
+                on_python_path=True):
+        env = dict(os.environ)
+        env.pop("PYTHONPATH", None)
+        if on_python_path:
+            env["PYTHONPATH"] = os.getcwd()
+        return subprocess.run(
+            [sys.executable, *arguments],
+            cwd=cwd, env=env, capture_output=True, text=True, timeout=30)
+
+    def _plant(self, directory, names=("dataclasses", "traceback")):
+        """Write stand-ins for modules Metagross imports; return their log."""
+        log = os.path.join(directory, "imported.log")
+        for name in names:
+            with open(os.path.join(directory, name + ".py"), "w") as stream:
+                stream.write(f"open({log!r}, 'a').write({name!r})\n"
+                             "raise ImportError('planted module ran')\n")
+        return log
+
+    def test_foreign_working_directory_is_not_on_the_import_path(self):
+        # `python -m` puts the working directory first on sys.path, and the
+        # controller normally runs as root.
+        for spelling in (("-m", "metagross"), ("-mmetagross",),
+                         ("-Bm", "metagross")):
+            with self.subTest(spelling=spelling), \
+                    tempfile.TemporaryDirectory() as foreign:
+                log = self._plant(foreign)
+                result = self._launch(foreign, (*spelling, "--help"))
+                self.assertFalse(os.path.exists(log), result.stderr)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("usage:", result.stdout)
+
+    def test_launch_by_path_never_imports_from_the_working_directory(self):
+        # Under -m the interpreter itself imports runpy or types from the
+        # working directory before Metagross runs. Launched by path it must
+        # not, so plant those too.
+        launcher = os.path.join(os.getcwd(), "metagross")
+        with tempfile.TemporaryDirectory() as foreign:
+            log = self._plant(
+                foreign, ("dataclasses", "traceback", "runpy", "types"))
+            result = self._launch(foreign, (launcher, "--help"),
+                                  on_python_path=False)
+            self.assertFalse(os.path.exists(log), result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("usage:", result.stdout)
+
+    def test_checkout_as_working_directory_still_launches(self):
+        result = self._launch(os.getcwd())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("usage:", result.stdout)
+
+    def test_another_program_that_imports_metagross_keeps_its_path(self):
+        # A project launched with -m that uses metagross.span() must still
+        # import its own modules from the working directory.
+        with tempfile.TemporaryDirectory() as project:
+            os.mkdir(os.path.join(project, "app"))
+            for name, source in (("app/__init__.py", "import metagross\n"),
+                                 ("app/__main__.py", "import helper\n"),
+                                 ("helper.py", "print('helper imported')\n")):
+                with open(os.path.join(project, name), "w") as stream:
+                    stream.write(source)
+            result = self._launch(project, ("-m", "app"))
+        self.assertEqual((result.returncode, result.stdout),
+                         (0, "helper imported\n"), result.stderr)
+
+
 class TopLevelHelpTest(unittest.TestCase):
     def test_help_before_target_is_unprivileged(self):
         for args in (["-h"], ["--help"], ["--json", "--help"]):
