@@ -14,6 +14,7 @@ import ctypes
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -26,6 +27,7 @@ ENABLED = os.environ.get("RUN_STUB_INTEGRATION") == "1"
 
 _SCRIPT = '''\
 import ctypes
+import os
 
 cuda = ctypes.CDLL("libcuda.so.1")
 cuda.cuLaunchKernel.argtypes = (
@@ -112,7 +114,7 @@ def main():
     use_pool()
     wait_for_stream()
     release(pointer)
-    print("stub workload done")
+    print("stub workload done as", os.getuid(), os.getgid())
 
 
 main()
@@ -142,16 +144,19 @@ class StubLiveTraceTest(unittest.TestCase):
         with open(self.script, "w", encoding="utf-8") as stream:
             stream.write(_SCRIPT)
         os.chmod(self.script, 0o644)
-        # Metagross creates the output files itself and hands them to the
-        # invoking user; see _fresh_output_path in test_metagross.
+        # Through sudo the target runs as the invoking user; in a bare root
+        # shell (a container) there is nobody to drop to.
+        self.invoker = (int(os.environ.get("SUDO_UID", 0)),
+                        int(os.environ.get("SUDO_GID", 0)))
+        # Metagross creates the output files itself, in a directory of the
+        # invoking user, and hands them to that user.
         self.out_dir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.out_dir, ignore_errors=True)
+        os.chown(self.out_dir, *self.invoker)
 
     def _trace(self, *options):
         trace = os.path.join(self.out_dir, "trace.jsonl")
         summary = os.path.join(self.out_dir, "summary.json")
-        # Through sudo the target runs as the invoking user; in a bare root
-        # shell (a container) there is nobody to drop to.
         root_target = [] if "SUDO_UID" in os.environ else ["--allow-root-target"]
         process = subprocess.run(
             [sys.executable, "-m", "metagross", "--json", "--output", trace,
@@ -159,7 +164,14 @@ class StubLiveTraceTest(unittest.TestCase):
              "--project-root", self.project, self.script],
             capture_output=True, text=True, timeout=120)
         self.assertEqual(process.returncode, 0, process.stderr)
-        self.assertEqual(process.stdout, "stub workload done\n")
+        # The privilege drop: the script ran as the invoker, who also owns
+        # the private output files.
+        self.assertEqual(process.stdout,
+                         "stub workload done as {} {}\n".format(*self.invoker))
+        for path in (trace, summary):
+            info = os.stat(path)
+            self.assertEqual((info.st_uid, info.st_gid), self.invoker)
+            self.assertEqual(stat.S_IMODE(info.st_mode), 0o600)
         notices = [line for line in process.stderr.splitlines()
                    if line.startswith("metagross:")]
         self.assertEqual(

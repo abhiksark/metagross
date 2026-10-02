@@ -70,10 +70,13 @@ def _fresh_output_path(test):
     The live suite runs as root; pre-creating the file would make it
     root-owned and metagross (dropped to the invoking uid) would rightly
     refuse to truncate it. Letting metagross create the file matches real
-    usage and lets it chown the file to the invoker.
+    usage and lets it chown the file to the invoker. The directory must
+    belong to the invoker too, or metagross refuses to create a file there.
     """
     directory = tempfile.mkdtemp()
     test.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+    os.chown(directory, int(os.environ.get("SUDO_UID", os.getuid())),
+             int(os.environ.get("SUDO_GID", os.getgid())))
     return os.path.join(directory, "trace.jsonl")
 
 
@@ -824,7 +827,14 @@ class OutputSafetyTest(unittest.TestCase):
                 writable_opens.append(name)
             return fd
 
-        with mock.patch("metagross.os.open", side_effect=record_open):
+        def dev_directory(_path, _uid):
+            # /dev is refused as a directory that is not the caller's; step
+            # past that to reach the check on the file itself.
+            return real_open("/dev", os.O_RDONLY | os.O_DIRECTORY)
+
+        with mock.patch("metagross.os.open", side_effect=record_open), \
+                mock.patch("metagross._open_output_parent",
+                           side_effect=dev_directory):
             with self.assertRaisesRegex(MetagrossError, "not a regular file"):
                 with open_trace_output("/dev/null", self.uid, self.gid):
                     pass
@@ -1054,8 +1064,31 @@ class OutputSafetyTest(unittest.TestCase):
         with open(trace, "rb") as handle:
             self.assertEqual(handle.read(), b"keep this capture")
 
+    def test_output_directory_must_be_the_callers_or_a_shared_sticky_one(self):
+        # Root creates the file and gives it to the caller. In a root-owned
+        # directory that would hand an unprivileged caller a file in, say,
+        # /etc/ld.so.conf.d.
+        if self.uid != 0:
+            for directory in ("/etc", "/usr/lib"):
+                with self.subTest(directory=directory):
+                    with self.assertRaisesRegex(
+                            MetagrossError, "does not belong to you"):
+                        metagross._open_output_parent(
+                            f"{directory}/metagross-test.conf", self.uid)
+        os.close(metagross._open_output_parent("/tmp/trace.jsonl", self.uid))
+        os.close(metagross._open_output_parent(self._path("trace"), self.uid))
+
+    @unittest.skipUnless(os.geteuid() == 0, "needs root for real output ownership")
+    def test_root_does_not_create_a_callers_file_in_a_root_directory(self):
+        path = self._path("trace")  # the directory belongs to root
+        with self.assertRaisesRegex(MetagrossError, "does not belong to you"):
+            with open_trace_output(path, 1000, 1000):
+                pass
+        self.assertFalse(os.path.exists(path))
+
     @unittest.skipUnless(os.geteuid() == 0, "needs root for real output ownership")
     def test_real_foreign_inode_swap_preserves_contents(self):
+        os.chown(self.dir.name, 1000, 1000)
         trace, victim = self._path("trace"), self._path("protected")
         with open(trace, "wb") as handle:
             handle.write(b"old trace")
@@ -1080,6 +1113,7 @@ class OutputSafetyTest(unittest.TestCase):
 
     @unittest.skipUnless(os.geteuid() == 0, "needs root for real output ownership")
     def test_new_file_chown_cannot_follow_a_replacement_symlink(self):
+        os.chown(self.dir.name, 1000, 1000)
         trace, moved = self._path("trace"), self._path("moved")
         victim = self._path("protected")
         with open(victim, "wb") as handle:

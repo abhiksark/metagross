@@ -94,6 +94,9 @@ predictable, and diagnosable. Favor a boring core over clever tracing magic.
 - New output files must be created with mode `0600`.
 - New output files should be owned by the invoking user, not root, when running
   under sudo.
+- The directory that receives an output must belong to the invoking user or be
+  a shared sticky directory such as `/tmp`. Root must not create a file the
+  caller owns in a directory the caller could not write to.
 - Existing output paths may only be truncated when they are regular,
   non-symlink files owned by the invoking uid with no other hard link.
 - Reject directories, symlinks, device files, FIFOs, and files owned by another

@@ -24,6 +24,11 @@ User-visible changes to Metagross. Versions follow `metagross.__version__`.
   `--ebpf` without privileges or GPU access, no longer mistakes an option
   value ending in `.py` for the script, passes extra `docker run` options
   from `METAGROSS_DOCKER_ARGS`, and refuses to run from `/workspace`.
+- Breaking, security: `--output` and `--summary-output` are refused in a
+  directory that does not belong to the invoking user, unless it is a shared
+  sticky directory such as `/tmp`. Before, a user allowed to run only
+  Metagross as root could create a file they owned in any root-owned
+  directory.
 - SIGTERM to Metagross during a run, for example from `docker stop` or
   `timeout`, is passed to the script, as Ctrl-C already was. The capture ends
   with its summary instead of being cut off, and `--web` stops serving.

@@ -68,9 +68,13 @@ sudo env RUN_STUB_INTEGRATION=1 \
   /usr/bin/python3 -m unittest -v tests.test_stub_live
 ```
 
-It covers probe attachment, the privilege drop, the ring buffer and profile
-pipe, attribution, and the JSONL and summary output. It does not replace the
-live integration gate: the stub accepts any arguments and never fails.
+It covers probe attachment, the privilege drop (the script's user and the
+owner and mode of the output files), the ring buffer and profile pipe,
+attribution, and the JSONL and summary output. It does not replace the live
+integration gate: the stub accepts any arguments and never fails. The CI job
+also runs `tests.test_metagross.OutputSafetyTest` as root, for the ownership
+tests that are skipped without it, and fails if any test in either run is
+skipped.
 
 ## Direct Docker dashboard gate
 

@@ -325,6 +325,15 @@ def _open_output_parent(path: str, uid: int) -> int:
                     "other users can write to; remove that permission "
                     "(chmod go-w) or write somewhere else"
                 )
+        # Root creates the file and hands it to `uid`, so the directory must
+        # be one where `uid` could have created it: its own, or a shared
+        # sticky one such as /tmp. Otherwise a caller who may only run
+        # Metagross as root could plant a file it owns in /etc/cron.d.
+        shared = info.st_mode & stat.S_ISVTX and info.st_mode & stat.S_IWOTH
+        if info.st_uid != uid and not shared:
+            raise MetagrossError(
+                f"output {path!r} is in {current!r}, which does not belong "
+                "to you; write to a directory of your own")
         return fd
     except BaseException:
         os.close(fd)

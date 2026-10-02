@@ -143,7 +143,10 @@ Output parent directories must be owned by root or the invoking user. Symlinked
 parents and group- or other-writable non-sticky parents are rejected. Standard
 sticky directories such as `/tmp` are supported. The check covers every
 directory from `/` down to the output file, so a private directory inside a
-group-writable one is still refused; the error names the directory to fix. Ownership changes apply only
+group-writable one is still refused; the error names the directory to fix.
+The directory that holds the file must belong to the invoking user or be a
+shared sticky directory, so that Metagross, running as root, never creates a
+file for you where you could not have created it yourself. Ownership changes apply only
 to newly created open files, never to a replacement pathname. Another process
 with permission to rename your files can still move or unlink the capture;
 keep its directory private when stable paths matter.
