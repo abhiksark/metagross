@@ -1108,7 +1108,8 @@ def _trace(cfg, creds, uid, gid, dashboard_port, dashboard_token,
         dropped = b["counters"][ct.c_int(1)].value
         lost_profile = profile_reader.lost_records()
         if lost:
-            print(f"metagross: lost {lost} events (ring buffer full)", file=sys.stderr)
+            print(f"metagross: lost {lost} events (ring buffer or call table "
+                  "full)", file=sys.stderr)
         if dropped:
             print(f"metagross: dropped {dropped} nested calls", file=sys.stderr)
         hook_replacements = profile_reader.hook_replacements()

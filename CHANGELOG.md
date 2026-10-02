@@ -48,6 +48,9 @@ User-visible changes to Metagross. Versions follow `metagross.__version__`.
   probed once; before, one call could be counted as nested and mark the
   capture incomplete. The pre-3.2 32-bit forms of the memory APIs are no
   longer traced with the 64-bit layout.
+- A call whose arguments the probe could not read carries `unread: true` in
+  its details instead of zeros that look real, and a call that could not be
+  recorded because the in-flight table was full counts as a lost event.
 - Breaking, security: `--output` and `--summary-output` are refused in a
   directory that does not belong to the invoking user, unless it is a shared
   sticky directory such as `/tmp`. Before, a user allowed to run only

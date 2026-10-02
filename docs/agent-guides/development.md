@@ -187,6 +187,8 @@ Rules:
   every API. Mark an API `old_abi` when its unsuffixed name is the pre-3.2
   32-bit entry point; a `_v2` of any other API is a variant, not a
   replacement.
+- Check the result of every user-memory read and map update in a probe: set
+  the event's `unread` flag or count a lost event, never report zeros as data.
 - Keep eBPF programs simple. Capture arguments in kernel space; interpret in
   Python.
 - Never assume a kernel/function handle has a name. Kernel names are best-effort.

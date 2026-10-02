@@ -478,6 +478,10 @@ def describe(api, ev, registry: KernelRegistry, allocs: AllocTracker,
             det["stream"] = _hex(ev.args[0])
         elif api.base == "cuEventSynchronize":
             det["event"] = _hex(ev.args[0])
+    if ev.unread:
+        # The probe could not read part of the call from the script's
+        # memory; the values that depend on it above are zero.
+        det["unread"] = True
     return kernel, det
 
 

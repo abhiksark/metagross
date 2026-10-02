@@ -500,6 +500,11 @@ Details captured depend on the API:
 | Memory transfers | `bytes`, `stream` (async only) |
 | Synchronization | `stream` (cuStreamSynchronize), `event` (cuEventSynchronize) |
 
+Any row's details can also carry `unread: true`: the probe could not read
+part of the call from the script's memory, and the values that depend on it
+(the last three launch arguments, a launch configuration, or a returned
+pointer) are zero. This is not expected in practice.
+
 Versioned and per-thread-default-stream symbol variants are normalized to the
 base API names above. Each entry point is probed once, even when the driver
 exports it under several names. The pre-3.2 forms of the allocation, free,

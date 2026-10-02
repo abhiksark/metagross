@@ -216,6 +216,7 @@ _HEADER = r"""
 struct inflight_t {
     u64 ts;
     u32 api_id;
+    u32 unread;  // an argument could not be read from the target's memory
     u64 args[9];
 };
 
@@ -225,7 +226,7 @@ struct event_t {
     u32 tid;
     u32 api_id;
     s32 ret;
-    u32 _pad;
+    u32 unread;
     u64 args[9];
     u64 out;
 };
@@ -265,7 +266,8 @@ int enter_{base}(struct pt_regs *ctx) {{
 {enter_extra}
     struct inflight_t *prev = inflight.lookup(&tid);
     if (prev) bump(1);
-    inflight.update(&tid, &f);
+    // A full table means this call cannot be reported: count it as lost.
+    if (inflight.update(&tid, &f) != 0) bump(0);
     return 0;
 }}
 """
@@ -285,7 +287,7 @@ int exit_{base}(struct pt_regs *ctx) {{
     e->tid = tid;
     e->api_id = f->api_id;
     e->ret = (s32)PT_REGS_RC(ctx);
-    e->_pad = 0;
+    e->unread = f->unread;
     __builtin_memcpy(e->args, f->args, sizeof(e->args));
     e->out = 0;
 {exit_extra}
@@ -300,9 +302,11 @@ int exit_{base}(struct pt_regs *ctx) {{
 _LAUNCH_STACK_READS = r"""
     {
         u64 sp = PT_REGS_SP(ctx);
-        bpf_probe_read_user(&f.args[6], sizeof(u64), (void *)(sp + 8));
-        bpf_probe_read_user(&f.args[7], sizeof(u64), (void *)(sp + 16));
-        bpf_probe_read_user(&f.args[8], sizeof(u64), (void *)(sp + 24));
+        long failed;
+        failed = bpf_probe_read_user(&f.args[6], sizeof(u64), (void *)(sp + 8));
+        failed |= bpf_probe_read_user(&f.args[7], sizeof(u64), (void *)(sp + 16));
+        failed |= bpf_probe_read_user(&f.args[8], sizeof(u64), (void *)(sp + 24));
+        if (failed) f.unread = 1;
     }
 """
 
@@ -313,9 +317,11 @@ _LAUNCH_EX_CONFIG_READS = r"""
         void *cfg = (void *)f.args[0];
         u32 dims[6] = {};
         u32 shmem = 0; u64 stream = 0;
-        bpf_probe_read_user(&dims, sizeof(dims), cfg);
-        bpf_probe_read_user(&shmem, sizeof(shmem), cfg + 24);
-        bpf_probe_read_user(&stream, sizeof(stream), cfg + 32);
+        long failed;
+        failed = bpf_probe_read_user(&dims, sizeof(dims), cfg);
+        failed |= bpf_probe_read_user(&shmem, sizeof(shmem), cfg + 24);
+        failed |= bpf_probe_read_user(&stream, sizeof(stream), cfg + 32);
+        if (failed) f.unread = 1;
         f.args[2] = ((u64)dims[1] << 32) | dims[0];
         f.args[3] = ((u64)dims[3] << 32) | dims[2];
         f.args[4] = ((u64)dims[5] << 32) | dims[4];
@@ -325,14 +331,17 @@ _LAUNCH_EX_CONFIG_READS = r"""
 """
 
 _READ_OUT_PARAM = r"""
-    if (e->ret == 0)
-        bpf_probe_read_user(&e->out, sizeof(u64), (void *)f->args[0]);
+    if (e->ret == 0
+        && bpf_probe_read_user(&e->out, sizeof(u64), (void *)f->args[0]))
+        e->unread = 1;
 """
 
 _READ_OUT_AND_NAME = _READ_OUT_PARAM + r"""
     named->name[0] = 0;
-    if (e->ret == 0 && f->args[2])
-        bpf_probe_read_user_str(&named->name, NAME_MAX_LEN, (void *)f->args[2]);
+    if (e->ret == 0 && f->args[2]
+        && bpf_probe_read_user_str(&named->name, NAME_MAX_LEN,
+                                   (void *)f->args[2]) < 0)
+        e->unread = 1;
 """
 
 _RESERVE_EVENT = (
@@ -375,7 +384,7 @@ class RawEvent(ct.Structure):
     _fields_ = [
         ("ts", ct.c_uint64), ("dur", ct.c_uint64),
         ("tid", ct.c_uint32), ("api_id", ct.c_uint32),
-        ("ret", ct.c_int32), ("_pad", ct.c_uint32),
+        ("ret", ct.c_int32), ("unread", ct.c_uint32),
         ("args", ct.c_uint64 * 9), ("out", ct.c_uint64),
         ("name", ct.c_char * 1024),
     ]

@@ -158,6 +158,19 @@ class DescribeTest(unittest.TestCase):
         self.assertEqual(det["bytes"], 4096)
         self.assertEqual(self.allocs.total_bytes, 0)
 
+    def test_an_unread_argument_is_flagged_in_the_details(self):
+        raw = _raw(1, args=(0xF00, 8, 1, 1, 128, 1, 0, 0, 0), ts=1, dur=1)
+        raw.unread = 1
+        _, details = _events.describe(
+            _bpf.API_BY_ID[1], raw, _events.KernelRegistry(),
+            _events.AllocTracker())
+        self.assertIs(details["unread"], True)
+        raw.unread = 0
+        _, details = _events.describe(
+            _bpf.API_BY_ID[1], raw, _events.KernelRegistry(),
+            _events.AllocTracker())
+        self.assertNotIn("unread", details)
+
     def test_free_failure_does_not_skew_gpu_total(self):
         _, det = _events.describe(_bpf.API_BY_ID[3],
                                   _raw(3, args=(0, 4096), out=0x9000),
@@ -1381,6 +1394,18 @@ class BpfSourceTest(unittest.TestCase):
             self.assertIn(
                 f"bpf_probe_read_user(&f.args[{slot}], sizeof(u64), "
                 f"(void *)(sp + {offset}));", body)
+
+    def test_a_failed_read_or_a_full_call_table_is_reported(self):
+        # Ignored, a failed read would report zeros as if they were real,
+        # and a call that could not be recorded would vanish.
+        start = self.src.index("int enter_cuLaunchKernel(")
+        body = self.src[start:self.src.index("int exit_cuLaunchKernel(")]
+        self.assertIn("if (failed) f.unread = 1;", body)
+        self.assertIn("if (inflight.update(&tid, &f) != 0) bump(0);", body)
+        self.assertIn("e->unread = f->unread;", self.src)
+        start = self.src.index("int exit_cuMemAlloc(")
+        exit_alloc = self.src[start:self.src.index("int enter_", start)]
+        self.assertIn("e->unread = 1;", exit_alloc)
 
     def test_launch_ex_reads_the_config_struct(self):
         start = self.src.index("int enter_cuLaunchKernelEx(")
