@@ -40,9 +40,9 @@ Verification; user-visible/product changes also require Documentation and releas
   rules.
 - [Verification guide](docs/agent-guides/verification.md): targeted unit tests,
   default unprivileged gate, live integration gate, and handoff expectations.
-- [Documentation and release guide](docs/agent-guides/docs-and-release.md): README
-  update triggers, output schema discipline, examples, packaging considerations,
-  and git/release workflow.
+- [Documentation and release guide](docs/agent-guides/docs-and-release.md):
+  documentation update triggers, output schema discipline, examples, packaging,
+  versions, and git/release workflow.
 
 ## Repository map
 
@@ -52,20 +52,31 @@ Verification; user-visible/product changes also require Documentation and releas
 - `metagross/_bpf.py`: CUDA API table, libcuda discovery and the loaded-libcuda
   check, symbol resolution, generated eBPF C source, BCC loading, probe
   attachment, and raw event structs.
+- `metagross/_target.py`: private runner the forked child execs into; installs
+  the profiling hook and runs the script with normal interpreter shutdown.
 - `metagross/_dashboard.py`: private runner for `--web` that serves the
   in-memory dashboard as the unprivileged target user.
 - `metagross/_profile.py`: profiling hook installed in the traced child and the
   binary profile-record codec read by the parent.
+- `metagross/_span.py`: the public `metagross.span()` context manager.
 - `metagross/_viewer.py`: unprivileged streaming JSONL model, summary loading,
   terminal sanitization, and static visual trace rendering.
 - `metagross/_follow.py`: bounded incremental JSONL following, partial-line
   handling, trace replacement detection, and final-summary watching.
 - `metagross/_tui.py`: dependency-free curses live dashboard and terminal-sized
   overview layout.
+- `metagross/_web.py`: standard-library HTTP dashboard server, its bounded
+  state and JSON payload, and the embedded browser front end.
+- `metagross/_publish.py`: bounded delivery of a live capture from the
+  controller to a local dashboard.
 - `metagross/_events.py`: profile/GPU stream joining, attribution, kernel-name and
   allocation tracking, detail enrichment, table rendering, and JSONL rendering.
 - `tests/test_metagross.py`: unprivileged unit suite plus root/CUDA integration tests
   gated by `RUN_EBPF_INTEGRATION=1`.
+- `tests/test_target.py`: the exec boundary: startup barrier, argument and
+  environment pass-through, shutdown, exit statuses, and descriptor inheritance.
+- `tests/test_viewer.py`: the snapshot, follow, and web viewers and the
+  dashboard HTTP interface.
 - `tests/test_stub_live.py`, `tests/stub_libcuda.c`: the real tracer run against
   a stub driver library, gated by `RUN_STUB_INTEGRATION=1`; needs root and BCC
   but no GPU.

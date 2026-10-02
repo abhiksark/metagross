@@ -21,6 +21,8 @@ predictable, and diagnosable. Favor a boring core over clever tracing magic.
   resolution, eBPF C generation, BCC loading, probe attachment, and raw structs.
 - `metagross/_profile.py` owns the child-process Python profiler and binary
   profile record codec.
+- `metagross/_span.py` owns the public `metagross.span()` context manager,
+  which reports through the same profile pipe.
 - `metagross/_viewer.py` owns unprivileged trace-file parsing, bounded viewer
   state, summary reconciliation, terminal sanitization, and static rendering.
 - `metagross/_follow.py` owns bounded incremental reads, partial JSONL records,
@@ -88,7 +90,7 @@ predictable, and diagnosable. Favor a boring core over clever tracing magic.
 - New output files should be owned by the invoking user, not root, when running
   under sudo.
 - Existing output paths may only be truncated when they are regular,
-  non-symlink files owned by the invoking uid.
+  non-symlink files owned by the invoking uid with no other hard link.
 - Reject directories, symlinks, device files, FIFOs, and files owned by another
   user.
 
@@ -224,8 +226,8 @@ Rules:
 
 ## Productization guidance
 
-- Before adding packaging, configuration, or service integrations, keep the CLI
-  behavior and README examples as the source of truth.
+- Before adding configuration or service integrations, keep the CLI behavior
+  and README examples as the source of truth.
 - Avoid hidden global state that would make repeated invocations in tests or
   wrappers flaky.
 - Prefer additive flags and backwards-compatible output fields.

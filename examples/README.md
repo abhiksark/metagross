@@ -28,7 +28,7 @@ sudo /usr/bin/python3 -m metagross examples/gpu_demo.py
   traced run's events for that step carry `"compute"` in their `span` field;
   see [op spans](../docs/reference.md#op-spans).
 - **run_integration.sh** (repository root) runs the root-gated live
-  integration suite (`test_metagross.LiveTraceTest`) under sudo with
+  integration suite (`tests.test_metagross.LiveTraceTest`) under sudo with
   `RUN_EBPF_INTEGRATION=1` set.
 - **docker/** contains a containerized Metagross + PyTorch environment with
   tensor, CNN, ViT, decoder-only transformer, training, and multi-stage pipeline

@@ -9,9 +9,10 @@ Detailed CLI, schema, API, file-safety, and viewer contracts belong in
 verification guide. Update those alongside affected README examples without
 duplicating the full reference in the README.
 
-## README update triggers
+## Documentation update triggers
 
-Update `README.md` in the same change when altering:
+Update `docs/reference.md` in the same change, and `README.md` where it
+mentions the behavior, when altering:
 
 - CLI flags, option ordering, validation, usage, or exit behavior.
 - Required OS, kernel, Python, BCC, CUDA, or NVIDIA driver assumptions.
@@ -31,8 +32,8 @@ Update `README.md` in the same change when altering:
 - Use `null` for unknown JSON attribution fields.
 - Keep table output stable enough for humans; do not optimize it for parsing at
   the expense of readability.
-- If a breaking schema change becomes necessary, document it clearly in the
-  README and tests.
+- If a breaking schema change becomes necessary, document it in the
+  reference and the changelog, and update the tests.
 
 ## Examples
 
@@ -43,9 +44,9 @@ Update `README.md` in the same change when altering:
 - Avoid making examples depend on heavyweight frameworks unless the example is
   specifically about that framework.
 
-## Productization checklist for future packaging
+## Packaging checklist
 
-When packaging or distribution is introduced, make sure to document and test:
+When changing packaging or distribution, keep these documented and tested:
 
 - Supported Python versions.
 - Supported Linux distributions and kernel versions.

@@ -63,6 +63,7 @@ the script go to the target.
 | `--web-port PORT` | 8765; built-in dashboard port, 0 to 65,535, where zero selects a free port. Requires `--web`. |
 | `--ebpf` | Print generated C without tracing; accepts `--trace`, rejects `--dashboard-port` and `--web`. |
 | `-h`, `--help` | Print usage without a target or privileged dependencies. |
+| `--version` | Print the version without a target or privileged dependencies. |
 
 `--trace all` cannot be combined with another family. Empty or unknown families
 are rejected. A producer token in the environment alone does not enable delivery.
@@ -186,7 +187,7 @@ Threads started any other way, including `loop.run_in_executor` workers,
 start with no span.
 
 A `metagross.span()` call outside a running trace (the script run bare, without
-`sudo /usr/bin/python3 -m metagross`) is a no-op — the `with` block still
+`sudo /usr/bin/python3 -m metagross`) is a no-op: the `with` block still
 runs its body normally, so instrumented scripts stay runnable unmodified as long
 as `import metagross` works there (install it with pip, or put the checkout on
 `PYTHONPATH`).

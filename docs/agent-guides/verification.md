@@ -28,8 +28,8 @@ Use focused tests while iterating:
   tests.test_viewer.ViewerRoutingTest
 ```
 
-If class names change, inspect `test_metagross.py` and run the closest affected
-classes or individual test methods.
+If class names change, inspect `tests/test_metagross.py` and run the closest
+affected classes or individual test methods.
 
 ## Live integration gate
 
@@ -62,8 +62,8 @@ machine without an NVIDIA driver, because the stub is installed as the
 a disposable container or machine:
 
 ```sh
-gcc -O0 -shared -fPIC -o /usr/lib/x86_64-linux-gnu/libcuda.so.1 \
-  tests/stub_libcuda.c && ldconfig
+sudo gcc -O0 -shared -fPIC -o /usr/lib/x86_64-linux-gnu/libcuda.so.1 \
+  tests/stub_libcuda.c && sudo ldconfig
 sudo env RUN_STUB_INTEGRATION=1 \
   /usr/bin/python3 -m unittest -v tests.test_stub_live
 ```
@@ -152,7 +152,7 @@ again to confirm replacement rather than count merging.
 - Attribution changes: profile codec, timeline, joiner ordering, unknown-frame,
   and cross-thread tests.
 - Rendering/schema changes: table snapshots/assertions, JSONL schema assertions,
-  and README updates.
+  and reference updates.
 - Viewer changes: unprivileged parser/model tests, bounded-state assertions,
   control-character sanitization, deterministic width/height snapshots, CLI
   routing before root/BCC validation, partial-line and rotation tests for live
