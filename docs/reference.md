@@ -728,7 +728,8 @@ The tracer bounds what it keeps from the target's profile pipe: names longer
 than 500 bytes are treated as a corrupt stream, at most 65,536 distinct project
 frames are kept, and unread profile data is capped at 16 MiB, after which the
 target drops and counts records. Calls to frames beyond that count are counted
-as lost profile records, which marks the capture incomplete. On every loop
+as lost profile records and treated like any other loss: the frames known at
+that point are forgotten and the capture is incomplete. On every loop
 tick, whether or not the GPU is active, frame history older than 100 ms before
 the last ring buffer drain and the oldest call still waiting is discarded,
 and nothing is kept for a thread whose history is empty.

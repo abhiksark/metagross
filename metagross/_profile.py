@@ -381,10 +381,12 @@ class RecordReader:
                 frame = self._frames.get(frame_id)
                 if frame is None:
                     # A frame past the _MAX_FRAMES cap, or a corrupt id.
-                    # Fail closed -- drop this one record and count it,
-                    # never guess a frame, and never clear the map on the
-                    # strength of one bad id.
+                    # Never guess a frame, and never clear the map on the
+                    # strength of one bad id. Dropping the record alone
+                    # would leave the caller on top of the stack and name
+                    # it for the unknown frame's calls, so report a gap.
                     self.lost_records += 1
+                    out.append(("gap", ts_ns))
                     continue
                 kind = _KIND_BY_FRAME_RTYPE[rtype]
                 out.append(("frame", kind, tid, ts_ns, *frame))

@@ -1398,8 +1398,22 @@ class RecordCodecTest(unittest.TestCase):
                     frame_id, f"f{frame_id}", "/p/a.py", frame_id))
             out = reader.feed(_profile._encode_frame_ref(_profile.CALL, 1, 10, 2))
         self.assertEqual(len(reader._frames), 2)
-        self.assertEqual(out, [])              # frame 2 was never kept
+        self.assertEqual(out, [("gap", 10)])   # frame 2 was never kept
         self.assertEqual(reader.lost_records, 1)
+
+    def test_call_from_a_frame_past_the_cap_is_not_given_to_its_caller(self):
+        reader = self._reader_after_hello()
+        joiner = _events.Joiner(hold_ns=100)
+        with mock.patch.object(_profile, "_MAX_FRAMES", 1):
+            data = (_profile._encode_frame_def(0, "f0", "/p/a.py", 1)
+                    + _profile._encode_frame_def(1, "f1", "/p/a.py", 2)
+                    + _profile._encode_frame_ref(_profile.CALL, 7, 10, 0)
+                    + _profile._encode_frame_ref(_profile.CALL, 7, 20, 1))
+            for rec in reader.feed(data):
+                joiner.on_profile_record(rec)
+        joiner.on_gpu_event(_raw(16, ts=30, dur=5, tid=7))   # made by f1
+        (event,) = joiner.flush(now_ns=1000)
+        self.assertIsNone(event.frame)
 
     def test_unknown_rtype_does_not_raise(self):
         reader = self._reader_after_hello()
@@ -1420,7 +1434,7 @@ class RecordCodecTest(unittest.TestCase):
         self.assertEqual(len(reader.feed(known)), 1)  # frame_id 0 now defined
         bad = _profile._encode_frame_ref(_profile.CALL, tid=7, ts_ns=20,
                                          frame_id=999)
-        self.assertEqual(reader.feed(bad), [])
+        self.assertEqual(reader.feed(bad), [("gap", 20)])
         self.assertEqual(reader.lost_records, 1)
         # The map survived the drop: a later reference to the earlier,
         # real frame_id (0) still resolves correctly.
