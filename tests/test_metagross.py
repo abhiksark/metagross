@@ -266,6 +266,17 @@ class CaptureStatsTest(unittest.TestCase):
         self.assertFalse(snapshot["complete"])
         self.assertEqual(snapshot["capture"]["lost_profile_records"], 3)
 
+    def test_capture_from_an_unprobed_libcuda_is_incomplete(self):
+        snapshot = _events.CaptureStats().snapshot(
+            lost_events=0,
+            dropped_nested_calls=0,
+            observed_outstanding_bytes=0,
+            render_failed=False,
+            libcuda_mismatch=True,
+        )
+        self.assertFalse(snapshot["complete"])
+        self.assertTrue(snapshot["capture"]["libcuda_mismatch"])
+
     def test_refused_attributions_make_the_capture_incomplete(self):
         snapshot = _events.CaptureStats().snapshot(
             lost_events=0,
@@ -1094,8 +1105,8 @@ class SymbolResolutionTest(unittest.TestCase):
             "7ffd5a1f0000-7ffd5a211000 rw-p 00000000 00:00 0 [stack]\n"
         )
         self.assertEqual(_bpf.mapped_libcuda(maps),
-                         {"/opt/nvidia driver/libcuda.so.550.54.14"})
-        self.assertEqual(_bpf.mapped_libcuda(""), set())
+                         {"/opt/nvidia driver/libcuda.so.550.54.14": 977})
+        self.assertEqual(_bpf.mapped_libcuda(""), {})
 
     def _mapped(self, path):
         """Map a file into this process, as a loaded library would be."""
@@ -1115,11 +1126,12 @@ class SymbolResolutionTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             loaded = self._library_file(tmp, "libcuda.so.550.54.14")
             other = self._library_file(tmp, "elsewhere", "libcuda.so.1")
-            self.assertEqual(_bpf.loaded_libcuda(os.getpid()), set())
+            self.assertEqual(_bpf.loaded_libcuda(os.getpid()), {})
             with self._mapped(loaded):
                 mapped = _bpf.loaded_libcuda(os.getpid())
-            self.assertEqual(mapped, {os.path.realpath(loaded)})
-            self.assertIsNone(metagross._libcuda_mismatch_warning(set(), other))
+            self.assertEqual(
+                mapped, {os.path.realpath(loaded): os.stat(loaded).st_ino})
+            self.assertIsNone(metagross._libcuda_mismatch_warning({}, other))
             self.assertIsNone(metagross._libcuda_mismatch_warning(mapped, loaded))
             self.assertEqual(
                 metagross._libcuda_mismatch_warning(mapped, other),
@@ -1136,8 +1148,21 @@ class SymbolResolutionTest(unittest.TestCase):
                 handle.write(b"\0" * 4096)
             loaded = self._library_file(tmp, "libcuda.so.1")
             with self._mapped(odd), self._mapped(loaded):
-                self.assertEqual(_bpf.loaded_libcuda(os.getpid()),
+                self.assertEqual(set(_bpf.loaded_libcuda(os.getpid())),
                                  {os.path.realpath(loaded)})
+
+    def test_probed_libcuda_reached_by_another_path_is_not_a_mismatch(self):
+        # uprobes follow the file, not the name it was opened by.
+        with tempfile.TemporaryDirectory() as tmp:
+            probed = self._library_file(tmp, "a", "libcuda.so.1")
+            other_name = os.path.join(tmp, "b", "libcuda.so.1")
+            os.makedirs(os.path.dirname(other_name))
+            os.link(probed, other_name)
+            with self._mapped(other_name):
+                mapped = _bpf.loaded_libcuda(os.getpid())
+            self.assertEqual(set(mapped), {os.path.realpath(other_name)})
+            self.assertIsNone(
+                metagross._libcuda_mismatch_warning(mapped, probed))
 
     def test_libcuda_warning_keeps_escape_sequences_off_the_terminal(self):
         with tempfile.TemporaryDirectory() as tmp:

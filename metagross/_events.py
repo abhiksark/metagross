@@ -551,10 +551,12 @@ class CaptureStats:
                  observed_outstanding_bytes: int, render_failed: bool,
                  trace_failed: bool = False,
                  lost_profile_records: int = 0,
-                 refused_attributions: int = 0) -> dict:
+                 refused_attributions: int = 0,
+                 libcuda_mismatch: bool = False) -> dict:
         complete = not any((lost_events, dropped_nested_calls,
                             render_failed, trace_failed,
-                            lost_profile_records, refused_attributions))
+                            lost_profile_records, refused_attributions,
+                            libcuda_mismatch))
         return {
             "schema_version": 1,
             "complete": complete,
@@ -569,6 +571,7 @@ class CaptureStats:
                 "trace_failed": trace_failed,
                 "lost_profile_records": lost_profile_records,
                 "refused_attributions": refused_attributions,
+                "libcuda_mismatch": libcuda_mismatch,
             },
             "timing": {
                 "total_api_duration_ns": self.total_api_duration_ns,

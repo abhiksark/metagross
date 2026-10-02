@@ -120,7 +120,7 @@ class Credentials:
 
 
 _FINAL_DRAIN_TIMEOUT_S = 2.0
-_LIBCUDA_CHECK_INTERVAL_S = 1.0
+_LIBCUDA_CHECK_INTERVAL_S = 0.1
 _DASHBOARD_READY_TIMEOUT_S = 5.0
 _DEFAULT_WEB_PORT = 8765
 _TRACE_FAMILIES = frozenset(("launch", "memory", "copy", "sync"))
@@ -459,16 +459,23 @@ def _forbid_new_privileges() -> None:
         raise OSError(ct.get_errno(), "prctl(PR_SET_NO_NEW_PRIVS) failed")
 
 
-def _libcuda_mismatch_warning(mapped: set[str], lib_path: str) -> str | None:
+def _libcuda_mismatch_warning(
+        mapped: dict[str, int], lib_path: str) -> str | None:
     """Return a warning if the target loaded a libcuda the probes are not on.
 
     The loader may pick another copy than `find_libcuda` did, and uprobes only
-    fire for the probed file. The mapped path is the target's to choose, so
-    its control characters are kept off the terminal.
+    fire for the probed file, whatever path it was reached by. The mapped
+    path is the target's to choose, so its control characters are kept off
+    the terminal.
     """
     probed = os.path.realpath(lib_path)
     if not mapped or probed in mapped:
         return None
+    try:
+        if os.stat(probed).st_ino in mapped.values():
+            return None  # the probed file under another name
+    except OSError:
+        pass
     from metagross import _events
 
     return _events.printable(
@@ -924,6 +931,7 @@ def _trace(cfg, creds, uid, gid, dashboard_port, dashboard_token) -> int:
     lost = 0
     dropped = 0
     lost_profile = 0
+    libcuda_mismatch = False
     libcuda_check_due = time.monotonic() + _LIBCUDA_CHECK_INTERVAL_S
     try:
         renderer.header()
@@ -951,6 +959,7 @@ def _trace(cfg, creds, uid, gid, dashboard_port, dashboard_token) -> int:
                             else time.monotonic() + _LIBCUDA_CHECK_INTERVAL_S)
                         warning = _libcuda_mismatch_warning(mapped, lib_path)
                         if warning is not None:
+                            libcuda_mismatch = True
                             print(warning, file=sys.stderr)
                     wpid, status = os.waitpid(pid, os.WNOHANG)
                     reaped = wpid == pid
@@ -1050,6 +1059,7 @@ def _trace(cfg, creds, uid, gid, dashboard_port, dashboard_token) -> int:
             trace_failed=trace_failed,
             lost_profile_records=lost_profile,
             refused_attributions=joiner.refused_attributions,
+            libcuda_mismatch=libcuda_mismatch,
         )
         selected_families = (
             _TRACE_FAMILIES if cfg.trace_families is None else cfg.trace_families

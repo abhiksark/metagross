@@ -170,17 +170,20 @@ def find_libcuda() -> str:
 
 
 
-def mapped_libcuda(maps_text: str) -> set[str]:
-    """Return the libcuda files named in a `/proc/<pid>/maps` listing."""
-    paths = set()
+def mapped_libcuda(maps_text: str) -> dict[str, int]:
+    """Return the libcuda files in a `/proc/<pid>/maps` listing, by path.
+
+    The value is the file's inode number, which is what uprobes follow.
+    """
+    files = {}
     for line in maps_text.splitlines():
         fields = line.split(None, 5)
         if len(fields) == 6 and os.path.basename(fields[5]).startswith("libcuda.so"):
-            paths.add(fields[5])
-    return paths
+            files[fields[5]] = int(fields[4]) if fields[4].isdigit() else 0
+    return files
 
 
-def loaded_libcuda(pid: int) -> set[str]:
+def loaded_libcuda(pid: int) -> dict[str, int]:
     """Return the libcuda files a process has mapped; empty if it has none.
 
     A diagnostic only: it must never raise, because an error in the tracing
@@ -192,7 +195,7 @@ def loaded_libcuda(pid: int) -> set[str]:
                   errors="surrogateescape") as maps:
             return mapped_libcuda(maps.read())
     except (OSError, ValueError):
-        return set()
+        return {}
 
 
 _HEADER = r"""

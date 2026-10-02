@@ -263,7 +263,8 @@ Summary schema version 1 has top-level `schema_version`, `complete`, `capture`,
 events were lost, nested calls were dropped, profile records were lost, the
 target replaced the profiling hook, the script ended without a normal
 interpreter exit, Metagross left calls unattributed because it lacked their
-profile history, event rendering failed, or the tracing loop failed.
+profile history, the script loaded a `libcuda` the probes are not on, event
+rendering failed, or the tracing loop failed.
 `lost_profile_records` counts one for each hook replacement and one for a
 profile stream that stopped before the script's normal exit.
 `refused_attributions` counts calls written as `<unknown>` although their
@@ -278,7 +279,7 @@ Summary nested fields are:
 
 | Object | Fields |
 |--------|--------|
-| `capture` | `events`, `attributed`, `unknown_attribution`, `cuda_errors`, `lost_events`, `dropped_nested_calls`, `render_failed`, `trace_failed`, `lost_profile_records`, `refused_attributions` |
+| `capture` | `events`, `attributed`, `unknown_attribution`, `cuda_errors`, `lost_events`, `dropped_nested_calls`, `render_failed`, `trace_failed`, `lost_profile_records`, `refused_attributions`, `libcuda_mismatch` |
 | `timing` | `total_api_duration_ns`, `synchronization_duration_ns` |
 | `memory` | `successful_allocation_bytes`, `observed_peak_bytes`, `observed_outstanding_bytes` |
 | `copies` | `successful_bytes_by_api`, mapping normalized API names to byte counts |
@@ -502,8 +503,10 @@ including arm64, are not supported.
 **One libcuda**: Probes are attached to the `libcuda.so.1` Metagross finds
 in the standard library paths or the loader cache. If the script loads a
 different copy, for example through `LD_LIBRARY_PATH`, none of its calls are
-traced; Metagross checks the script's loaded libraries about once a second and
-warns on stderr when that happens.
+traced. Metagross checks the script's loaded libraries ten times a second
+until a `libcuda` appears; if it is a different file, it warns on stderr and
+marks the capture incomplete (`libcuda_mismatch`). A script that exits before
+the first check is not checked.
 
 **Other profilers**: Attribution uses the Python profiling hook
 (`sys.setprofile`). If the script installs its own profile function, as

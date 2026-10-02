@@ -11,6 +11,9 @@ User-visible changes to Metagross. Versions follow `metagross.__version__`.
 - New summary field `capture.refused_attributions` (`refused=` in `--stats`):
   calls left `<unknown>` because the tracer lacked their profile history. A
   nonzero count marks the capture incomplete.
+- Fix: a script that loaded a `libcuda` the probes are not on now marks the
+  capture incomplete (`capture.libcuda_mismatch`). The check compares files,
+  not path strings, and runs ten times a second.
 - Fix: a call from a function beyond the 65,536-function limit is `<unknown>`
   instead of being given to its caller.
 - Profile records are decoded about twice as fast, and finished threads no
