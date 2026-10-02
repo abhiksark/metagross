@@ -10,6 +10,7 @@ import json
 import http.server
 import mmap
 import os
+import re
 import runpy
 import shutil
 import signal
@@ -4393,6 +4394,187 @@ class RunLiveInitFailureTest(unittest.TestCase):
         self._run(FakeBPF, output_path=trace)
         with open(trace, "rb") as handle:
             self.assertEqual(handle.read(), b"the previous capture")
+
+
+class _FakeCounters:
+    def __init__(self):
+        self.values = {0: 0, 1: 0}
+
+    def __getitem__(self, index):
+        return mock.Mock(value=self.values[index.value])
+
+
+class _FakeBPF:
+    """Stands in for bcc.BPF: no kernel, and a ring buffer the test feeds."""
+
+    on_poll = staticmethod(lambda bpf: None)
+    last = None
+
+    def __init__(self, text):
+        # The generated program filters on the target's process ID.
+        self.pid = int(re.search(r"!= (\d+)\) return 0", text).group(1))
+        self.counters = _FakeCounters()
+        self.cleaned = False
+        type(self).last = self
+
+    def __getitem__(self, name):
+        return self if name == "events" else self.counters
+
+    def attach_uprobe(self, **_options):
+        pass
+
+    def attach_uretprobe(self, **_options):
+        pass
+
+    def open_ring_buffer(self, callback):
+        self._callback = callback
+
+    def emit(self, api_id, ret=0):
+        """Deliver one call the target's main thread is making now."""
+        event = bytes(_bpf.PlainEvent(
+            ts=time.monotonic_ns(), dur=2_000, tid=self.pid, api_id=api_id,
+            ret=ret))
+        self._callback(None, event, len(event))
+
+    def ring_buffer_poll(self, timeout=0):
+        type(self).on_poll(self)
+        time.sleep(min(timeout, 10) / 1000)
+
+    def ring_buffer_consume(self):
+        pass
+
+    def cleanup(self):
+        self.cleaned = True
+
+
+class EventLoopTest(unittest.TestCase):
+    """The tracing loop with a real script and a ring buffer fed by the test.
+
+    Needs no root, BCC, or GPU: the script runs as this user, the profile
+    pipe is real, and `_FakeBPF` supplies the driver calls.
+    """
+
+    SCRIPT = (
+        "import pathlib, sys, time\n"
+        "here = pathlib.Path(__file__).parent\n"
+        "def work():\n"
+        "    (here / 'in-work').touch()\n"
+        "    time.sleep(0.5)\n"
+        "work()\n"
+        "(here / 'finished').touch()\n"
+        "sys.exit(7)\n"
+    )
+
+    def setUp(self):
+        self.project = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.project, ignore_errors=True)
+        self.script = os.path.join(self.project, "run.py")
+        with open(self.script, "w", encoding="utf-8") as stream:
+            stream.write(self.SCRIPT)
+        self.trace = os.path.join(self.project, "trace.jsonl")
+        self.summary = os.path.join(self.project, "summary.json")
+        self.addCleanup(setattr, _FakeBPF, "on_poll", _FakeBPF.on_poll)
+
+    def _in_work(self):
+        return os.path.exists(os.path.join(self.project, "in-work"))
+
+    def _once_in_work(self, action):
+        """Run `action(bpf)` once, at the first poll after work() began."""
+        done = []
+
+        def on_poll(bpf):
+            if not done and self._in_work():
+                done.append(True)
+                action(bpf)
+
+        _FakeBPF.on_poll = staticmethod(on_poll)
+
+    def _run(self):
+        cfg = Config(script=self.script, project_root=self.project,
+                     json_output=True, output_path=self.trace,
+                     summary_output_path=self.summary, show_stats=True)
+        me = Credentials(os.getuid(), os.getgid(), "tester", self.project)
+        stderr = io.StringIO()
+        with mock.patch("metagross.os.geteuid", return_value=0), \
+                mock.patch("metagross.validate_sudo", return_value=me), \
+                mock.patch("metagross._drop_privileges"), \
+                mock.patch("metagross._bpf.find_libcuda", return_value="/unused"), \
+                mock.patch.dict("sys.modules", {"bcc": mock.Mock(BPF=_FakeBPF)}), \
+                mock.patch("metagross._bpf.dlsym_resolver",
+                           return_value=lambda symbol: 1), \
+                mock.patch("metagross._bpf.resolve_attachments",
+                           return_value=[_stub_attachment()]), \
+                PrivateDashboardTest._quiet_stderr_fd(), \
+                contextlib.redirect_stderr(stderr):
+            status = metagross.run_live(cfg)
+        with open(self.trace, encoding="utf-8") as stream:
+            rows = [json.loads(line) for line in stream]
+        with open(self.summary, encoding="utf-8") as stream:
+            summary = json.load(stream)
+        return status, rows, summary, stderr.getvalue()
+
+    def test_a_call_is_attributed_and_the_script_status_is_returned(self):
+        self._once_in_work(lambda bpf: bpf.emit(16))
+        status, rows, summary, stderr = self._run()
+        self.assertEqual(status, 7)
+        self.assertEqual(
+            [(row["function"], row["api"], row["pid"]) for row in rows],
+            [("work", "cuCtxSynchronize", _FakeBPF.last.pid)])
+        self.assertTrue(summary["complete"])
+        self.assertEqual(summary["target"]["exit_status"], 7)
+        self.assertRegex(
+            stderr,
+            r"metagross: stats events=1 attributed=1 unknown=0 errors=0 "
+            r"lost=0 dropped=0 lost_profile=0 refused=0 complete=true\n$")
+        self.assertTrue(_FakeBPF.last.cleaned)
+
+    def test_cuda_errors_and_lost_events_reach_the_summary(self):
+        def lose_events(bpf):
+            bpf.emit(16, ret=2)
+            bpf.counters.values[0] = 3
+
+        self._once_in_work(lose_events)
+        status, rows, summary, stderr = self._run()
+        self.assertEqual(status, 7)
+        self.assertEqual([row["return_code"] for row in rows], [2])
+        self.assertEqual(summary["capture"]["cuda_errors"], 1)
+        self.assertEqual(summary["capture"]["lost_events"], 3)
+        self.assertFalse(summary["complete"])
+        self.assertIn("metagross: lost 3 events", stderr)
+        self.assertIn("errors=1 lost=3", stderr)
+
+    def test_ctrl_c_reaches_the_script_and_the_capture_still_ends(self):
+        def interrupt(_bpf):
+            raise KeyboardInterrupt
+
+        self._once_in_work(interrupt)
+        status, _, summary, _ = self._run()
+        self.assertEqual(status, 130)
+        self.assertEqual(summary["target"]["exit_status"], 130)
+        self.assertFalse(os.path.exists(os.path.join(self.project, "finished")))
+
+    def test_sigterm_reaches_the_script_and_the_capture_still_ends(self):
+        before = signal.getsignal(signal.SIGTERM)
+        self._once_in_work(lambda _bpf: os.kill(os.getpid(), signal.SIGTERM))
+        status, _, summary, _ = self._run()
+        self.assertEqual(status, 143)
+        self.assertEqual(summary["target"]["exit_status"], 143)
+        self.assertIs(signal.getsignal(signal.SIGTERM), before)
+
+    def test_a_tracer_error_lets_the_script_finish(self):
+        def fail(_bpf):
+            raise RuntimeError("ring buffer went away")
+
+        self._once_in_work(fail)
+        status, _, summary, stderr = self._run()
+        # Not killed: it ran to its own exit, and its status is kept.
+        self.assertEqual(status, 7)
+        self.assertTrue(os.path.exists(os.path.join(self.project, "finished")))
+        self.assertIn("metagross: tracing stopped on an error: ring buffer "
+                      "went away; the script continues untraced", stderr)
+        self.assertTrue(summary["capture"]["trace_failed"])
+        self.assertFalse(summary["complete"])
+        self.assertTrue(_FakeBPF.last.cleaned)
 
 
 @unittest.skipUnless(INTEGRATION and os.geteuid() == 0,

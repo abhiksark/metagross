@@ -4,7 +4,9 @@ User-visible changes to Metagross. Versions follow `metagross.__version__`.
 
 ## Unreleased
 
-- Python 3.14 is tested. The unit suite now also passes inside a container.
+- Python 3.14 is tested. The unit suite now also passes inside a container
+  and runs the tracing loop itself, with a real script and a fake ring
+  buffer.
 - The source archive now carries the tests' fixtures, the examples, and the
   documents the README links, so its unit tests run from the unpacked archive.
   The wheel carries the logo and font notices next to the license.

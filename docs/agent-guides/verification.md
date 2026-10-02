@@ -23,6 +23,7 @@ Use focused tests while iterating:
   tests.test_target \
   tests.test_metagross.ParseArgsTest \
   tests.test_metagross.RendererTest \
+  tests.test_metagross.EventLoopTest \
   tests.test_metagross.DashboardPublisherTest \
   tests.test_viewer.WebDashboardTest \
   tests.test_viewer.ViewerRoutingTest
@@ -145,6 +146,10 @@ again to confirm replacement rather than count merging.
 - CLI parsing or validation: parse/usage tests plus README examples if affected.
 - Output path handling: ownership, symlink, regular-file, create/truncate, and
   permission tests.
+- The tracing loop: `tests.test_metagross.EventLoopTest` runs the real loop
+  with a real script and a fake ring buffer, without root or BCC. Use it for
+  signal forwarding, loss counters, the final summary, and what happens when
+  the tracer fails while the script runs.
 - Child process behavior: run `tests.test_target` for the unprivileged exec boundary,
   startup barrier, PID preservation, normal shutdown, `atexit`, non-daemon
   threads, buffered stdout/stderr, exceptions, exit codes, signals, argument

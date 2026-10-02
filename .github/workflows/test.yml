@@ -98,7 +98,7 @@ jobs:
       - name: Coverage floor
         run: |
           python -m coverage run --source=metagross -m unittest
-          python -m coverage report --fail-under=79
+          python -m coverage report --fail-under=84
 
   web-js-syntax:
     runs-on: ubuntu-22.04
