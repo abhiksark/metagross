@@ -3,6 +3,7 @@
 import collections
 import contextlib
 import contextvars
+import ctypes
 import fcntl
 import io
 import json
@@ -1197,6 +1198,7 @@ class BpfSourceTest(unittest.TestCase):
         short = bytes(bytearray(raw))[:_bpf.RawEvent.name.offset]
         self.assertEqual(len(short), 112)
         ev = _bpf.decode_event(short)
+        self.assertLess(ctypes.sizeof(ev), 128)  # no room kept for a name
         self.assertEqual((ev.ts, ev.api_id, ev.out), (7, 3, 0x9000))
         self.assertEqual(ev.name, b"")
 

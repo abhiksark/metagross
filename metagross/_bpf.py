@@ -368,6 +368,19 @@ class RawEvent(ct.Structure):
     ]
 
 
-def decode_event(data: bytes) -> RawEvent:
+class PlainEvent(ct.Structure):
+    """A `RawEvent` from a probe that reads no kernel name.
+
+    Calls wait in the tracer until their profile history arrives, so the
+    common event must not carry a kilobyte of empty name.
+    """
+    _fields_ = RawEvent._fields_[:-1]
+    name = b""
+
+
+def decode_event(data: bytes) -> RawEvent | PlainEvent:
     """Decode either record the probes send; most carry no name field."""
+    if len(data) <= ct.sizeof(PlainEvent):
+        return PlainEvent.from_buffer_copy(
+            data.ljust(ct.sizeof(PlainEvent), b"\0"))
     return RawEvent.from_buffer_copy(data.ljust(ct.sizeof(RawEvent), b"\0"))
