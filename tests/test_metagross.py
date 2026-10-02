@@ -1172,6 +1172,41 @@ class SymbolResolutionTest(unittest.TestCase):
         got = _bpf.resolve_attachments(apis, addrs.get)
         self.assertEqual([a.symbol for a in got], ["cuLaunchKernel"])
 
+    def test_one_address_is_probed_once_across_apis(self):
+        # A driver may give several names one entry point. A second probe
+        # pair there would fire on the same call and be counted as nesting.
+        apis = [_bpf.API_BY_ID[7], _bpf.API_BY_ID[13]]  # cuMemcpyHtoD, cuMemcpy
+        addrs = {"cuMemcpyHtoD_v2": 100, "cuMemcpy": 100}
+        got = _bpf.resolve_attachments(apis, addrs.get)
+        self.assertEqual([(a.symbol, a.api.base) for a in got],
+                         [("cuMemcpyHtoD_v2", "cuMemcpyHtoD")])
+
+    def test_old_abi_names_are_left_alone_where_v2_exists(self):
+        # Before the `_v2` entry points, pointers and sizes were 32 bits;
+        # the probes read 64 and would report wrong values.
+        apis = [_bpf.API_BY_ID[3]]  # cuMemAlloc
+        addrs = {"cuMemAlloc": 100, "cuMemAlloc_v2": 200}
+        got = _bpf.resolve_attachments(apis, addrs.get)
+        self.assertEqual([a.symbol for a in got], ["cuMemAlloc_v2"])
+        apis = [_bpf.API_BY_ID[8]]  # cuMemcpyHtoDAsync
+        addrs = {"cuMemcpyHtoDAsync": 1, "cuMemcpyHtoDAsync_v2": 2,
+                 "cuMemcpyHtoDAsync_v2_ptsz": 3}
+        got = _bpf.resolve_attachments(apis, addrs.get)
+        self.assertEqual([a.symbol for a in got],
+                         ["cuMemcpyHtoDAsync_v2", "cuMemcpyHtoDAsync_v2_ptsz"])
+        # A driver with only the unsuffixed name is still traced.
+        got = _bpf.resolve_attachments([_bpf.API_BY_ID[3]], {"cuMemAlloc": 1}.get)
+        self.assertEqual([a.symbol for a in got], ["cuMemAlloc"])
+
+    def test_v2_of_other_apis_is_a_variant_not_a_replacement(self):
+        # cuCtxSynchronize_v2 takes a context argument; the unsuffixed call
+        # is the one frameworks make.
+        apis = [_bpf.API_BY_ID[16]]
+        addrs = {"cuCtxSynchronize": 1, "cuCtxSynchronize_v2": 2}
+        got = _bpf.resolve_attachments(apis, addrs.get)
+        self.assertEqual([a.symbol for a in got],
+                         ["cuCtxSynchronize", "cuCtxSynchronize_v2"])
+
     def test_distinct_addresses_both_attached(self):
         apis = [_bpf.Api(1, "cuLaunchKernel", "launch", mandatory=True)]
         addrs = {"cuLaunchKernel": 100, "cuLaunchKernel_ptsz": 200}

@@ -501,7 +501,10 @@ Details captured depend on the API:
 | Synchronization | `stream` (cuStreamSynchronize), `event` (cuEventSynchronize) |
 
 Versioned and per-thread-default-stream symbol variants are normalized to the
-base API names above. JSONL retains these names; table rows omit the `cu` prefix,
+base API names above. Each entry point is probed once, even when the driver
+exports it under several names. The pre-3.2 forms of the allocation, free,
+and directional copy APIs (the names without `_v2`), which take 32-bit
+pointers and sizes, are not traced on a driver that also has the `_v2` form. JSONL retains these names; table rows omit the `cu` prefix,
 for example `LaunchKernel` and `MemAlloc`. For directional transfers, direction is encoded in the
 `api` field: `cuMemcpyHtoD` is host-to-device and `cuMemcpyDtoH` is
 device-to-host. Generic `cuMemcpy` and `cuMemcpyAsync` events remain generic.

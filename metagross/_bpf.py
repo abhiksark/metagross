@@ -20,21 +20,25 @@ class Api:
     base: str
     category: str
     mandatory: bool = False
+    # The name without `_v2` is the pre-3.2 entry point, which takes 32-bit
+    # device pointers and sizes. The probes read 64 bits and would misreport
+    # it, so it is traced only where the driver has no `_v2` form.
+    old_abi: bool = False
 
 
 APIS = [
     Api(1, "cuLaunchKernel", "launch", mandatory=True),
     Api(2, "cuLaunchKernelEx", "launch_ex"),
-    Api(3, "cuMemAlloc", "alloc"),
+    Api(3, "cuMemAlloc", "alloc", old_abi=True),
     Api(4, "cuMemAllocAsync", "alloc_async"),
-    Api(5, "cuMemFree", "free"),
+    Api(5, "cuMemFree", "free", old_abi=True),
     Api(6, "cuMemFreeAsync", "free_async"),
-    Api(7, "cuMemcpyHtoD", "copy_h2d"),
-    Api(8, "cuMemcpyHtoDAsync", "copy_h2d"),
-    Api(9, "cuMemcpyDtoH", "copy_d2h"),
-    Api(10, "cuMemcpyDtoHAsync", "copy_d2h"),
-    Api(11, "cuMemcpyDtoD", "copy_d2d"),
-    Api(12, "cuMemcpyDtoDAsync", "copy_d2d"),
+    Api(7, "cuMemcpyHtoD", "copy_h2d", old_abi=True),
+    Api(8, "cuMemcpyHtoDAsync", "copy_h2d", old_abi=True),
+    Api(9, "cuMemcpyDtoH", "copy_d2h", old_abi=True),
+    Api(10, "cuMemcpyDtoHAsync", "copy_d2h", old_abi=True),
+    Api(11, "cuMemcpyDtoD", "copy_d2d", old_abi=True),
+    Api(12, "cuMemcpyDtoDAsync", "copy_d2d", old_abi=True),
     Api(13, "cuMemcpy", "copy_generic"),
     Api(14, "cuMemcpyAsync", "copy_generic"),
     Api(15, "cuStreamSynchronize", "sync"),
@@ -85,12 +89,18 @@ def candidate_symbols(base: str) -> list[str]:
 
 def resolve_attachments(apis, resolver: Callable[[str], int | None]):
     attachments = []
+    # One probe pair per address, across every API: two pairs on one entry
+    # point would both fire, and the second would look like a nested call.
+    seen_addrs = set()
     for api in apis:
-        seen_addrs = set()
         found = False
-        for sym in candidate_symbols(api.base):
-            addr = resolver(sym)
+        resolved = [(sym, resolver(sym)) for sym in candidate_symbols(api.base)]
+        skip_old_abi = api.old_abi and any(
+            addr is not None and "_v2" in sym for sym, addr in resolved)
+        for sym, addr in resolved:
             if addr is None or addr in seen_addrs:
+                continue
+            if skip_old_abi and "_v2" not in sym:
                 continue
             seen_addrs.add(addr)
             attachments.append(Attachment(sym, api))

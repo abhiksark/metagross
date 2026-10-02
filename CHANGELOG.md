@@ -44,6 +44,10 @@ User-visible changes to Metagross. Versions follow `metagross.__version__`.
   first time.
 - Fix: allocation totals no longer drift when one thread frees a block while
   another thread's allocation, begun earlier, is given the same address.
+- Fix: an entry point the driver exports under several traced names is
+  probed once; before, one call could be counted as nested and mark the
+  capture incomplete. The pre-3.2 32-bit forms of the memory APIs are no
+  longer traced with the 64-bit layout.
 - Breaking, security: `--output` and `--summary-output` are refused in a
   directory that does not belong to the invoking user, unless it is a shared
   sticky directory such as `/tmp`. Before, a user allowed to run only
