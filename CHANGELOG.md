@@ -2,7 +2,7 @@
 
 User-visible changes to Metagross. Versions follow `metagross.__version__`.
 
-## Unreleased
+## 0.1.1 (2026-10-02)
 
 - Fix: a call is no longer attributed to a stale function when the tracer is
   behind the script or profile records were dropped. It waits until the
