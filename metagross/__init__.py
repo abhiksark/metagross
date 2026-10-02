@@ -391,7 +391,11 @@ def _validate_output_paths(
 
 
 def _open_output_streams(output_path, summary_output_path, uid, gid):
-    """Validate both sinks before truncation and transfer their open streams."""
+    """Validate both sinks and transfer their open streams, not yet truncated.
+
+    The caller empties them with `_truncate_outputs` once tracing is certain
+    to start, so a failed start leaves an earlier capture intact.
+    """
     _validate_output_paths(output_path, summary_output_path)
     try:
         with contextlib.ExitStack() as opened:
@@ -413,13 +417,16 @@ def _open_output_streams(output_path, summary_output_path, uid, gid):
                     raise MetagrossError(
                         "trace output and summary output must be different files"
                     )
-            for stream in streams:
-                if stream is not None:
-                    os.ftruncate(stream.fileno(), 0)
             opened.pop_all()
             return trace if trace is not None else sys.stderr, summary
     except OSError as exc:
         raise MetagrossError(f"cannot prepare output files: {exc}") from None
+
+
+def _truncate_outputs(*streams) -> None:
+    for stream in streams:
+        if stream is not None and stream is not sys.stderr:
+            os.ftruncate(stream.fileno(), 0)
 
 
 def _validate_script(script: str, project_root: str) -> str:
@@ -741,7 +748,8 @@ def _trace(cfg, creds, uid, gid, dashboard_port, dashboard_token) -> int:
             f"bcc (BPF Compiler Collection) not available; install python3-bpfcc: {exc}"
         ) from None
 
-    # 3. Validate both output inodes before truncating either existing file.
+    # 3. Validate and open both outputs. They are emptied in step 8, so a
+    # start that fails before then leaves an earlier capture intact.
     wall_minus_mono_ns = time.time_ns() - time.monotonic_ns()
     stream, summary_stream = _open_output_streams(
         cfg.output_path, cfg.summary_output_path, uid, gid
@@ -934,6 +942,13 @@ def _trace(cfg, creds, uid, gid, dashboard_port, dashboard_token) -> int:
 
     # 8. Release the barrier only after probes, dashboard delivery, the ring
     # buffer, and the profile reader are all ready.
+    try:
+        _truncate_outputs(stream, summary_stream)
+    except OSError as exc:
+        if publisher is not None:
+            publisher.abort("cannot prepare output files")
+        _cleanup_before_release()
+        raise MetagrossError(f"cannot prepare output files: {exc}") from None
     try:
         os.write(barrier_w, b"\x01")
     except OSError:

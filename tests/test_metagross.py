@@ -4052,8 +4052,9 @@ class RunLiveInitFailureTest(unittest.TestCase):
         self.dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.dir.cleanup)
 
-    def _run(self, bpf_factory):
-        cfg = Config(script=__file__, project_root=os.path.dirname(__file__))
+    def _run(self, bpf_factory, output_path=None):
+        cfg = Config(script=__file__, project_root=os.path.dirname(__file__),
+                     output_path=output_path)
         creds = Credentials(os.getuid(), os.getgid(), "fixture", self.dir.name)
         killed, reaped, writes = [], [], []
 
@@ -4093,6 +4094,22 @@ class RunLiveInitFailureTest(unittest.TestCase):
         self.assertIn(4242, reaped)          # and reaped
         self.assertTrue(FakeBPF.cleaned)     # BPF object torn down
         self.assertEqual(writes, [])         # barrier was never written to
+
+    def test_a_failed_start_keeps_the_previous_capture(self):
+        class FakeBPF:
+            def __init__(self, *a, **k): pass
+            def __getitem__(self, key): return self
+            def attach_uprobe(self, **k): pass
+            def attach_uretprobe(self, **k): pass
+            def open_ring_buffer(self, cb): raise RuntimeError("ring buffer open failed")
+            def cleanup(self): pass
+        os.chmod(self.dir.name, 0o700)
+        trace = os.path.join(self.dir.name, "trace.jsonl")
+        with open(trace, "wb") as handle:
+            handle.write(b"the previous capture")
+        self._run(FakeBPF, output_path=trace)
+        with open(trace, "rb") as handle:
+            self.assertEqual(handle.read(), b"the previous capture")
 
 
 @unittest.skipUnless(INTEGRATION and os.geteuid() == 0,

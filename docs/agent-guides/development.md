@@ -95,6 +95,8 @@ predictable, and diagnosable. Favor a boring core over clever tracing magic.
   non-symlink files owned by the invoking uid with no other hard link.
 - Reject directories, symlinks, device files, FIFOs, and files owned by another
   user.
+- Empty an existing output only after probes are attached, immediately before
+  the startup barrier is released.
 
 ## Direct dashboard transport
 

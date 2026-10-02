@@ -17,6 +17,9 @@ User-visible changes to Metagross. Versions follow `metagross.__version__`.
   would have reported wrong launch arguments.
 - Options that take a value accept `--name=value`. An argument such as `-V`
   is reported as an unknown option instead of being taken as the script.
+- Fix: an existing `--output` or `--summary-output` file is emptied only when
+  the script is about to start, so a run that fails to attach no longer
+  destroys the earlier capture.
 
 ## 0.1.1 (2026-10-02)
 

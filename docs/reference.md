@@ -135,7 +135,9 @@ Metagross truncates an existing output only when it is a regular, non-symlink
 file owned by that user with no other hard link, verified through the opened
 file descriptor. Trace
 and summary outputs must refer to different files, including through hard links;
-both are validated before either existing file is truncated.
+both are validated before either existing file is truncated. An existing file
+is emptied only once the probes are attached and the script is about to start,
+so a run that fails to start leaves the earlier capture intact.
 
 Output parent directories must be owned by root or the invoking user. Symlinked
 parents and group- or other-writable non-sticky parents are rejected. Standard
