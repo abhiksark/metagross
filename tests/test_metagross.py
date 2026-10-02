@@ -2033,6 +2033,31 @@ class InstallHookTest(unittest.TestCase):
         kinds = [rec[1] for rec in frames if rec[4] == "hot"]
         self.assertEqual(sorted(set(kinds)), [_profile.CALL, _profile.RETURN])
 
+    def test_hook_removed_for_new_threads_is_reported_at_exit(self):
+        # threading.setprofile() changes the hook later threads start with
+        # and raises no audit event, so it is only noticed at exit.
+        r, w = os.pipe()
+        self.addCleanup(os.close, r)
+        code = (
+            "import sys, tempfile, threading\n"
+            "sys.path.insert(0, %r)\n"
+            "from metagross import _profile\n"
+            "_profile.install(%d, tempfile.mkdtemp())\n"
+            "threading.setprofile(None)\n"
+        ) % (os.getcwd(), w)
+        try:
+            subprocess.run([sys.executable, "-c", code], pass_fds=(w,),
+                           check=True, timeout=30)
+        finally:
+            os.close(w)
+        data = b""
+        while chunk := os.read(r, 4096):
+            data += chunk
+        reader = _profile.RecordReader()
+        reader.feed(data)
+        self.assertEqual(reader.hook_replacements, 1)
+        self.assertEqual(reader.end_of_stream(), [])  # END still arrived
+
     def test_replaced_hook_drops_the_frames_it_can_no_longer_close(self):
         # The script swaps in its own profile function (as cProfile does on
         # Python 3.11 and earlier) while a project frame is open. Nothing

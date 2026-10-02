@@ -869,6 +869,10 @@ def install(write_fd: int, project_root: str,
         # Registered before the script runs, so it runs after the script's
         # own exit handlers. A forked child must not end its parent's stream.
         if _current_emitter is emitter:
+            if threading.getprofile() is not hook:
+                # `threading.setprofile` is not audited. Threads started
+                # after the script called it ran without the hook.
+                emitter.hook_replaced(time.monotonic_ns())
             emitter.end(time.monotonic_ns())
 
     threading.setprofile(hook)

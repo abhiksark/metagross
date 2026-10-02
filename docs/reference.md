@@ -520,7 +520,9 @@ that moment, prints a warning, and marks the capture incomplete. Calls on that
 thread report `<unknown>` until the script restores the hook, which `cProfile`
 does not do. On Python 3.12 and later `cProfile` runs alongside the hook and
 attribution is unaffected. A replacement made from a thread that Metagross does
-not profile is not detected.
+not profile is not detected. `threading.setprofile()` changes the hook that
+later threads start with and is noticed only when the script exits: calls on
+those threads are `<unknown>` and the capture is marked incomplete.
 
 **PyTorch autograd**: Some backward-pass kernels may report `<unknown>` because
 PyTorch can launch them from C++ worker threads without an active Python project

@@ -18,6 +18,7 @@ User-visible changes to Metagross. Versions follow `metagross.__version__`.
   produce an empty capture reported complete.
 - Fix: a call from a function beyond the 65,536-function limit is `<unknown>`
   instead of being given to its caller.
+- A hook removed with `threading.setprofile()` marks the capture incomplete.
 - Profile records are decoded about twice as fast, and finished threads no
   longer accumulate in the tracer.
 - Fix: a mapped file with a name that is not valid UTF-8 no longer makes

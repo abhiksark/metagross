@@ -1031,8 +1031,8 @@ def _trace(cfg, creds, uid, gid, dashboard_port, dashboard_token) -> int:
         hook_replacements = profile_reader.hook_replacements()
         if hook_replacements:
             print("metagross: the target replaced the profiling hook "
-                  f"{hook_replacements} time(s); calls made on that thread "
-                  "afterwards are unattributed", file=sys.stderr)
+                  f"{hook_replacements} time(s); calls made on the affected "
+                  "threads afterwards are unattributed", file=sys.stderr)
         ended_early = profile_reader.ended_early()
         if ended_early:
             print("metagross: the profile stream stopped before the script's "
