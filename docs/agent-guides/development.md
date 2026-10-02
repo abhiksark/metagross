@@ -181,7 +181,7 @@ per-`rtype` body. `RecordReader.feed` decodes it into tagged tuples that
 record type, update all relevant pieces together:
 
 1. The `rtype` constant and its body `struct.Struct` in `_profile.py`.
-2. The encoder (e.g. `encode_frame`, `encode_span`) that packs the
+2. The encoder (e.g. `_encode_frame_def`, `encode_span`) that packs the
    common header plus the body.
 3. `RecordReader.feed`'s dispatch: parse-or-wait-for-more-bytes, advance the
    buffer only once the whole record is present, run it through the seq/gap
@@ -198,8 +198,8 @@ Rules:
   after the last one that arrived leave no `seq` hole to detect.
 - Every record's `seq` must flow through `RecordReader`'s gap check
   (`_note_seq`) exactly once, even for record types the reader currently
-  discards (e.g. `FRAME_DEF` bodies before a consumer for it exists);
-  skipping it desynchronizes gap detection from the rest of the stream.
+  consumes itself (e.g. `HELLO`); skipping it desynchronizes gap detection
+  from the rest of the stream.
 - A record type without a self-describing length (fixed-size body, or a body
   whose prefix carries the length of what follows) cannot be safely decoded;
   the reader has no way to resynchronize past bytes it cannot parse, so it

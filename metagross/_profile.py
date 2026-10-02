@@ -73,18 +73,8 @@ def _next_seq() -> int:
     return seq
 
 
-def _reset_seq() -> None:
-    """Reset the module-level child seq counter. Test-only."""
-    global _seq
-    _seq = 0
-
-
 def record_type(record_bytes: bytes) -> int:
-    """Return the rtype byte of an encoded record.
-
-    Exposed for later tasks (e.g. asserting which record a raw blob is)
-    without every caller re-deriving the header layout.
-    """
+    """Return the rtype byte of an encoded record."""
     return _COMMON.unpack_from(record_bytes)[0]
 
 
@@ -108,20 +98,6 @@ def _encode_frame_ref(kind, tid, ts_ns, frame_id) -> bytes:
     rtype = _FRAME_RTYPE_BY_KIND[kind]
     seq = _next_seq()
     return _COMMON.pack(rtype, seq, 0) + _FRAME_REF_BODY.pack(tid, ts_ns, frame_id)
-
-
-def encode_frame(kind, tid, ts_ns, func, path, line) -> bytes:
-    """Encode one self-contained frame record: a fresh FRAME_DEF (id 0)
-    immediately followed by the CALL/RETURN that references it.
-
-    A test or tool convenience for exercising the wire codec without
-    running a whole `_FrameEmitter`. `install()`'s hot path does not call
-    this -- it interns real frames through `_FrameEmitter` instead, so a
-    repeated frame costs one small reference rather than a redefinition.
-    """
-    frame_id = 0
-    return (_encode_frame_def(frame_id, func, path, line)
-            + _encode_frame_ref(kind, tid, ts_ns, frame_id))
 
 
 class _FrameEmitter:
@@ -714,10 +690,6 @@ class _ProjectClassifier:
         return metadata
 
 
-def is_project_file(path: str, project_root: str) -> bool:
-    return _ProjectClassifier(project_root).includes(path)
-
-
 _current_emitter: "_FrameEmitter | None" = None
 
 
@@ -844,8 +816,7 @@ def install(write_fd: int, project_root: str,
         _current_emitter = None  # first: `audit` must not write from here
         sys.setprofile(None)
         threading.setprofile(None)
-        # AGENTS.md: be conservative with inherited file descriptors. A
-        # long-lived non-exec worker holding the write end open would
+        # A long-lived non-exec worker holding the write end open would
         # otherwise delay the parent's EOF until the final-drain deadline.
         for fd in (write_fd, drops_fd):
             if fd is None:

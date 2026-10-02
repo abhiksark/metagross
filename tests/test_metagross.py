@@ -48,6 +48,20 @@ def setUpModule():
     unittest.addModuleCleanup(patcher.stop)
 
 
+def _reset_seq():
+    _profile._seq = 0
+
+
+def _encode_frame(kind, tid, ts_ns, func, path, line):
+    """Encode a FRAME_DEF (id 0) followed by the CALL or RETURN that uses it."""
+    return (_profile._encode_frame_def(0, func, path, line)
+            + _profile._encode_frame_ref(kind, tid, ts_ns, 0))
+
+
+def _is_project_file(path, project_root):
+    return _profile._ProjectClassifier(project_root).includes(path)
+
+
 def _fresh_output_path(test):
     """Return a not-yet-created trace-output path metagross can create and own.
 
@@ -1288,7 +1302,7 @@ class BpfSourceTest(unittest.TestCase):
 
 class RecordCodecTest(unittest.TestCase):
     def setUp(self):
-        _profile._reset_seq()
+        _reset_seq()
 
     def _reader_after_hello(self):
         """A RecordReader past its HELLO, so plain frame assertions below
@@ -1299,7 +1313,7 @@ class RecordCodecTest(unittest.TestCase):
 
     def test_roundtrip_single(self):
         reader = self._reader_after_hello()
-        blob = _profile.encode_frame(_profile.CALL, 7, 123456789,
+        blob = _encode_frame(_profile.CALL, 7, 123456789,
                                      "train_step", "/p/train.py", 31)
         self.assertEqual(reader.feed(blob),
                          [("frame", _profile.CALL, 7, 123456789, "train_step",
@@ -1309,7 +1323,7 @@ class RecordCodecTest(unittest.TestCase):
         # Split inside the 6-byte common header: feed() must not even try
         # to unpack rtype/seq yet.
         reader = self._reader_after_hello()
-        blob = _profile.encode_frame(_profile.RETURN, 7, 99, "f", "/p/a.py", 2)
+        blob = _encode_frame(_profile.RETURN, 7, 99, "f", "/p/a.py", 2)
         self.assertEqual(reader.feed(blob[:5]), [])
         self.assertEqual(reader.feed(blob[5:]),
                          [("frame", _profile.RETURN, 7, 99, "f", "/p/a.py", 2)])
@@ -1319,12 +1333,12 @@ class RecordCodecTest(unittest.TestCase):
         # but before the func/path bytes finish arriving. The seq check
         # must not fire on the first, incomplete feed -- only once the
         # whole record is present -- or a slow/chunked write would
-        # manufacture a spurious gap on its own record. encode_frame's blob
+        # manufacture a spurious gap on its own record. _encode_frame's blob
         # is FRAME_DEF-first, so the split lands inside FRAME_DEF's own
         # func/path bytes (the trailing CALL/RETURN reference is untouched
         # until the second feed).
         reader = self._reader_after_hello()
-        blob = _profile.encode_frame(_profile.RETURN, 7, 99,
+        blob = _encode_frame(_profile.RETURN, 7, 99,
                                      "somewhat_longer_func_name",
                                      "/p/a/longer/path.py", 2)
         split = 6 + _profile._FRAME_DEF_PREFIX.size + 4  # a few bytes into func
@@ -1337,8 +1351,8 @@ class RecordCodecTest(unittest.TestCase):
 
     def test_multiple_records_one_feed(self):
         reader = self._reader_after_hello()
-        blob = (_profile.encode_frame(_profile.CALL, 1, 1, "a", "/p/a.py", 1)
-                + _profile.encode_frame(_profile.RETURN, 1, 2, "a", "/p/a.py", 1))
+        blob = (_encode_frame(_profile.CALL, 1, 1, "a", "/p/a.py", 1)
+                + _encode_frame(_profile.RETURN, 1, 2, "a", "/p/a.py", 1))
         self.assertEqual(len(reader.feed(blob)), 2)
 
     def test_truncated_multibyte_does_not_raise(self):
@@ -1350,7 +1364,7 @@ class RecordCodecTest(unittest.TestCase):
         # yields exactly one record.
         reader = self._reader_after_hello()
         long_str = "x" + "é" * 300
-        blob = _profile.encode_frame(_profile.CALL, 3, 42, long_str,
+        blob = _encode_frame(_profile.CALL, 3, 42, long_str,
                                      long_str, 5)
         records = reader.feed(blob)
         self.assertEqual(len(records), 1)
@@ -1373,16 +1387,16 @@ class RecordCodecTest(unittest.TestCase):
         # next record that DOES carry a real one: here, the CALL's ts=5.
         # (If the stream had ended before any real-ts record arrived, it
         # would fall back to ("gap", None) via RecordReader.finalize().)
-        blob = _profile.encode_frame(_profile.CALL, 1, 5, "f", "/p/a.py", 1)
+        blob = _encode_frame(_profile.CALL, 1, 5, "f", "/p/a.py", 1)
         out = _profile.RecordReader().feed(blob)
         self.assertEqual(out[0], ("gap", 5))
         self.assertEqual(out[1], ("frame", _profile.CALL, 1, 5, "f", "/p/a.py", 1))
 
     def test_record_type_reads_rtype_byte(self):
         hello = _profile.encode_hello(pid=1, start_ns=0)
-        # encode_frame's blob is FRAME_DEF-first; record_type reads that
+        # _encode_frame's blob is FRAME_DEF-first; record_type reads that
         # leading record's rtype, not the CALL/RETURN reference behind it.
-        frame = _profile.encode_frame(_profile.CALL, 1, 1, "f", "/p/a.py", 1)
+        frame = _encode_frame(_profile.CALL, 1, 1, "f", "/p/a.py", 1)
         self.assertEqual(_profile.record_type(hello), _profile.HELLO)
         self.assertEqual(_profile.record_type(frame), _profile.FRAME_DEF)
 
@@ -1395,7 +1409,7 @@ class RecordCodecTest(unittest.TestCase):
 
     def test_hook_replaced_is_a_gap_at_its_own_timestamp(self):
         reader = self._reader_after_hello()
-        frame = _profile.encode_frame(_profile.CALL, 1, 100, "f", "/p/a.py", 1)
+        frame = _encode_frame(_profile.CALL, 1, 100, "f", "/p/a.py", 1)
         replaced = _profile.encode_hook_replaced(250)
         self.assertEqual(reader.feed(frame + replaced),
                          [("frame", _profile.CALL, 1, 100, "f", "/p/a.py", 1),
@@ -1405,7 +1419,7 @@ class RecordCodecTest(unittest.TestCase):
 
     def test_end_record_closes_the_stream_cleanly(self):
         reader = self._reader_after_hello()
-        frame = _profile.encode_frame(_profile.CALL, 1, 100, "f", "/p/a.py", 1)
+        frame = _encode_frame(_profile.CALL, 1, 100, "f", "/p/a.py", 1)
         end = _profile.encode_end(300)
         self.assertEqual(reader.feed(frame + end[:5]),
                          [("frame", _profile.CALL, 1, 100, "f", "/p/a.py", 1)])
@@ -1416,7 +1430,7 @@ class RecordCodecTest(unittest.TestCase):
 
     def test_end_record_after_dropped_records_is_a_gap(self):
         reader = self._reader_after_hello()
-        _profile.encode_frame(_profile.CALL, 1, 100, "f", "/p/a.py", 1)  # dropped
+        _encode_frame(_profile.CALL, 1, 100, "f", "/p/a.py", 1)  # dropped
         self.assertEqual(reader.feed(_profile.encode_end(300)), [("gap", 300)])
         self.assertEqual(reader.end_of_stream(), [])
         self.assertEqual(reader.lost_records, 2)  # the DEF and the CALL
@@ -1476,7 +1490,7 @@ class RecordCodecTest(unittest.TestCase):
         # that one record and count it, never guess a frame, and never
         # clear the map on the strength of one bad id.
         reader = self._reader_after_hello()
-        known = _profile.encode_frame(_profile.CALL, 7, 10, "run", "/p/a.py", 1)
+        known = _encode_frame(_profile.CALL, 7, 10, "run", "/p/a.py", 1)
         self.assertEqual(len(reader.feed(known)), 1)  # frame_id 0 now defined
         bad = _profile._encode_frame_ref(_profile.CALL, tid=7, ts_ns=20,
                                          frame_id=999)
@@ -1492,7 +1506,7 @@ class RecordCodecTest(unittest.TestCase):
 
 class FrameInterningTest(unittest.TestCase):
     def setUp(self):
-        _profile._reset_seq()
+        _reset_seq()
 
     def test_frame_defined_once_then_referenced_by_id(self):
         written = []
@@ -1520,7 +1534,7 @@ class FrameInterningTest(unittest.TestCase):
 
 class FrameEmitterConcurrencyTest(unittest.TestCase):
     def setUp(self):
-        _profile._reset_seq()
+        _reset_seq()
 
     def test_concurrent_emit_and_span_do_not_desync_seq(self):
         # emit() and span() both run on the threading.setprofile hook, which
@@ -1587,7 +1601,7 @@ class FrameEmitterConcurrencyTest(unittest.TestCase):
 
 class ProfileDropTest(unittest.TestCase):
     def setUp(self):
-        _profile._reset_seq()
+        _reset_seq()
 
     def test_current_emitter_is_none_when_profiling_is_not_installed(self):
         # install() only ever runs in a forked, exec'd target child; the
@@ -1750,7 +1764,7 @@ class ProfileDropTest(unittest.TestCase):
 
 class ProfileReaderTest(unittest.TestCase):
     def setUp(self):
-        _profile._reset_seq()
+        _reset_seq()
 
     def test_poll_flushes_a_pending_gap_left_unresolved_by_this_drain(self):
         # Burst-then-quiet: the gap is first revealed on a first-sighting
@@ -1801,7 +1815,7 @@ class ProfileReaderTest(unittest.TestCase):
         self.assertEqual(reader.poll(), [])
         self.assertEqual(reader.drained_ns, 0)
         reader.start()
-        os.write(w, _profile.encode_frame(_profile.CALL, 7, 100, "run", "/p/a.py", 3))
+        os.write(w, _encode_frame(_profile.CALL, 7, 100, "run", "/p/a.py", 3))
         self._poll_until(reader, lambda out: any(r[0] == "frame" for r in out))
         self._poll_until(reader, lambda out: reader.drained_ns >= before_ns)
 
@@ -1816,7 +1830,7 @@ class ProfileReaderTest(unittest.TestCase):
         reader = _profile.ProfileReader(r, drops_fd=drops_fd)
         reader.start()
         os.write(w, _profile.encode_hello(pid=1, start_ns=0))
-        os.write(w, _profile.encode_frame(_profile.CALL, 7, 100, "run", "/p/a.py", 3))
+        os.write(w, _encode_frame(_profile.CALL, 7, 100, "run", "/p/a.py", 3))
         self._poll_until(reader, lambda out: any(r[0] == "frame" for r in out))
         self.assertNotIn(("gap", None), reader.poll())
         os.eventfd_write(drops_fd, 2)
@@ -1832,7 +1846,7 @@ class ProfileReaderTest(unittest.TestCase):
         reader = _profile.ProfileReader(r, drops_fd=drops_fd)
         reader.start()
         os.write(w, _profile.encode_hello(pid=1, start_ns=0))
-        os.write(w, _profile.encode_frame(_profile.CALL, 7, 100, "run", "/p/a.py", 3))
+        os.write(w, _encode_frame(_profile.CALL, 7, 100, "run", "/p/a.py", 3))
         _profile._next_seq()  # one dropped record
         os.eventfd_write(drops_fd, 1)
         os.write(w, _profile._encode_frame_ref(_profile.RETURN, 7, 200, 0))
@@ -1850,7 +1864,7 @@ class ProfileReaderTest(unittest.TestCase):
         reader = _profile.ProfileReader(r)
         reader._q.put(_profile.encode_hello(pid=1, start_ns=0))
         for ts in (10, 20, 30):
-            reader._q.put(_profile.encode_frame(
+            reader._q.put(_encode_frame(
                 _profile.CALL, 7, ts, "run", "/p/a.py", 3))
         self.assertEqual(reader.poll(max_chunks=2), [
             ("frame", _profile.CALL, 7, 10, "run", "/p/a.py", 3)])
@@ -1892,7 +1906,7 @@ class ProfileReaderTest(unittest.TestCase):
         reader = _profile.ProfileReader(r)
         reader.start()
         os.write(w, _profile.encode_hello(pid=1, start_ns=0))
-        os.write(w, _profile.encode_frame(_profile.CALL, 7, 100, "run", "/p/a.py", 3))
+        os.write(w, _encode_frame(_profile.CALL, 7, 100, "run", "/p/a.py", 3))
         deadline = time.monotonic() + 2.0
         got = []
         while not got and time.monotonic() < deadline:
@@ -1915,7 +1929,7 @@ class ProfileReaderTest(unittest.TestCase):
         reader = _profile.ProfileReader(r)
         reader.start()
         os.write(w, _profile.encode_hello(pid=1, start_ns=0))
-        os.write(w, _profile.encode_frame(_profile.CALL, 7, 100, "run", "/p/a.py", 3))
+        os.write(w, _encode_frame(_profile.CALL, 7, 100, "run", "/p/a.py", 3))
         os.close(w)
         records = reader.drain_to_eof(time.monotonic() + 2.0)
         self.assertEqual(records, [
@@ -1983,20 +1997,20 @@ class ProfileReaderTest(unittest.TestCase):
 
 class ProjectFileTest(unittest.TestCase):
     def test_inside_root(self):
-        self.assertTrue(_profile.is_project_file("/p/x/y.py", "/p"))
+        self.assertTrue(_is_project_file("/p/x/y.py", "/p"))
 
     def test_outside_root(self):
-        self.assertFalse(_profile.is_project_file("/usr/lib/python3.10/os.py", "/p"))
+        self.assertFalse(_is_project_file("/usr/lib/python3.10/os.py", "/p"))
 
     def test_site_packages_inside_root_excluded(self):
         self.assertFalse(
-            _profile.is_project_file("/p/venv/lib/python3.10/site-packages/m.py", "/p"))
+            _is_project_file("/p/venv/lib/python3.10/site-packages/m.py", "/p"))
 
     def test_metagross_itself_excluded(self):
         import metagross
         path = metagross.__file__
         root = os.path.dirname(os.path.dirname(path))
-        self.assertFalse(_profile.is_project_file(path, root))
+        self.assertFalse(_is_project_file(path, root))
 
     def test_code_without_a_source_file_is_not_project_code(self):
         # exec(), frozen modules and generated code carry names like
@@ -2004,10 +2018,10 @@ class ProjectFileTest(unittest.TestCase):
         root = os.getcwd()
         for name in ("<string>", "<stdin>", "<frozen importlib._bootstrap>",
                      "<eval_with_key>.0"):
-            self.assertFalse(_profile.is_project_file(name, root), name)
+            self.assertFalse(_is_project_file(name, root), name)
 
     def test_filesystem_root_accepts_project_file(self):
-        self.assertTrue(_profile.is_project_file("/tmp/project.py", "/"))
+        self.assertTrue(_is_project_file("/tmp/project.py", "/"))
 
     def test_classifier_caches_path_resolution(self):
         realpath = _profile.os.path.realpath
@@ -2341,7 +2355,7 @@ class SpanApiTest(unittest.TestCase):
 
     def _capture_span_reports(self):
         """Install a recording emitter; return the decoded span names."""
-        _profile._reset_seq()
+        _reset_seq()
         written = []
         self.addCleanup(setattr, _profile, "_current_emitter",
                         _profile._current_emitter)
@@ -2560,18 +2574,18 @@ class AttributionTest(unittest.TestCase):
 
 class GapHandlingTest(unittest.TestCase):
     def setUp(self):
-        _profile._reset_seq()
+        _reset_seq()
 
     def test_seq_gap_emits_gap_record(self):
         reader = _profile.RecordReader()
         out = reader.feed(_profile.encode_hello(pid=1234, start_ns=1))
-        out += reader.feed(_profile.encode_frame(_profile.CALL, tid=7, ts_ns=10,
+        out += reader.feed(_encode_frame(_profile.CALL, tid=7, ts_ns=10,
                                                  func="a", path="/p/a.py", line=1))
         # A real dropped record: encode one (it consumes a seq) but never feed
         # it, so the reader sees the seq jump.
-        _profile.encode_frame(_profile.CALL, tid=7, ts_ns=20, func="x",
+        _encode_frame(_profile.CALL, tid=7, ts_ns=20, func="x",
                               path="/p/a.py", line=9)
-        out += reader.feed(_profile.encode_frame(_profile.CALL, tid=7, ts_ns=30,
+        out += reader.feed(_encode_frame(_profile.CALL, tid=7, ts_ns=30,
                                                  func="b", path="/p/a.py", line=2))
         self.assertIn("gap", [rec[0] for rec in out])
         # The gap tuple precedes the record that revealed it, so a consumer
@@ -2775,7 +2789,7 @@ class JoinerTest(unittest.TestCase):
         # dropped on a full pipe. evaluate then launches a kernel. The hole
         # shows only when the next record gets through.
         ms = 1_000_000
-        _profile._reset_seq()
+        _reset_seq()
         reader = _profile.RecordReader()
         joiner = _events.Joiner()
 

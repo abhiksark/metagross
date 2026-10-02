@@ -389,13 +389,10 @@ def describe(api, ev, registry: KernelRegistry, allocs: AllocTracker,
              kernel_override=_UNSET):
     """Describe a raw CUDA event.
 
-    kernel_override distinguishes two callers for launch categories:
-    left at the default _UNSET (the direct-call path DescribeTest uses),
-    the kernel name is looked up live in registry, matching pre-existing
-    behavior. Passed explicitly (the Joiner.enrich path, always passed),
-    a str names the kernel snapshotted at enqueue time and None freezes
-    the launch to the placeholder rather than trusting a later
-    registration.
+    For a launch, kernel_override is the name the registry held when the
+    call was queued (what Joiner.enrich passes), or None to keep the
+    placeholder rather than trust a later registration. Left unset, the
+    name is looked up in registry now.
     """
     cat = api.category
     kernel = None
