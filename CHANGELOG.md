@@ -42,6 +42,8 @@ User-visible changes to Metagross. Versions follow `metagross.__version__`.
   second in any 30, asleep instead of spinning. Before, a tracer that was
   slow but alive could cost one second for every function called for the
   first time.
+- Fix: allocation totals no longer drift when one thread frees a block while
+  another thread's allocation, begun earlier, is given the same address.
 - Breaking, security: `--output` and `--summary-output` are refused in a
   directory that does not belong to the invoking user, unless it is a shared
   sticky directory such as `/tmp`. Before, a user allowed to run only

@@ -238,6 +238,22 @@ class OpSpanTimeline:
         self._forget_empty()
 
 
+def account_memory(api, ev, allocs: AllocTracker):
+    """Apply an allocation or free and return `(freed bytes, new total)`.
+
+    Returns None for any other call. A pointer exists only once its
+    allocation returns, so calls must be applied in the order they returned.
+    """
+    if api.category in ("alloc", "alloc_async"):
+        if ev.ret == 0:
+            allocs.on_alloc(ev.out, ev.args[1])
+        return None, allocs.total_bytes
+    if api.category in ("free", "free_async"):
+        freed = allocs.on_free(ev.args[0]) if ev.ret == 0 else None
+        return freed, allocs.total_bytes
+    return None
+
+
 @dataclasses.dataclass
 class AttributedEvent:
     raw: object
@@ -245,6 +261,9 @@ class AttributedEvent:
     frame: FrameInfo | None
     kernel_at_enqueue: str | None = None
     span: str | None = None
+    # `account_memory`'s result from when the call was delivered, or unset
+    # for an event built outside the Joiner.
+    memory: object = _UNSET
 
 
 @dataclasses.dataclass
@@ -295,8 +314,14 @@ class Joiner:
         if api.category in ("launch", "launch_ex"):
             handle = raw.args[0] if api.category == "launch" else raw.args[1]
             kernel = self.registry.name(handle)
+        # The ring buffer delivers calls in the order they returned, which
+        # is the order allocation accounting needs. Rows are released by
+        # entry time, which would let an allocation overtake the free that
+        # made its address available.
+        memory = account_memory(api, raw, self.allocs)
         heapq.heappush(
-            self._pending, (raw.ts, next(self._arrivals), raw, api, kernel))
+            self._pending,
+            (raw.ts, next(self._arrivals), raw, api, kernel, memory))
 
     def on_profile_record(self, rec) -> None:
         tag = rec[0]
@@ -321,7 +346,7 @@ class Joiner:
     def enrich(self, event: AttributedEvent) -> EnrichedEvent:
         kernel, details = describe(
             event.api, event.raw, self.registry, self.allocs,
-            kernel_override=event.kernel_at_enqueue,
+            kernel_override=event.kernel_at_enqueue, memory=event.memory,
         )
         return EnrichedEvent(
             event.raw, event.api, event.frame, kernel, details, event.span
@@ -352,7 +377,7 @@ class Joiner:
         pending = self._pending
         out = []
         while pending and (force or pending[0][0] <= ready_until_ns):
-            _, _, raw, api, kernel = heapq.heappop(pending)
+            _, _, raw, api, kernel, memory = heapq.heappop(pending)
             # The calling thread stays inside the driver for the whole call,
             # so its stack at return is its stack at entry. Query at return:
             # a long call's entry can be older than the pruned history, but
@@ -360,13 +385,13 @@ class Joiner:
             returned_ns = raw.ts + raw.dur
             out.append(AttributedEvent(
                 raw, api, self.timeline.attribute(raw.tid, returned_ns),
-                kernel, self.spans.attribute(raw.tid, returned_ns)))
+                kernel, self.spans.attribute(raw.tid, returned_ns), memory))
         while pending and (now_ns - pending[0][0] >= self.max_wait_ns
                            or len(pending) > self.max_pending):
             # The profile stream is too far behind to wait for.
-            _, _, raw, api, kernel = heapq.heappop(pending)
+            _, _, raw, api, kernel, memory = heapq.heappop(pending)
             self._waited_out += 1
-            out.append(AttributedEvent(raw, api, None, kernel))
+            out.append(AttributedEvent(raw, api, None, kernel, memory=memory))
         # History must reach back to every call still to be attributed: the
         # ones held here, and the ones not yet delivered, which returned
         # after the ring buffer was last drained. The controller may have
@@ -386,14 +411,18 @@ def _hex(v: int) -> str:
 
 
 def describe(api, ev, registry: KernelRegistry, allocs: AllocTracker,
-             kernel_override=_UNSET):
+             kernel_override=_UNSET, memory=_UNSET):
     """Describe a raw CUDA event.
 
     For a launch, kernel_override is the name the registry held when the
     call was queued (what Joiner.enrich passes), or None to keep the
     placeholder rather than trust a later registration. Left unset, the
-    name is looked up in registry now.
+    name is looked up in registry now. Likewise memory is
+    `account_memory`'s result from when the call was delivered; left unset,
+    the allocation or free is applied to allocs now.
     """
+    if memory is _UNSET:
+        memory = account_memory(api, ev, allocs)
     cat = api.category
     kernel = None
     det: dict = {}
@@ -432,18 +461,14 @@ def describe(api, ev, registry: KernelRegistry, allocs: AllocTracker,
         det["ptr"] = _hex(ev.out)
         if cat == "alloc_async":
             det["stream"] = _hex(ev.args[2])
-        if ev.ret == 0:
-            allocs.on_alloc(ev.out, ev.args[1])
-        det["gpu_total"] = allocs.total_bytes
+        det["gpu_total"] = memory[1]
     elif cat in ("free", "free_async"):
         det["ptr"] = _hex(ev.args[0])
-        if ev.ret == 0:
-            size = allocs.on_free(ev.args[0])
-            if size is not None:
-                det["bytes"] = size
+        if memory[0] is not None:
+            det["bytes"] = memory[0]
         if cat == "free_async":
             det["stream"] = _hex(ev.args[1])
-        det["gpu_total"] = allocs.total_bytes
+        det["gpu_total"] = memory[1]
     elif cat.startswith("copy"):
         det["bytes"] = ev.args[2]
         if api.base.endswith("Async"):

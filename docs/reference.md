@@ -505,8 +505,11 @@ base API names above. JSONL retains these names; table rows omit the `cu` prefix
 for example `LaunchKernel` and `MemAlloc`. For directional transfers, direction is encoded in the
 `api` field: `cuMemcpyHtoD` is host-to-device and `cuMemcpyDtoH` is
 device-to-host. Generic `cuMemcpy` and `cuMemcpyAsync` events remain generic.
-`gpu_total` is the running total of successfully observed driver allocations;
-it is not a measurement of all memory owned by a framework or process.
+`gpu_total` is the total of successfully observed driver allocations still
+outstanding when the call returned; it is not a measurement of all memory
+owned by a framework or process. Calls are counted in the order they
+returned, and rows are written by entry time, so with allocations and frees
+on several threads `gpu_total` need not rise and fall row by row.
 
 ## Overhead and limits
 

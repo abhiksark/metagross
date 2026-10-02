@@ -2913,6 +2913,33 @@ class GapHandlingTest(unittest.TestCase):
 
 
 class JoinerTest(unittest.TestCase):
+    def test_allocations_are_accounted_in_the_order_calls_returned(self):
+        # Thread B enters an allocation and blocks. Thread A frees a block;
+        # the driver then gives its address to B. B's call began before
+        # the free, and rows come out by entry time, but its pointer did
+        # not exist until it returned.
+        joiner = _events.Joiner(hold_ns=0)
+        pointer = 0x70000000
+        delivered = [  # the order the ring buffer delivers: by return time
+            _raw(3, args=(0, 100), out=pointer, ts=10, dur=5, tid=1),
+            _raw(5, args=(pointer,), ts=1200, dur=100, tid=1),
+            _raw(3, args=(0, 200), out=pointer, ts=1000, dur=500, tid=2),
+        ]
+        for raw in delivered:
+            joiner.on_gpu_event(raw)
+        rows = [joiner.enrich(event).details
+                for event in joiner.flush(10_000, force=True)]
+        self.assertEqual(
+            rows,
+            [{"bytes": 100, "ptr": "0x70000000", "gpu_total": 100},
+             {"bytes": 200, "ptr": "0x70000000", "gpu_total": 200},
+             {"ptr": "0x70000000", "bytes": 100, "gpu_total": 0}])
+        self.assertEqual(joiner.allocs.total_bytes, 200)  # B's block is live
+        joiner.on_gpu_event(_raw(5, args=(pointer,), ts=2000, dur=1, tid=2))
+        (event,) = joiner.flush(10_000, force=True)
+        self.assertEqual(joiner.enrich(event).details["bytes"], 200)
+        self.assertEqual(joiner.allocs.total_bytes, 0)
+
     def test_span_reports_reach_the_span_timeline(self):
         j = _events.Joiner()
         j.on_profile_record(("span", 7, 10, "forward"))
