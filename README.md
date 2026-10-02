@@ -67,10 +67,22 @@ bindings, and PyTorch, so the host needs only:
 - Docker with the NVIDIA Container Toolkit, and permission to run privileged
   containers, which is equivalent to root on the host.
 
+To use your own image, a virtual environment, or no container at all, see
+[Run without the Docker image](docs/reference.md#run-without-the-docker-image).
+
 <a id="quick-start"></a>
 ## Quick start
 
 ### 1. Build the image
+
+Check GPU pass-through first, so a host problem shows before the build:
+
+```sh
+docker run --rm --gpus all nvidia/cuda:12.4.1-runtime-ubuntu22.04 nvidia-smi
+```
+
+Then build. The image is about 8 GB, most of it the CUDA base image and the
+PyTorch wheels.
 
 ```sh
 git clone https://github.com/abhiksark/metagross.git
@@ -83,7 +95,8 @@ docker build \
 ```
 
 The build arguments make the traced script run as your UID and GID, so the
-trace files it writes belong to you.
+trace files it writes belong to you. The build fails if the base image already
+uses that GID; see the [Docker guide](examples/docker/README.md#build).
 
 ### 2. Install the `metagross` command
 
@@ -187,8 +200,8 @@ See [op spans](docs/reference.md#op-spans) and the annotated
 - [Terminal snapshot and follow viewers](docs/reference.md#viewer-option-reference)
   for saved JSONL captures.
 
-From the repository root, usage help runs on the host without Docker, root,
-BCC, CUDA, or a GPU:
+From the repository root, usage help and the viewers run on the host with
+Python 3.10 or newer, without Docker, root, BCC, CUDA, or a GPU:
 
 ```sh
 python3 -m metagross --help

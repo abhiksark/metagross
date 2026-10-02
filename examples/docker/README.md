@@ -399,7 +399,8 @@ loss columns means that capture was incomplete.
 - `cannot start the web dashboard`: another process holds the port; pass
   `--web-port` with a free port.
 - The dashboard URL does not load: include `--network host` and open the URL on
-  the machine running the container.
+  the machine running the container. From another machine, forward the port
+  first: `ssh -L 8765:127.0.0.1:8765 user@gpu-machine`.
 
 Docker Desktop on macOS and Windows does not expose a native NVIDIA Linux driver
 and host eBPF environment suitable for this example.

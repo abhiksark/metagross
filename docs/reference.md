@@ -26,6 +26,43 @@ it; pip cannot install BCC. The installed command takes the same arguments as
 It has the same name as the Docker wrapper from the quick start, so whichever
 comes first on `PATH` runs.
 
+### Run without the Docker image
+
+The script runs under the interpreter that started Metagross, and that
+interpreter must be able to import BCC. Distributions package the BCC bindings
+for their system Python only (`python3-bpfcc` on Ubuntu) and pip cannot
+install them, so everything the script imports has to be importable from an
+interpreter that also sees the system BCC:
+
+- **System Python**: install the script's packages for `/usr/bin/python3` and
+  start Metagross with it, as in the examples in this reference.
+- **Virtual environment**: create it from the system Python with access to the
+  system packages, and start Metagross with the environment's interpreter:
+
+  ```sh
+  /usr/bin/python3 -m venv --system-site-packages .venv
+  .venv/bin/pip install your-packages
+  sudo .venv/bin/python /path/to/metagross-checkout/metagross script.py
+  ```
+
+  The script then runs inside the environment. An environment created
+  without `--system-site-packages`, or a conda or pyenv interpreter, cannot
+  import the system BCC and stops with `bcc (BPF Compiler Collection) not
+  available`.
+- **Your own image**: follow
+  [`examples/docker/Dockerfile`](../examples/docker/Dockerfile). Install
+  `python3-bpfcc` and your packages for the image's system Python, copy the
+  `metagross` package in, set `SUDO_UID`, `SUDO_GID`, and `SUDO_USER` to the
+  account the script should run as, and start the container with the flags the
+  [Docker guide](../examples/docker/README.md#run-the-basic-workload)
+  explains. The distribution's system Python decides the Python version:
+  3.10 on Ubuntu 22.04, 3.12 on Ubuntu 24.04.
+
+Rows come from any code in the process that calls the traced driver APIs in
+the probed `libcuda.so.1`. PyTorch and direct driver calls through `ctypes`
+are tested; other libraries, such as CuPy, ONNX Runtime, and TensorRT, are
+not.
+
 The tracing interface is:
 
 ```text
@@ -411,8 +448,10 @@ network.
 Viewer authentication blocks callers without the secret, but does not protect
 against root, a compromised user account or browser, or software able to read
 the terminal output or browser session storage. Do not share the private URL,
-and do not expose the server through a proxy or port forward; use `--host` when
-viewers on the internal network need access.
+and do not expose the server through a reverse proxy or a tunnel that other
+people can reach. Use `--host` when viewers on the internal network need
+access, or an SSH forward to your own machine as described under
+[Built-in web dashboard](#built-in-web-dashboard).
 
 The live status moves from `WAITING` to `LIVE`, then reconciles to `COMPLETE`,
 `INCOMPLETE`, or `MISMATCH` when the final summary appears. An empty summary
@@ -555,6 +594,11 @@ as `cuMemAlloc` calls.
 **Nested re-entry**: Nested driver-API re-entry (rare) drops the outer event,
 keeping only the innermost call. Such events are counted but not duplicated.
 
+**Driver-internal calls**: The driver can call its own traced entry points,
+for example to allocate memory on behalf of another API. Such a call is an
+ordinary row, attributed to the project function that was active, and it
+counts toward `gpu_total`.
+
 **High event rates**: A workload that emits CUDA calls faster than userspace can
 drain and render them can overflow the BPF ring buffer. Metagross prints a lost
 event warning; a trace with that warning is incomplete.
@@ -600,7 +644,16 @@ sudo /usr/bin/python3 -m metagross --web examples/gpu_demo.py
 Before loading probes or forking the target, the controller starts the
 in-memory receiver as the same unprivileged account the target runs as, in its
 own session, bound to `127.0.0.1` on `--web-port` (8765 by default). It prints
-the private viewer URL to standard error. The controller generates the producer
+the private viewer URL to standard error. The dashboard has no option to
+listen on another address. To watch it from another machine, forward the same
+port over SSH and open the printed URL there:
+
+```sh
+ssh -L 8765:127.0.0.1:8765 user@gpu-machine
+```
+
+The local port must equal the dashboard port, because the server rejects
+requests addressed to any other port. The controller generates the producer
 token and passes it to the receiver through an inherited pipe; the token never
 appears in an environment variable, the command line, or the terminal. Terminal
 Ctrl-C reaches the target, not the dashboard, and the dashboard exits if the

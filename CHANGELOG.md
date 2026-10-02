@@ -10,6 +10,9 @@ User-visible changes to Metagross. Versions follow `metagross.__version__`.
   The wheel carries the logo and font notices next to the license.
 - `metagross.__all__` names the Python API: `span`, `main`, and
   `__version__`. A checkout between releases reports a `.dev0` version.
+- The reference documents how to run without the Docker image (system Python,
+  a virtual environment, or your own image) and how to open the built-in
+  dashboard from another machine.
 
 ## 0.1.1 (2026-10-02)
 
