@@ -1229,7 +1229,21 @@ class BpfSourceTest(unittest.TestCase):
         self.assertEqual(self.src.count("{"), self.src.count("}"))
 
     def test_launch_reads_stack_args(self):
-        self.assertIn("bpf_probe_read_user", self.src)
+        # Block Z, shared memory and the stream are the 7th to 9th arguments
+        # and live on the caller's stack.
+        start = self.src.index("int enter_cuLaunchKernel(")
+        body = self.src[start:self.src.index("int exit_cuLaunchKernel(")]
+        for slot, offset in ((6, 8), (7, 16), (8, 24)):
+            self.assertIn(
+                f"bpf_probe_read_user(&f.args[{slot}], sizeof(u64), "
+                f"(void *)(sp + {offset}));", body)
+
+    def test_launch_ex_reads_the_config_struct(self):
+        start = self.src.index("int enter_cuLaunchKernelEx(")
+        body = self.src[start:self.src.index("int exit_cuLaunchKernelEx(")]
+        self.assertIn("bpf_probe_read_user(&dims, sizeof(dims), cfg);", body)
+        self.assertIn("bpf_probe_read_user(&shmem, sizeof(shmem), cfg + 24);", body)
+        self.assertIn("bpf_probe_read_user(&stream, sizeof(stream), cfg + 32);", body)
 
     def test_ring_buffer_has_four_mibibyte_capacity(self):
         self.assertIn("BPF_RINGBUF_OUTPUT(events, 1024)", self.src)
@@ -2685,7 +2699,10 @@ class GapHandlingTest(unittest.TestCase):
         tl.attribute(1, 10)
         tl.on_gap(500)
         tl.prune(50)
-        self.assertIsNone(tl.attribute(1, 100))  # still below the gap horizon
+        # A late record from before the gap gives the thread a log again; the
+        # horizon alone must keep that history unanswerable.
+        tl.on_record(0, 1, 60, "stale", "/p/a.py", 1)
+        self.assertIsNone(tl.attribute(1, 100))
 
     def test_joiner_dispatches_gap_to_timeline(self):
         j = _events.Joiner(hold_ns=100)
