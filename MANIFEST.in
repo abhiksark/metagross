@@ -1,0 +1,13 @@
+# MANIFEST.in
+# What the source archive needs beyond the package: the tests' fixtures, the
+# examples they read, and the documents the README links. Paths under docs/
+# and assets/ are listed one by one because those folders also hold local
+# files that must not ship.
+include AGENTS.md CHANGELOG.md CONTRIBUTING.md SECURITY.md run_integration.sh
+include tests/__init__.py tests/stub_libcuda.c
+include docs/reference.md
+recursive-include docs/agent-guides *.md
+include assets/README.md assets/FONT-LICENSE.txt
+include assets/logo-dark.svg assets/logo-light.svg assets/logo-mark.svg
+recursive-include examples *.py *.md *.json *.jsonl
+include examples/docker/Dockerfile examples/docker/metagross

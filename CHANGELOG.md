@@ -2,6 +2,12 @@
 
 User-visible changes to Metagross. Versions follow `metagross.__version__`.
 
+## Unreleased
+
+- The source archive now carries the tests' fixtures, the examples, and the
+  documents the README links, so its unit tests run from the unpacked archive.
+  The wheel carries the logo and font notices next to the license.
+
 ## 0.1.1 (2026-10-02)
 
 - Fix: a call is no longer attributed to a stale function when the tracer is

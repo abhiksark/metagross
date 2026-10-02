@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,7 +8,9 @@ dynamic = ["version"]
 description = "Trace which function in a Python script caused each CUDA driver API call, using eBPF."
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "Apache-2.0"}
+license = "Apache-2.0"
+# The logo notice travels with the package: the dashboard embeds the mark.
+license-files = ["LICENSE", "assets/README.md", "assets/FONT-LICENSE.txt"]
 authors = [{name = "Abhik Sarkar"}]
 # No Python dependencies. Live tracing needs the BCC bindings from the
 # distribution (python3-bpfcc on Ubuntu), which pip cannot install.
@@ -17,6 +19,11 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
 ]
 
 [project.scripts]
