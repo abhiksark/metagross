@@ -1883,6 +1883,42 @@ class ProfileDropTest(unittest.TestCase):
         emitter.emit(_profile.CALL, 1, 40, "d", "/p/a.py", 4)
         self.assertEqual(len(waits), 2)                        # allowed again
 
+    def test_writer_stops_for_good_when_its_descriptor_fails(self):
+        # EBADF: the script closed the number. It may reuse it for a file of
+        # its own, so the writer must never touch it again.
+        attempts = []
+
+        def closed_write(fd, data):
+            attempts.append(data)
+            raise OSError(9, "Bad file descriptor")
+
+        writer = _writer(closed_write)
+        emitter = _profile._FrameEmitter(writer.write)
+        emitter.span(1, 10, "step")
+        self.assertTrue(writer.closed)
+        emitter.emit(_profile.CALL, 1, 20, "f", "/p/a.py", 1)
+        emitter.end(30)
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(writer.dropped, 0)
+
+    def test_writer_stops_when_the_number_names_another_file(self):
+        # The script closed the descriptor and opened a file that was given
+        # the same number: writes would succeed, into the script's file.
+        written = []
+        ours = [True]
+        writer = _writer(lambda fd, data: written.append(data),
+                         still_ours=lambda: ours[0])
+        emitter = _profile._FrameEmitter(writer.write)
+        for _ in range(_profile._IDENTITY_CHECK_EVERY * 2):
+            emitter.span(1, 10, "step")
+        self.assertFalse(writer.closed)
+        ours[0] = False
+        before = len(written)
+        for _ in range(_profile._IDENTITY_CHECK_EVERY * 3):
+            emitter.span(1, 10, "step")
+        self.assertTrue(writer.closed)
+        self.assertLess(len(written) - before, _profile._IDENTITY_CHECK_EVERY)
+
     def test_waiting_for_room_sleeps_on_the_descriptor(self):
         r, w = os.pipe()
         self.addCleanup(os.close, r)

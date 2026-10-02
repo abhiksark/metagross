@@ -101,6 +101,52 @@ class TargetExecutionTest(unittest.TestCase):
                 else:
                     self.assertEqual(records, [])
 
+    def test_profile_records_never_land_in_a_file_the_script_opens(self):
+        # A daemonizing script closes what it inherited, then opens files,
+        # which are handed the lowest free numbers.
+        source = (
+            "import os, sys\n"
+            "def handler():\n"
+            "    return 1\n"
+            "handler()\n"
+            "os.closerange(3, 1 << 20)\n"
+            "log = os.open('served.log', os.O_WRONLY | os.O_CREAT, 0o600)\n"
+            "os.write(log, b'request served\\n')\n"
+            "for _ in range(500):\n"
+            "    handler()\n"
+            "pid = os.fork()\n"
+            "if pid == 0:\n"
+            "    os.write(log, b'from the child\\n')\n"
+            "    os._exit(0)\n"
+            "os.waitpid(pid, 0)\n"
+            "with open('served.log', 'rb') as stream:\n"
+            "    print(stream.read())\n"
+            "print(sys.getprofile())\n"
+        )
+        with open(self.script, "w", encoding="utf-8") as stream:
+            stream.write(source)
+        code, stdout, stderr, _ = self._run(
+            source, setup=f"os.chdir({self.directory!r})\n")
+        self.assertEqual(code, 0, stderr)
+        # Only the script's own bytes, the fork handler left its descriptor
+        # open in the child, and the hook removed itself.
+        self.assertEqual(
+            stdout, "b'request served\\nfrom the child\\n'\nNone\n")
+
+    def test_tracer_descriptors_sit_above_the_numbers_a_script_gets(self):
+        source = (
+            "import os\n"
+            "print(sorted(int(n) for n in os.listdir('/proc/self/fd')))\n"
+        )
+        code, stdout, stderr, _ = self._run(source)
+        self.assertEqual(code, 0, stderr)
+        # Standard streams, the directory listing itself, and the two
+        # tracer descriptors.
+        numbers = json.loads(stdout)
+        self.assertEqual(numbers[:4], [0, 1, 2, 3])
+        self.assertEqual(len(numbers), 6, numbers)
+        self.assertGreater(numbers[4], 900)
+
     def test_target_is_signalled_when_the_controller_dies(self):
         # PR_GET_PDEATHSIG (2) reads back what the child armed before exec.
         source = (

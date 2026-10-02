@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import atexit
 import contextvars
+import itertools
 import os
 import queue
 import select
@@ -40,6 +41,7 @@ _MAX_QUEUED_CHUNKS = 256  # 64 KiB reads the controller may fall behind by
 _POLL_CHUNKS = 8  # 64 KiB reads decoded per call, so the caller's loop keeps turning
 _MUST_DELIVER_TIMEOUT_S = 1.0  # wait on a full pipe for a record that must arrive
 _STALL_COOLDOWN_S = 30.0  # after such a wait times out, do not wait again this soon
+_IDENTITY_CHECK_EVERY = 64  # records between checks that the fds are still the tracer's
 
 # Every record starts with this 6-byte common header.
 _COMMON = struct.Struct("<BIB")  # rtype, seq, _reserved
@@ -154,6 +156,15 @@ class _FrameEmitter:
             self._write(encode_end(ts))
 
 
+def _fd_identity(fd: int):
+    """Return what tells one open file from another, or None if `fd` is closed."""
+    try:
+        info = os.fstat(fd)
+    except OSError:
+        return None
+    return info.st_dev, info.st_ino
+
+
 def _wait_writable(fd: int, timeout_s: float) -> None:
     """Sleep until `fd` accepts a write, fails, or the timeout passes."""
     poller = select.poll()  # not select(): the fd number may exceed 1023
@@ -187,17 +198,31 @@ class _DropCountWriter:
     The reader finds a dropped record only when a later one arrives, and a
     target that then stays inside library code writes none. Each drop is
     therefore also added to `drops_fd`, an eventfd the controller reads.
+
+    The descriptors are numbers in the target's own process. A target that
+    closes the descriptors it inherited can later be handed the same numbers
+    for its own files, so the writer stops for good (`closed`) on any write
+    error other than a full pipe, and when `still_ours`, asked every
+    `_IDENTITY_CHECK_EVERY` records, says the numbers now name other files.
     """
 
     def __init__(self, fd: int, os_write=os.write, clock=time.monotonic,
-                 drops_fd: int | None = None, wait_writable=_wait_writable):
+                 drops_fd: int | None = None, wait_writable=_wait_writable,
+                 still_ours=lambda: True, on_closed=lambda: None):
         self._fd = fd
         self._os_write = os_write
         self._clock = clock
         self._wait_writable = wait_writable
+        self._still_ours = still_ours
+        self._on_closed = on_closed
+        # True once in every `_IDENTITY_CHECK_EVERY` calls; this runs for
+        # each record, so it is one C call rather than a Python counter.
+        self._identity_check_due = itertools.cycle(
+            (False,) * (_IDENTITY_CHECK_EVERY - 1) + (True,)).__next__
         self._no_wait_before = 0.0
         self._drops_fd = drops_fd
         self.dropped = 0
+        self.closed = False
 
     def _count_drop(self) -> None:
         self.dropped += 1
@@ -205,9 +230,16 @@ class _DropCountWriter:
             try:
                 os.eventfd_write(self._drops_fd, 1)
             except OSError:
-                pass  # a broken trace channel must never kill the target
+                self.closed = True  # a broken trace channel must never kill the target
 
     def write(self, data: bytes) -> bool:
+        if self.closed:
+            # Each thread that still emits is told, so it can drop its hook.
+            self._on_closed()
+            return False
+        if self._identity_check_due() and not self._still_ours():
+            self.closed = True
+            return False
         # Every record is well under PIPE_BUF (the largest, a FRAME_DEF,
         # is at most ~6 + 16 + 2*_MAX_STR bytes), so a successful os.write
         # on a pipe is always atomic here: the return value is never a
@@ -220,7 +252,11 @@ class _DropCountWriter:
             self._count_drop()
             return False
         except OSError:
-            pass  # broken trace pipe must never kill the target
+            # Closed by the target (EBADF) or by the controller (EPIPE). A
+            # broken trace pipe must never kill the target, and the number
+            # must not be written to again: the target may reuse it.
+            self.closed = True
+            return False
         return True
 
     def _write_or_time_out(self, data: bytes) -> bool:
@@ -246,7 +282,8 @@ class _DropCountWriter:
                 self._wait_writable(self._fd, deadline - now)
                 continue
             except OSError:
-                return True  # broken trace pipe must never kill the target
+                self.closed = True  # see `write`
+                return False
             return True
 
 
@@ -770,7 +807,23 @@ def install(write_fd: int, project_root: str,
     # an EAGAIN on HELLO itself would desync the reader's very first
     # expected seq before anything downstream can recover from it.
     os.set_blocking(write_fd, False)
-    writer = _DropCountWriter(write_fd, drops_fd=drops_fd)
+    owned = [(fd, _fd_identity(fd)) for fd in (write_fd, drops_fd)
+             if fd is not None]
+
+    def still_ours() -> bool:
+        return all(_fd_identity(fd) == identity for fd, identity in owned)
+
+    def stop_profiling() -> None:
+        # The trace channel is gone: stop paying for the hook. Each thread
+        # removes its own the next time it has a record to write.
+        global _current_emitter
+        if _current_emitter is emitter:
+            _current_emitter = None  # first: `audit` must not write from here
+        threading.setprofile(None)
+        sys.setprofile(None)
+
+    writer = _DropCountWriter(write_fd, drops_fd=drops_fd,
+                              still_ours=still_ours, on_closed=stop_profiling)
     emitter = _FrameEmitter(writer.write)
     _current_emitter = emitter
 
@@ -833,9 +886,10 @@ def install(write_fd: int, project_root: str,
         threading.setprofile(None)
         # A long-lived non-exec worker holding the write end open would
         # otherwise delay the parent's EOF until the final-drain deadline.
-        for fd in (write_fd, drops_fd):
-            if fd is None:
-                continue
+        # Close the numbers only while they are still the tracer's files.
+        if writer.closed or not still_ours():
+            return
+        for fd, _identity in owned:
             try:
                 os.close(fd)
             except OSError:

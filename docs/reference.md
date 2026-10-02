@@ -857,9 +857,15 @@ loads BPF programs and attaches probes; the target runs as the validated sudo
 caller, or as root only with `--allow-root-target`. The child drops credentials
 and sets `no_new_privs` before entering a fresh interpreter with the same PID,
 so the target and its descendants cannot gain privileges through setuid
-programs: a script that runs `sudo` works bare but fails under Metagross. Its profiling descriptor
-is restored to close-on-exec before target code runs; controller descriptors do
-not intentionally cross into target code. Arguments remain unchanged. The
+programs: a script that runs `sudo` works bare but fails under Metagross. Its two tracer
+descriptors are moved to high descriptor numbers and marked close-on-exec
+before target code runs; controller descriptors do not intentionally cross
+into target code. A script that closes them, for example by closing every
+descriptor it inherited, ends attribution for the rest of the run: the
+profiling hook removes itself, later calls are `<unknown>`, and the capture is
+marked incomplete. The hook stops on the first failed write and checks every
+64 records that its descriptor numbers still name the tracer's files, so its
+records do not go into a file the script opened later. Arguments remain unchanged. The
 bootstrap removes the producer token before the target can inspect its environment.
 
 `python -m` puts the working directory first on Python's import path, and the

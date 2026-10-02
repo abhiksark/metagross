@@ -34,6 +34,10 @@ User-visible changes to Metagross. Versions follow `metagross.__version__`.
   eight; the snapshot's lists are labelled by their real order (number of
   calls); and kernel names that differ only after 500 characters are no
   longer merged.
+- Fix: a script that closes the descriptors it inherited, as daemonizing
+  code does, no longer gets binary profile records written into the files it
+  opens afterwards, and a later fork no longer closes one of its
+  descriptors. Attribution stops and the capture is marked incomplete.
 - Fix: when the tracer falls behind, the script waits for it at most one
   second in any 30, asleep instead of spinning. Before, a tracer that was
   slow but alive could cost one second for every function called for the

@@ -1119,8 +1119,9 @@ def _trace(cfg, creds, uid, gid, dashboard_port, dashboard_token,
         ended_early = profile_reader.ended_early()
         if ended_early:
             print("metagross: the profile stream stopped before the script's "
-                  "normal exit (the script was killed, or the tracer fell "
-                  "behind); its last calls are unattributed", file=sys.stderr)
+                  "normal exit (the script was killed or closed the tracer's "
+                  "descriptors, or the tracer fell behind); its last calls "
+                  "are unattributed", file=sys.stderr)
         overrun = lost_profile - hook_replacements - ended_early
         if overrun > 0:
             print(f"metagross: lost {overrun} profile records (writer overrun)",

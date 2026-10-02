@@ -67,9 +67,13 @@ predictable, and diagnosable. Favor a boring core over clever tracing magic.
 - Drop the target to the invoking sudo user when valid metadata is available.
 - Preserve `HOME`, `USER`, and `LOGNAME` for the dropped user.
 - The profile write descriptor and the drop-counter eventfd cross the single
-  exec into the private runner. Restore close-on-exec there before target code
-  runs; target exec descendants must not inherit them. Other controller
-  descriptors remain close-on-exec.
+  exec into the private runner. Move them to high numbers and restore
+  close-on-exec there before target code runs; target exec descendants must
+  not inherit them. Other controller descriptors remain close-on-exec.
+- The numbers belong to the target's process, which may close and reuse them.
+  The writer must stop for good on any write error other than a full pipe and
+  when the numbers no longer name the tracer's files, and the fork handler
+  must close them only while they still do.
 - Maintain the startup barrier: the child must not execute target code until the
   parent has attached every required uprobe/uretprobe to the exact child PID and
   any explicitly requested dashboard has acknowledged capture start.
