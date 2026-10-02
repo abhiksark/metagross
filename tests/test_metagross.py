@@ -2338,7 +2338,7 @@ class OpSpanTimelineTest(unittest.TestCase):
         t.on_span(7, 10, "forward")
         t.on_span(7, 20, None)
         t.prune(100)
-        self.assertEqual(t._logs[7], [])
+        self.assertNotIn(7, t._logs)
 
 
 class AttributionTest(unittest.TestCase):
@@ -2542,7 +2542,7 @@ class GapHandlingTest(unittest.TestCase):
         tl.on_record(0, 1, 30, "leaked", "/p/a.py", 2)   # CALL; its RETURN is lost
         tl.attribute(1, 30)
         tl.on_gap(50)
-        self.assertEqual(tl._logs[1], [])                # nothing pre-gap survives
+        self.assertNotIn(1, tl._logs)                    # nothing pre-gap survives
         self.assertIsNone(tl.attribute(1, 40))            # below horizon -> unknown
         self.assertIsNone(tl.attribute(1, 100))           # at/after gap -> still unknown
 
@@ -2776,6 +2776,21 @@ class JoinerTest(unittest.TestCase):
         joiner.on_profile_record(("frame", _profile.CALL, 2, 400, "other", "/p/a.py", 9))
         self.assertIsNone(joiner.timeline.attribute(1, 600))
 
+    def test_finished_threads_leave_no_state_behind(self):
+        # One thread per request: each runs a project function inside a span
+        # and exits. Nothing may be kept per thread once its history is old.
+        j = _events.Joiner(hold_ns=100)
+        for tid in range(1, 1001):
+            ts = tid * 10
+            j.on_profile_record(("span", tid, ts, "request"))
+            j.on_profile_record(("frame", _profile.CALL, tid, ts + 1, "f", "/p/a.py", 1))
+            j.on_profile_record(("frame", _profile.RETURN, tid, ts + 2, "f", "/p/a.py", 1))
+            j.on_profile_record(("span", tid, ts + 3, None))
+        j.flush(now_ns=20_000)
+        self.assertEqual(j.timeline._logs, {})
+        self.assertEqual(j.timeline._states, {})
+        self.assertEqual(j.spans._logs, {})
+
     def test_flush_still_prunes_history_older_than_the_hold_window(self):
         j = _events.Joiner(hold_ns=100)
         for ts in range(10, 400, 10):
@@ -2783,7 +2798,7 @@ class JoinerTest(unittest.TestCase):
             j.on_profile_record(("frame", _profile.RETURN, 1, ts + 5, "f", "/p/a.py", 1))
         j.on_gpu_event(_raw(16, ts=12, dur=1, tid=1))
         j.flush(now_ns=1000)
-        self.assertEqual(j.timeline._logs[1], [])
+        self.assertNotIn(1, j.timeline._logs)
 
     def test_flush_prunes_history_while_the_gpu_is_idle(self):
         # No GPU event is ever released here; the frame log must still not
@@ -2793,7 +2808,7 @@ class JoinerTest(unittest.TestCase):
             j.on_profile_record(("frame", _profile.CALL, 1, ts, "f", "/p/a.py", 1))
             j.on_profile_record(("frame", _profile.RETURN, 1, ts + 5, "f", "/p/a.py", 1))
         self.assertEqual(j.flush(now_ns=1000), [])
-        self.assertEqual(j.timeline._logs[1], [])
+        self.assertNotIn(1, j.timeline._logs)
 
     def test_force_flush(self):
         j = _events.Joiner(hold_ns=10**12)
@@ -2860,7 +2875,7 @@ class SpanJoinTest(unittest.TestCase):
         # pruned away just like FrameTimeline -- the span timeline must not
         # grow unbounded.
         self.assertEqual(j.spans._logs.get(1, []), [])
-        self.assertEqual(j.timeline._horizons.get(1), j.spans._horizons.get(1))
+        self.assertEqual(j.timeline._horizon, j.spans._horizon)
 
 
 class ExampleCaptureTest(unittest.TestCase):

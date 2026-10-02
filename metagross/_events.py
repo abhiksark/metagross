@@ -73,12 +73,16 @@ class _ReplayState:
 
 
 class FrameTimeline:
-    """Per-TID profile logs with incremental point-in-time stack replay."""
+    """Per-TID profile logs with incremental point-in-time stack replay.
+
+    A thread is kept only while its log holds a record, so threads that
+    have finished cost nothing.
+    """
 
     def __init__(self):
         self._logs: dict[int, list[tuple]] = {}
         self._states: dict[int, _ReplayState] = {}
-        self._horizons: dict[int, int] = {}
+        self._horizon = 0  # no query below this instant can be answered
         # Queries refused because the history for that instant is gone. The
         # thread may well have been inside a project function.
         self.refused = 0
@@ -107,8 +111,7 @@ class FrameTimeline:
             self._states[tid] = _ReplayState()
 
     def attribute(self, tid: int, ts_ns: int):
-        horizon = self._horizons.get(tid)
-        if horizon is not None and ts_ns < horizon:
+        if ts_ns < self._horizon:
             self.refused += 1
             return None  # history below the prune horizon is gone; do not guess
         log = self._logs.get(tid)
@@ -140,19 +143,25 @@ class FrameTimeline:
         # at/after the gap would confidently (and wrongly) attribute to it
         # forever. Dropping everything below the gap forces post-gap queries
         # to <unknown> until a real CALL re-establishes the stack.
+        self._horizon = max(self._horizon, ts_ns)
         for tid, log in self._logs.items():
             log[:] = [record for record in log if record[0] >= ts_ns]
-            self._horizons[tid] = max(self._horizons.get(tid, ts_ns), ts_ns)
             self._states[tid] = _ReplayState()
+        self._forget_empty()
+
+    def _forget_empty(self) -> None:
+        for tid in [tid for tid, log in self._logs.items() if not log]:
+            del self._logs[tid]
+            self._states.pop(tid, None)
 
     def prune(self, min_ts_ns: int) -> None:
+        # The horizon only ever moves forward: history a prior gap or prune
+        # already put out of reach must not become trusted again just
+        # because a later prune call happens to pass a lower min_ts_ns
+        # (e.g. Joiner.flush pruning to the oldest still-held event after
+        # on_gap raised the horizon on a dropped record).
+        self._horizon = max(self._horizon, min_ts_ns)
         for tid, log in self._logs.items():
-            # A horizon only ever moves forward: history a prior gap or
-            # prune already put out of reach must not become trusted again
-            # just because a later prune call happens to pass a lower
-            # min_ts_ns (e.g. Joiner.flush pruning to the oldest still-held
-            # event after on_gap raised the horizon on a dropped record).
-            self._horizons[tid] = max(self._horizons.get(tid, min_ts_ns), min_ts_ns)
             cut = 0
             open_stack: list[FrameInfo] = []
             open_indices: list[int] = []
@@ -176,6 +185,7 @@ class FrameTimeline:
                     state.index = len(retained) + (state.index - cut)
                 else:
                     self._states[tid] = _ReplayState()
+        self._forget_empty()
 
 
 def _report_ts(report: tuple) -> int:
@@ -192,7 +202,7 @@ class OpSpanTimeline:
 
     def __init__(self):
         self._logs: dict[int, list[tuple[int, str | None]]] = {}
-        self._horizons: dict[int, int] = {}
+        self._horizon = 0
 
     def on_span(self, tid: int, ts_ns: int, name: str | None) -> None:
         log = self._logs.setdefault(tid, [])
@@ -201,10 +211,7 @@ class OpSpanTimeline:
 
     def attribute(self, tid: int, ts_ns: int):
         log = self._logs.get(tid)
-        if not log:
-            return None
-        horizon = self._horizons.get(tid)
-        if horizon is not None and ts_ns < horizon:
+        if not log or ts_ns < self._horizon:
             return None  # history below the prune horizon is gone; do not guess
         index = bisect.bisect_right(log, ts_ns, key=_report_ts)
         return log[index - 1][1] if index else None
@@ -212,17 +219,23 @@ class OpSpanTimeline:
     def on_gap(self, ts_ns: int) -> None:
         # The lost record may have been the report that ended a span, so no
         # thread's earlier state can be trusted until its next report.
-        for tid, log in self._logs.items():
+        self._horizon = max(self._horizon, ts_ns)
+        for log in self._logs.values():
             log[:] = [report for report in log if report[0] >= ts_ns]
-            self._horizons[tid] = max(self._horizons.get(tid, ts_ns), ts_ns)
+        self._forget_empty()
+
+    def _forget_empty(self) -> None:
+        for tid in [tid for tid, log in self._logs.items() if not log]:
+            del self._logs[tid]
 
     def prune(self, min_ts_ns: int) -> None:
-        for tid, log in self._logs.items():
-            self._horizons[tid] = max(self._horizons.get(tid, min_ts_ns), min_ts_ns)
+        self._horizon = max(self._horizon, min_ts_ns)
+        for log in self._logs.values():
             cut = bisect.bisect_left(log, min_ts_ns, key=_report_ts)
             if cut and log[cut - 1][1] is not None:
                 cut -= 1  # still the active span at the horizon
             del log[:cut]
+        self._forget_empty()
 
 
 @dataclasses.dataclass

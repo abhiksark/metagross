@@ -730,7 +730,8 @@ frames are kept, and unread profile data is capped at 16 MiB, after which the
 target drops and counts records. Calls to frames beyond that count are counted
 as lost profile records, which marks the capture incomplete. On every loop
 tick, whether or not the GPU is active, frame history older than 100 ms before
-the last ring buffer drain and the oldest call still waiting is discarded.
+the last ring buffer drain and the oldest call still waiting is discarded,
+and nothing is kept for a thread whose history is empty.
 A call waits at most five seconds for its profile history, and at
 most 200,000 calls wait at once; beyond either limit the oldest are
 written as `<unknown>`. If the tracer stops reading
