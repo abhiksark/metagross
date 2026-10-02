@@ -4,6 +4,13 @@ User-visible changes to Metagross. Versions follow `metagross.__version__`.
 
 ## Unreleased
 
+- Fix: a call is no longer attributed to a stale function when the tracer is
+  behind the script or profile records were dropped. It waits until the
+  profile stream has been read past it, and is written as `<unknown>` if that
+  does not happen within five seconds.
+- New summary field `capture.refused_attributions` (`refused=` in `--stats`):
+  calls left `<unknown>` because the tracer lacked their profile history. A
+  nonzero count marks the capture incomplete.
 - Fix: a mapped file with a name that is not valid UTF-8 no longer makes
   the tracer fail and kill the script, and the wrong-`libcuda` warning no
   longer prints control characters from the library path.

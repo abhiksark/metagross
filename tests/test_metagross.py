@@ -265,6 +265,17 @@ class CaptureStatsTest(unittest.TestCase):
         self.assertFalse(snapshot["complete"])
         self.assertEqual(snapshot["capture"]["lost_profile_records"], 3)
 
+    def test_refused_attributions_make_the_capture_incomplete(self):
+        snapshot = _events.CaptureStats().snapshot(
+            lost_events=0,
+            dropped_nested_calls=0,
+            observed_outstanding_bytes=0,
+            render_failed=False,
+            refused_attributions=2,
+        )
+        self.assertFalse(snapshot["complete"])
+        self.assertEqual(snapshot["capture"]["refused_attributions"], 2)
+
     def test_lost_profile_records_defaults_to_zero_and_stays_complete(self):
         stats = _events.CaptureStats()
         snapshot = stats.snapshot(
@@ -1537,6 +1548,21 @@ class ProfileDropTest(unittest.TestCase):
         self.assertEqual(writer.dropped, 1)               # the CALL dropped
         self.assertIn(_profile.FRAME_DEF, seen)            # the DEF survived
 
+    def test_each_dropped_record_is_added_to_the_drop_counter(self):
+        def full_pipe(fd, data):
+            raise BlockingIOError()
+
+        drops_fd = os.eventfd(0, os.EFD_NONBLOCK)
+        self.addCleanup(os.close, drops_fd)
+        clock = iter([0.0, 5.0]).__next__  # the bounded wait times out at once
+        writer = _profile._DropCountWriter(
+            7, os_write=full_pipe, clock=clock, drops_fd=drops_fd)
+        emitter = _profile._FrameEmitter(writer.write)
+        emitter.span(1, 10, "step")                              # ordinary
+        emitter.emit(_profile.CALL, 1, 20, "f", "/p/a.py", 1)    # its FRAME_DEF
+        self.assertEqual(writer.dropped, 2)
+        self.assertEqual(os.eventfd_read(drops_fd), 2)
+
     def test_hook_replaced_is_never_dropped(self):
         attempts = []
 
@@ -1691,6 +1717,67 @@ class ProfileReaderTest(unittest.TestCase):
         self.assertIn(("gap", None), out)
         os.close(w)
         os.close(r)
+
+    def _poll_until(self, reader, done):
+        out = []
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            out.extend(reader.poll())
+            if done(out):
+                return out
+            time.sleep(0.005)
+        self.fail(f"poll never reached the expected state: {out}")
+
+    def test_drained_instant_follows_an_empty_stream_only(self):
+        r, w = os.pipe()
+        self.addCleanup(os.close, r)
+        self.addCleanup(os.close, w)
+        reader = _profile.ProfileReader(r)
+        before_ns = time.monotonic_ns()
+        # Not started: the bytes stay in the pipe, so nothing is drained.
+        os.write(w, _profile.encode_hello(pid=1, start_ns=0))
+        self.assertEqual(reader.poll(), [])
+        self.assertEqual(reader.drained_ns, 0)
+        reader.start()
+        os.write(w, _profile.encode_frame(_profile.CALL, 7, 100, "run", "/p/a.py", 3))
+        self._poll_until(reader, lambda out: any(r[0] == "frame" for r in out))
+        self._poll_until(reader, lambda out: reader.drained_ns >= before_ns)
+
+    def test_drop_with_no_later_record_is_reported_once_the_stream_is_empty(self):
+        # The last records of a burst were dropped and the target then stays
+        # inside library code: no later record shows the hole.
+        r, w = os.pipe()
+        self.addCleanup(os.close, r)
+        self.addCleanup(os.close, w)
+        drops_fd = os.eventfd(0, os.EFD_NONBLOCK)
+        self.addCleanup(os.close, drops_fd)
+        reader = _profile.ProfileReader(r, drops_fd=drops_fd)
+        reader.start()
+        os.write(w, _profile.encode_hello(pid=1, start_ns=0))
+        os.write(w, _profile.encode_frame(_profile.CALL, 7, 100, "run", "/p/a.py", 3))
+        self._poll_until(reader, lambda out: any(r[0] == "frame" for r in out))
+        self.assertNotIn(("gap", None), reader.poll())
+        os.eventfd_write(drops_fd, 2)
+        self.assertEqual(reader.poll(), [("gap", None)])
+        self.assertEqual(reader.poll(), [])  # reported once
+
+    def test_drop_a_later_record_revealed_is_not_reported_again(self):
+        r, w = os.pipe()
+        self.addCleanup(os.close, r)
+        self.addCleanup(os.close, w)
+        drops_fd = os.eventfd(0, os.EFD_NONBLOCK)
+        self.addCleanup(os.close, drops_fd)
+        reader = _profile.ProfileReader(r, drops_fd=drops_fd)
+        reader.start()
+        os.write(w, _profile.encode_hello(pid=1, start_ns=0))
+        os.write(w, _profile.encode_frame(_profile.CALL, 7, 100, "run", "/p/a.py", 3))
+        _profile._next_seq()  # one dropped record
+        os.eventfd_write(drops_fd, 1)
+        os.write(w, _profile._encode_frame_ref(_profile.RETURN, 7, 200, 0))
+        out = self._poll_until(
+            reader, lambda out: sum(r[0] == "frame" for r in out) == 2)
+        out.extend(reader.poll())
+        self.assertEqual([r for r in out if r[0] == "gap"], [("gap", 200)])
 
     def test_backlog_is_bounded_when_the_controller_falls_behind(self):
         r, w = os.pipe()
@@ -2356,6 +2443,16 @@ class AttributionTest(unittest.TestCase):
                          _events.FrameInfo("main", "/p/m.py", 1))
 
 
+    def test_a_query_below_the_horizon_is_counted_as_refused(self):
+        tl = _events.FrameTimeline()
+        tl.on_record(0, 1, 10, "f", "/p/a.py", 1)
+        self.assertIsNone(tl.attribute(2, 50))   # a thread with no frames
+        self.assertEqual(tl.refused, 0)
+        tl.on_gap(100)
+        self.assertIsNone(tl.attribute(1, 50))   # its history was dropped
+        self.assertEqual(tl.refused, 1)
+
+
 class GapHandlingTest(unittest.TestCase):
     def setUp(self):
         _profile._reset_seq()
@@ -2567,6 +2664,115 @@ class JoinerTest(unittest.TestCase):
         joiner.on_gpu_event(_raw(1, ts=15 * ms, dur=1 * ms, tid=1))
         (event,) = joiner.flush(170 * ms, delivered_until_ns=160 * ms)
         self.assertEqual(event.frame.function, "train_step")
+
+    def test_call_inside_a_profile_hole_waits_and_is_not_guessed(self):
+        # train_epoch returns and evaluate is entered, but both records are
+        # dropped on a full pipe. evaluate then launches a kernel. The hole
+        # shows only when the next record gets through.
+        ms = 1_000_000
+        _profile._reset_seq()
+        reader = _profile.RecordReader()
+        joiner = _events.Joiner()
+
+        def feed(data):
+            for rec in reader.feed(data):
+                joiner.on_profile_record(rec)
+
+        feed(_profile.encode_hello(pid=1, start_ns=0))
+        feed(_profile._encode_frame_def(0, "train_epoch", "/p/train.py", 1))
+        feed(_profile._encode_frame_def(1, "evaluate", "/p/train.py", 9))
+        feed(_profile._encode_frame_ref(_profile.CALL, 1, 10 * ms, 0))
+        _profile._encode_frame_ref(_profile.RETURN, 1, 11 * ms, 0)   # dropped
+        _profile._encode_frame_ref(_profile.CALL, 1, 12 * ms, 1)     # dropped
+        joiner.on_gpu_event(_raw(1, ts=13 * ms, dur=1 * ms, tid=1))
+        # The pipe is still full, so the stream has not been read past the
+        # call: releasing now would name train_epoch.
+        self.assertEqual(
+            joiner.flush(120 * ms, profile_drained_ns=5 * ms), [])
+        feed(_profile._encode_frame_ref(_profile.RETURN, 1, 170 * ms, 1))
+        (event,) = joiner.flush(180 * ms, profile_drained_ns=5 * ms)
+        self.assertIsNone(event.frame)
+        self.assertEqual(reader.lost_records, 2)
+        self.assertEqual(joiner.refused_attributions, 1)
+
+    def test_long_call_waits_for_the_profile_stream_too(self):
+        # A call longer than the hold window is delivered with its hold
+        # already spent. It still waits for the stream to reach its entry.
+        ms = 1_000_000
+        joiner = _events.Joiner()
+        joiner.on_profile_record(
+            ("frame", _profile.CALL, 1, 10 * ms, "load_batch", "/p/a.py", 1))
+        joiner.on_gpu_event(_raw(15, ts=20 * ms, dur=300 * ms, tid=1))
+        self.assertEqual(
+            joiner.flush(321 * ms, profile_drained_ns=15 * ms), [])
+        joiner.on_profile_record(("gap", 322 * ms))
+        (event,) = joiner.flush(323 * ms, profile_drained_ns=15 * ms)
+        self.assertIsNone(event.frame)
+
+    def test_call_from_a_quiet_script_is_released_once_the_stream_is_empty(self):
+        # Library code makes the calls and writes no profile records. An
+        # empty stream after the call's entry is as good as a newer record.
+        ms = 1_000_000
+        joiner = _events.Joiner()
+        joiner.on_profile_record(
+            ("frame", _profile.CALL, 1, 10 * ms, "main", "/p/a.py", 1))
+        joiner.on_gpu_event(_raw(1, ts=500 * ms, dur=1 * ms, tid=1))
+        (event,) = joiner.flush(700 * ms, profile_drained_ns=650 * ms)
+        self.assertEqual(event.frame.function, "main")
+        self.assertEqual(joiner.refused_attributions, 0)
+
+    def test_call_the_profile_stream_never_reaches_is_released_unknown(self):
+        ms = 1_000_000
+        joiner = _events.Joiner()
+        joiner.on_profile_record(
+            ("frame", _profile.CALL, 1, 10 * ms, "main", "/p/a.py", 1))
+        joiner.on_gpu_event(_raw(1, ts=500 * ms, dur=1 * ms, tid=1))
+        self.assertEqual(
+            joiner.flush(5400 * ms, profile_drained_ns=20 * ms), [])
+        (event,) = joiner.flush(5600 * ms, profile_drained_ns=20 * ms)
+        self.assertIsNone(event.frame)
+        self.assertEqual(joiner.refused_attributions, 1)
+
+    def test_waiting_calls_are_bounded_in_number(self):
+        # A target that keeps the profile stream behind must not make the
+        # tracer hold calls without limit. The oldest are given up first.
+        joiner = _events.Joiner(max_pending=2)
+        for ts in (100, 200, 300):
+            joiner.on_gpu_event(_raw(16, ts=ts, dur=1, tid=1))
+        (event,) = joiner.flush(400, profile_drained_ns=50)
+        self.assertEqual(event.raw.ts, 100)
+        self.assertIsNone(event.frame)
+        self.assertEqual(len(joiner._pending), 2)
+        self.assertEqual(joiner.refused_attributions, 1)
+
+    def test_call_held_for_the_profile_stream_keeps_its_history(self):
+        # Ticks pass while the call waits; pruning must not put the frame it
+        # was made from out of reach.
+        ms = 1_000_000
+        joiner = _events.Joiner()
+        joiner.on_profile_record(
+            ("frame", _profile.CALL, 1, 10 * ms, "outer", "/p/a.py", 1))
+        joiner.on_profile_record(
+            ("frame", _profile.CALL, 1, 20 * ms, "inner", "/p/a.py", 5))
+        joiner.on_gpu_event(_raw(1, ts=30 * ms, dur=1 * ms, tid=1))
+        for now in (200, 400, 600):
+            self.assertEqual(
+                joiner.flush(now * ms, profile_drained_ns=25 * ms), [])
+        joiner.on_profile_record(
+            ("frame", _profile.RETURN, 1, 610 * ms, "inner", "/p/a.py", 5))
+        (event,) = joiner.flush(620 * ms, profile_drained_ns=25 * ms)
+        self.assertEqual(event.frame.function, "inner")
+        self.assertEqual(joiner.refused_attributions, 0)
+
+    def test_gap_reaches_past_every_record_already_seen(self):
+        # Another thread read the clock, lost the processor, and wrote the
+        # record that reveals the hole with a timestamp older than a CALL
+        # written before the hole. That CALL must not survive the gap.
+        joiner = _events.Joiner(hold_ns=100)
+        joiner.on_profile_record(("frame", _profile.CALL, 1, 500, "helper", "/p/a.py", 1))
+        joiner.on_profile_record(("gap", 400))
+        joiner.on_profile_record(("frame", _profile.CALL, 2, 400, "other", "/p/a.py", 9))
+        self.assertIsNone(joiner.timeline.attribute(1, 600))
 
     def test_flush_still_prunes_history_older_than_the_hold_window(self):
         j = _events.Joiner(hold_ns=100)

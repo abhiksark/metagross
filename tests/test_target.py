@@ -31,6 +31,8 @@ class TargetExecutionTest(unittest.TestCase):
         profile = tempfile.TemporaryFile()
         self.addCleanup(profile.close)
         barrier_r, barrier_w = os.pipe()
+        drops_fd = os.eventfd(0, os.EFD_NONBLOCK)
+        self.addCleanup(os.close, drops_fd)
         code = (
             "import os, sys, atexit, builtins\n"
             "from metagross import _child_main\n"
@@ -39,7 +41,7 @@ class TargetExecutionTest(unittest.TestCase):
             "creds = None\n"
             + setup
             + f"_child_main({self.script!r}, {list(args)!r}, creds, "
-            f"{barrier_r}, {profile.fileno()}, {self.directory!r}, "
+            f"{barrier_r}, {profile.fileno()}, {drops_fd}, {self.directory!r}, "
             f"{attribution!r})\n"
         )
         try:
@@ -48,7 +50,7 @@ class TargetExecutionTest(unittest.TestCase):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                pass_fds=(barrier_r, profile.fileno()),
+                pass_fds=(barrier_r, profile.fileno(), drops_fd),
                 env=env,
             )
         finally:
@@ -222,16 +224,18 @@ class TargetExecutionTest(unittest.TestCase):
         stdout, stderr = proc.communicate(timeout=10)
         self.assertEqual((proc.returncode, stdout, stderr), (0, "released\n", ""))
 
-    def test_profile_descriptor_does_not_reach_exec_descendants(self):
+    def test_trace_descriptors_do_not_reach_exec_descendants(self):
+        # The target holds the profile pipe and the drop counter, nothing else.
         source = (
             "import os, subprocess, sys\n"
             "fds = [int(fd) for fd in os.listdir('/proc/self/fd') "
             "if int(fd) > 2 and os.path.exists('/proc/self/fd/' + fd)]\n"
-            "assert len(fds) == 1, fds\n"
-            "assert not os.get_inheritable(fds[0])\n"
-            "check = 'import os; assert not os.path.exists(' "
-            "+ repr('/proc/self/fd/' + str(fds[0])) + ')'\n"
-            "subprocess.run([sys.executable, '-c', check], "
+            "assert len(fds) == 2, fds\n"
+            "for fd in fds:\n"
+            "    assert not os.get_inheritable(fd)\n"
+            "    check = 'import os; assert not os.path.exists(' "
+            "+ repr('/proc/self/fd/' + str(fd)) + ')'\n"
+            "    subprocess.run([sys.executable, '-c', check], "
             "close_fds=False, check=True)\n"
             "print('closed')\n"
         )

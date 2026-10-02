@@ -477,7 +477,8 @@ def _libcuda_mismatch_warning(mapped: set[str], lib_path: str) -> str | None:
 
 
 def _child_main(
-    script, script_args, creds, barrier_r, profile_w, project_root, python_attribution
+    script, script_args, creds, barrier_r, profile_w, drops_fd, project_root,
+    python_attribution
 ) -> NoReturn:
     """Drop credentials, await attachment, and exec the target interpreter."""
     os.environ.pop("METAGROSS_DASHBOARD_TOKEN", None)
@@ -497,15 +498,18 @@ def _child_main(
         f"import sys; sys.path.insert(0, {package_root!r}); "
         "from metagross._target import main; del sys.path[0]; main()"
     )
-    # Only this exec inherits the profile pipe. The runner restores CLOEXEC
-    # before running target code so target descendants cannot retain it.
+    # Only this exec inherits the profile pipe and the drop counter. The
+    # runner restores CLOEXEC before running target code so target
+    # descendants cannot retain them.
     os.set_inheritable(profile_w, True)
+    os.set_inheritable(drops_fd, True)
     interpreter_args = subprocess._args_from_interpreter_flags()
     # The stdlib helper omits -u; preserve effective stream buffering too.
     if getattr(sys.stdout, "write_through", False):
         interpreter_args.append("-u")
     os.execv(sys.executable, [
-        sys.executable, *interpreter_args, "-c", bootstrap, str(profile_w), project_root,
+        sys.executable, *interpreter_args, "-c", bootstrap, str(profile_w),
+        str(drops_fd), project_root,
         "1" if python_attribution else "0", script, *script_args,
     ])
 
@@ -701,6 +705,9 @@ def _trace(cfg, creds, uid, gid, dashboard_port, dashboard_token) -> int:
     # barrier (parent -> child).
     profile_r, profile_w = os.pipe()
     barrier_r, barrier_w = os.pipe()
+    # The target adds to this counter for every profile record it drops; a
+    # dropped record is otherwise invisible until a later one arrives.
+    drops_fd = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
     for fd in (profile_r, profile_w, barrier_r, barrier_w):
         os.set_inheritable(fd, False)
     # Raise the profile pipe's capacity beyond the default 64KiB to
@@ -723,6 +730,7 @@ def _trace(cfg, creds, uid, gid, dashboard_port, dashboard_token) -> int:
                 creds,
                 barrier_r,
                 profile_w,
+                drops_fd,
                 cfg.project_root,
                 cfg.python_attribution,
             )
@@ -745,7 +753,7 @@ def _trace(cfg, creds, uid, gid, dashboard_port, dashboard_token) -> int:
             os.waitpid(pid, 0)
         except (ChildProcessError, OSError):
             pass
-        for fd in (barrier_w, profile_r):
+        for fd in (barrier_w, profile_r, drops_fd):
             try:
                 os.close(fd)
             except OSError:
@@ -871,7 +879,7 @@ def _trace(cfg, creds, uid, gid, dashboard_port, dashboard_token) -> int:
         b["events"].open_ring_buffer(_on_ring_event)
         # Pre-barrier: dup profile_r into a private fd the reader thread owns.
         # A failed os.dup() still runs _cleanup_before_release() below.
-        profile_reader = _profile.ProfileReader(profile_r)
+        profile_reader = _profile.ProfileReader(profile_r, drops_fd=drops_fd)
     except BaseException as exc:
         _cleanup_before_release()
         if isinstance(exc, KeyboardInterrupt):
@@ -925,12 +933,14 @@ def _trace(cfg, creds, uid, gid, dashboard_port, dashboard_token) -> int:
                     # Every call that returned before this instant is handed
                     # over by the poll below. The profile drain after it can
                     # take long, so history is pruned relative to this time.
-                    drained_ns = time.monotonic_ns()
+                    ring_drained_ns = time.monotonic_ns()
                     b.ring_buffer_poll(50)
                     for rec in profile_reader.poll():
                         joiner.on_profile_record(rec)
-                    _emit_all(joiner.flush(time.monotonic_ns(),
-                                           delivered_until_ns=drained_ns))
+                    _emit_all(joiner.flush(
+                        time.monotonic_ns(),
+                        delivered_until_ns=ring_drained_ns,
+                        profile_drained_ns=profile_reader.drained_ns))
                     if (libcuda_check_due is not None
                             and time.monotonic() >= libcuda_check_due):
                         mapped = _bpf.loaded_libcuda(pid)
@@ -1002,6 +1012,11 @@ def _trace(cfg, creds, uid, gid, dashboard_port, dashboard_token) -> int:
         if overrun > 0:
             print(f"metagross: lost {overrun} profile records (writer overrun)",
                   file=sys.stderr)
+        refused = joiner.refused_attributions
+        if refused:
+            print(f"metagross: left {refused} calls unattributed because "
+                  "the profile history for them was missing or late",
+                  file=sys.stderr)
     except Exception as exc:
         trace_failed = True
         # Any unexpected failure here must not lose the target's exit
@@ -1011,6 +1026,7 @@ def _trace(cfg, creds, uid, gid, dashboard_port, dashboard_token) -> int:
         print(f"metagross: {exc}", file=sys.stderr)
     finally:
         os.close(profile_r)
+        os.close(drops_fd)
         b.cleanup()
         if stream is not sys.stderr:
             try:
@@ -1031,6 +1047,7 @@ def _trace(cfg, creds, uid, gid, dashboard_port, dashboard_token) -> int:
             render_failed=render_broken,
             trace_failed=trace_failed,
             lost_profile_records=lost_profile,
+            refused_attributions=joiner.refused_attributions,
         )
         selected_families = (
             _TRACE_FAMILIES if cfg.trace_families is None else cfg.trace_families
@@ -1057,6 +1074,7 @@ def _trace(cfg, creds, uid, gid, dashboard_port, dashboard_token) -> int:
                 f"lost={capture['lost_events']} "
                 f"dropped={capture['dropped_nested_calls']} "
                 f"lost_profile={capture['lost_profile_records']} "
+                f"refused={capture['refused_attributions']} "
                 f"complete={str(summary['complete']).lower()}",
                 file=sys.stderr,
             )

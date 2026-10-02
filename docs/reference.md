@@ -143,9 +143,14 @@ with the low-level `_thread` module are not profiled, so their calls are
 The target remains behind a pipe barrier until every uprobe and uretprobe
 pair is attached for its exact process ID. API calls that occur before any
 project frame is active are attributed as unknown rather than suppressed.
-Events are held for 100 ms to tolerate cross-CPU and cross-stream delivery
-ordering. Long API calls appear after they complete, attributed to the frame
-that made them.
+A call is written once it is at least 100 ms old and Metagross has read the
+profile stream past the call's entry: a newer profile record has arrived, or
+the stream was empty afterwards. Until then a record may still be on its way,
+and the frame seen so far would be a guess. If the stream has still not reached
+the call five seconds after it began, the call is written as `<unknown>` and
+counted in `refused_attributions`. Long API calls appear after they complete,
+attributed to the frame that made them, so rows are not in strict timestamp
+order; sort by `timestamp` if the order matters.
 
 ### Op spans
 
@@ -237,7 +242,7 @@ treat saved JSONL files accordingly.
 table or JSONL event output:
 
 ```text
-metagross: stats events=541 attributed=276 unknown=265 errors=0 lost=0 dropped=0 lost_profile=0 complete=true
+metagross: stats events=541 attributed=276 unknown=265 errors=0 lost=0 dropped=0 lost_profile=0 refused=0 complete=true
 ```
 
 `--summary-output FILE` writes a separate, versioned JSON document with capture
@@ -257,10 +262,15 @@ Summary schema version 1 has top-level `schema_version`, `complete`, `capture`,
 `top_spans`, `configuration`, and `target` fields. `complete` is false if BPF
 events were lost, nested calls were dropped, profile records were lost, the
 target replaced the profiling hook, the script ended without a normal
-interpreter exit, event rendering failed, or the tracing loop failed.
+interpreter exit, Metagross left calls unattributed because it lacked their
+profile history, event rendering failed, or the tracing loop failed.
 `lost_profile_records` counts one for each hook replacement and one for a
-profile stream that stopped before the script's normal exit. Unknown Python
-attribution does not by itself make capture incomplete. Allocation and byte totals describe
+profile stream that stopped before the script's normal exit.
+`refused_attributions` counts calls written as `<unknown>` although their
+thread may have been inside a project function: the profile history for that
+moment had been lost, or had not arrived within five seconds.
+Unknown attribution for any other reason, such as a call from a thread with no
+project frame, does not make capture incomplete. Allocation and byte totals describe
 successfully observed driver calls, not physical GPU usage or
 framework-level tensor allocations.
 
@@ -268,7 +278,7 @@ Summary nested fields are:
 
 | Object | Fields |
 |--------|--------|
-| `capture` | `events`, `attributed`, `unknown_attribution`, `cuda_errors`, `lost_events`, `dropped_nested_calls`, `render_failed`, `trace_failed`, `lost_profile_records` |
+| `capture` | `events`, `attributed`, `unknown_attribution`, `cuda_errors`, `lost_events`, `dropped_nested_calls`, `render_failed`, `trace_failed`, `lost_profile_records`, `refused_attributions` |
 | `timing` | `total_api_duration_ns`, `synchronization_duration_ns` |
 | `memory` | `successful_allocation_bytes`, `observed_peak_bytes`, `observed_outstanding_bytes` |
 | `copies` | `successful_bytes_by_api`, mapping normalized API names to byte counts |
@@ -524,6 +534,12 @@ keeping only the innermost call. Such events are counted but not duplicated.
 drain and render them can overflow the BPF ring buffer. Metagross prints a lost
 event warning; a trace with that warning is incomplete.
 
+**High Python call rates**: A script that calls project functions faster than
+Metagross reads the records, several hundred thousand calls per second on one
+desktop machine, fills the profile pipe. The script then drops records instead
+of waiting. Metagross forgets the frames it knew at that point, so calls near
+the loss are `<unknown>`, never a stale frame, and the capture is incomplete.
+
 The Docker example includes a repeatable bare/full/no-attribution/launch-only
 [overhead comparison](../examples/docker/README.md#benchmark-tracing-overhead).
 
@@ -714,7 +730,10 @@ frames are kept, and unread profile data is capped at 16 MiB, after which the
 target drops and counts records. Calls to frames beyond that count are counted
 as lost profile records, which marks the capture incomplete. On every loop
 tick, whether or not the GPU is active, frame history older than 100 ms before
-the last ring buffer drain is discarded. If the tracer stops reading
+the last ring buffer drain and the oldest call still waiting is discarded.
+A call waits at most five seconds for its profile history, and at
+most 200,000 calls wait at once; beyond either limit the oldest are
+written as `<unknown>`. If the tracer stops reading
 altogether, the script waits at most one second for it, then carries on and
 drops profile records until the tracer reads again; the capture is marked
 incomplete.

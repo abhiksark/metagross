@@ -6,6 +6,7 @@ import atexit
 import contextvars
 import os
 import queue
+import select
 import struct
 import sys
 import threading
@@ -193,14 +194,28 @@ class _DropCountWriter:
 
     `write` returns False when the record did not go out, so the emitter can
     skip a reference to a frame whose definition was dropped.
+
+    The reader finds a dropped record only when a later one arrives, and a
+    target that then stays inside library code writes none. Each drop is
+    therefore also added to `drops_fd`, an eventfd the controller reads.
     """
 
-    def __init__(self, fd: int, os_write=os.write, clock=time.monotonic):
+    def __init__(self, fd: int, os_write=os.write, clock=time.monotonic,
+                 drops_fd: int | None = None):
         self._fd = fd
         self._os_write = os_write
         self._clock = clock
         self._stalled = False
+        self._drops_fd = drops_fd
         self.dropped = 0
+
+    def _count_drop(self) -> None:
+        self.dropped += 1
+        if self._drops_fd is not None:
+            try:
+                os.eventfd_write(self._drops_fd, 1)
+            except OSError:
+                pass  # a broken trace channel must never kill the target
 
     def write(self, data: bytes) -> bool:
         # Every record is well under PIPE_BUF (the largest, a FRAME_DEF,
@@ -212,7 +227,7 @@ class _DropCountWriter:
         try:
             self._os_write(self._fd, data)
         except BlockingIOError:
-            self.dropped += 1
+            self._count_drop()
             return False
         except OSError:
             pass  # broken trace pipe must never kill the target
@@ -229,7 +244,7 @@ class _DropCountWriter:
                     # The reader learns of this from the seq hole a later
                     # record shows, or from the stream ending without END.
                     self._stalled = True
-                    self.dropped += 1
+                    self._count_drop()
                     return False
                 # Pipe momentarily full: retry until it drains. This runs
                 # under `_FrameEmitter`'s lock, so yield the GIL between
@@ -293,6 +308,9 @@ class RecordReader:
         # testing the writer in isolation, because the child cannot
         # reliably flush a final count once its pipe is overrunning.
         self.lost_records = 0
+        # The part of `lost_records` that seq holes showed: records the
+        # writer dropped and a later record revealed.
+        self.revealed_drops = 0
         self.hook_replacements = 0
         # Records dropped after the last one that arrived leave no seq hole
         # to find. The target writes END when it exits normally, so a stream
@@ -436,7 +454,9 @@ class RecordReader:
         mismatch = self._expected is None or seq != self._expected
         if mismatch:
             if self._expected is not None:
-                self.lost_records += (seq - self._expected) % _SEQ_MOD
+                missing = (seq - self._expected) % _SEQ_MOD
+                self.lost_records += missing
+                self.revealed_drops += missing
             self._pending_gap = True
         if self._pending_gap and ts_ns is not None:
             out.append(("gap", ts_ns))
@@ -482,7 +502,8 @@ class ProfileReader:
     and counts records instead of growing this process without limit.
     """
 
-    def __init__(self, fd: int, max_chunks: int = _MAX_QUEUED_CHUNKS):
+    def __init__(self, fd: int, max_chunks: int = _MAX_QUEUED_CHUNKS,
+                 drops_fd: int | None = None):
         # Own a PRIVATE dup of the read end. The main thread may close the
         # original profile_r (e.g. _cleanup_before_release); closing an fd
         # under a blocked os.read is undefined, and the number could be
@@ -490,11 +511,20 @@ class ProfileReader:
         # sees EOF when the child closes the write end, and the reader thread
         # closes only its own dup.
         self._fd = os.dup(fd)
+        self._pipe_fd = fd  # the caller's; only ever checked for emptiness
+        self._drops_fd = drops_fd
         self._q: queue.Queue = queue.Queue(maxsize=max_chunks)
         self._reader = RecordReader()
         self._thread = threading.Thread(target=self._run, name="metagross-profile",
                                         daemon=True)
+        self._busy = False  # the thread holds bytes that are not queued yet
+        self._dropped = 0   # records the target reports it dropped
+        self._announced_drops = 0
         self.at_eof = False
+        # The latest instant at which the stream was seen empty: every record
+        # the target wrote before it has been returned by `poll`, and every
+        # record it dropped before it has been reported as a gap.
+        self.drained_ns = 0
 
     def start(self) -> None:
         self._thread.start()
@@ -502,8 +532,14 @@ class ProfileReader:
     def _run(self) -> None:
         try:
             while True:
-                data = os.read(self._fd, 65536)  # blocking
+                # Wait without taking the bytes, and raise the flag before
+                # taking them, so `_stream_is_empty` never finds the pipe
+                # empty while a chunk is on its way to the queue.
+                select.select([self._fd], [], [])
+                self._busy = True
+                data = os.read(self._fd, 65536)
                 self._q.put(data)
+                self._busy = False
                 if not data:
                     break  # EOF: write end closed
         except OSError:
@@ -564,7 +600,44 @@ class ProfileReader:
             # a chunk boundary gets ("gap", now) for one flush), but only
             # under overrun, and never a guessed frame either way.
             out.extend(self._reader.finalize())
+        drained_ns = time.monotonic_ns()
+        if self.at_eof or self._stream_is_empty():
+            if self._has_hidden_drops():
+                out.append(("gap", None))
+            self.drained_ns = drained_ns
         return out
+
+    def _stream_is_empty(self) -> bool:
+        """Return whether no written byte is still on its way to `poll`.
+
+        The order matters: pipe, then the thread's flag, then the queue. Bytes
+        the thread took from the pipe are behind the flag until they are in
+        the queue, and only `poll` empties the queue.
+        """
+        try:
+            readable, _, _ = select.select([self._pipe_fd], [], [], 0)
+        except (OSError, ValueError):
+            return False
+        return not readable and not self._busy and self._q.empty()
+
+    def _has_hidden_drops(self) -> bool:
+        """Return whether the target dropped records no later one revealed.
+
+        Only meaningful while the stream is empty. A thread reports its own
+        drops before it makes another call, so the count covers every record
+        that could have changed the stack a delivered call was made from.
+        """
+        if self._drops_fd is None:
+            return False
+        try:
+            self._dropped += os.eventfd_read(self._drops_fd)
+        except OSError:
+            pass  # no drops since the last read
+        known = max(self._reader.revealed_drops, self._announced_drops)
+        if self._dropped <= known:
+            return False
+        self._announced_drops = self._dropped
+        return True
 
     def drain_to_eof(self, deadline: float) -> list:
         out = []
@@ -696,7 +769,8 @@ def report_span() -> None:
         emitter.span(threading.get_native_id(), time.monotonic_ns(), name)
 
 
-def install(write_fd: int, project_root: str) -> None:
+def install(write_fd: int, project_root: str,
+            drops_fd: int | None = None) -> None:
     global _current_emitter, _spans_used
     _spans_used = False
     local = threading.local()
@@ -711,7 +785,7 @@ def install(write_fd: int, project_root: str) -> None:
     # an EAGAIN on HELLO itself would desync the reader's very first
     # expected seq before anything downstream can recover from it.
     os.set_blocking(write_fd, False)
-    writer = _DropCountWriter(write_fd)
+    writer = _DropCountWriter(write_fd, drops_fd=drops_fd)
     emitter = _FrameEmitter(writer.write)
     _current_emitter = emitter
 
@@ -775,10 +849,13 @@ def install(write_fd: int, project_root: str) -> None:
         # AGENTS.md: be conservative with inherited file descriptors. A
         # long-lived non-exec worker holding the write end open would
         # otherwise delay the parent's EOF until the final-drain deadline.
-        try:
-            os.close(write_fd)
-        except OSError:
-            pass
+        for fd in (write_fd, drops_fd):
+            if fd is None:
+                continue
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
     os.register_at_fork(after_in_child=_disable_in_forked_child)
 

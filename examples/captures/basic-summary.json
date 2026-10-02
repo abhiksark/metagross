@@ -64,6 +64,7 @@
     "events": 17,
     "lost_events": 0,
     "lost_profile_records": 0,
+    "refused_attributions": 0,
     "render_failed": false,
     "trace_failed": false,
     "unknown_attribution": 0

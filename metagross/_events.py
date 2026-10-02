@@ -5,6 +5,8 @@ from __future__ import annotations
 import bisect
 import dataclasses
 import datetime
+import heapq
+import itertools
 import json as _json
 import os
 import shlex
@@ -77,6 +79,9 @@ class FrameTimeline:
         self._logs: dict[int, list[tuple]] = {}
         self._states: dict[int, _ReplayState] = {}
         self._horizons: dict[int, int] = {}
+        # Queries refused because the history for that instant is gone. The
+        # thread may well have been inside a project function.
+        self.refused = 0
 
     @staticmethod
     def _apply(stack: list[FrameInfo], record: tuple) -> None:
@@ -102,12 +107,13 @@ class FrameTimeline:
             self._states[tid] = _ReplayState()
 
     def attribute(self, tid: int, ts_ns: int):
+        horizon = self._horizons.get(tid)
+        if horizon is not None and ts_ns < horizon:
+            self.refused += 1
+            return None  # history below the prune horizon is gone; do not guess
         log = self._logs.get(tid)
         if not log:
             return None
-        horizon = self._horizons.get(tid)
-        if horizon is not None and ts_ns < horizon:
-            return None  # history below the prune horizon is gone; do not guess
         state = self._states.setdefault(tid, _ReplayState())
         if ts_ns < state.last_ts_ns:
             # GPU delivery can rarely exceed the hold window. Answer an older
@@ -239,13 +245,31 @@ class EnrichedEvent:
 
 
 class Joiner:
-    def __init__(self, hold_ns: int = 100_000_000):
+    def __init__(self, hold_ns: int = 100_000_000,
+                 max_wait_ns: int = 5_000_000_000,
+                 max_pending: int = 200_000):
         self.hold_ns = hold_ns
+        # Unread profile data is capped, so a busy tracer is a few seconds
+        # behind at most. A call that waits longer than this, or behind this
+        # many others, is given up on; the target must not be able to make
+        # the tracer hold calls without limit.
+        self.max_wait_ns = max_wait_ns
+        self.max_pending = max_pending
         self.timeline = FrameTimeline()
         self.spans = OpSpanTimeline()
         self.registry = KernelRegistry()
         self.allocs = AllocTracker()
+        # A heap ordered by entry time, so a flush touches only the calls it
+        # releases however many are waiting.
         self._pending: list = []
+        self._arrivals = itertools.count()  # orders calls with equal times
+        self._newest_profile_ns = 0  # newest timestamp in the profile stream
+        self._waited_out = 0
+
+    @property
+    def refused_attributions(self) -> int:
+        """Calls left unknown because the tracer lacked their history."""
+        return self.timeline.refused + self._waited_out
 
     def on_gpu_event(self, raw) -> None:
         api = _bpf.API_BY_ID.get(raw.api_id)
@@ -258,7 +282,8 @@ class Joiner:
         if api.category in ("launch", "launch_ex"):
             handle = raw.args[0] if api.category == "launch" else raw.args[1]
             kernel = self.registry.name(handle)
-        self._pending.append((raw.ts, raw, api, kernel))
+        heapq.heappush(
+            self._pending, (raw.ts, next(self._arrivals), raw, api, kernel))
 
     def on_profile_record(self, rec) -> None:
         tag = rec[0]
@@ -269,9 +294,16 @@ class Joiner:
             _, tid, ts, name = rec
             self.spans.on_span(tid, ts, name)
         elif tag == "gap":
-            gap_ts = rec[1] if rec[1] is not None else time.monotonic_ns()
-            self.timeline.on_gap(gap_ts)
-            self.spans.on_gap(gap_ts)
+            # A thread reads the clock before it takes the write lock, so the
+            # record that reveals a hole can be older than one written before
+            # the hole. Nothing already seen may survive the gap.
+            ts = max(rec[1] if rec[1] is not None else time.monotonic_ns(),
+                     self._newest_profile_ns + 1)
+            self.timeline.on_gap(ts)
+            self.spans.on_gap(ts)
+        else:
+            return
+        self._newest_profile_ns = max(self._newest_profile_ns, ts)
 
     def enrich(self, event: AttributedEvent) -> EnrichedEvent:
         kernel, details = describe(
@@ -283,41 +315,56 @@ class Joiner:
         )
 
     def flush(self, now_ns: int, force: bool = False,
-              delivered_until_ns: int | None = None):
-        """Release events held for a full window and prune old history.
+              delivered_until_ns: int | None = None,
+              profile_drained_ns: int | None = None):
+        """Release events whose calling stack is known and prune old history.
 
         `delivered_until_ns` is an instant by which every call that had
         returned has been handed to `on_gpu_event`: the time just before the
-        ring buffer was last drained. It defaults to `now_ns`.
+        ring buffer was last drained. `profile_drained_ns` is an instant at
+        which the profile stream was empty, so every record written before
+        it has been handed to `on_profile_record`. Both default to `now_ns`.
         """
-        released, kept = [], []
-        for ts, raw, api, kernel in self._pending:
-            if force or now_ns - ts >= self.hold_ns:
-                released.append((ts, raw, api, kernel))
-            else:
-                kept.append((ts, raw, api, kernel))
-        self._pending = kept
-        released.sort(key=lambda item: item[0])
+        if delivered_until_ns is None:
+            delivered_until_ns = now_ns
+        if profile_drained_ns is None:
+            profile_drained_ns = now_ns
+        # A thread writes its profile records before it enters the driver, so
+        # its stack is known once the stream has been read past that entry: a
+        # newer record has arrived, or the stream was empty after it. Until
+        # then a record may still be on its way, or missing with the hole not
+        # yet revealed, and the stack seen so far would be a guess.
+        profile_until_ns = max(self._newest_profile_ns, profile_drained_ns)
+        ready_until_ns = min(profile_until_ns, now_ns - self.hold_ns)
+        pending = self._pending
         out = []
-        for ts, raw, api, kernel in released:
+        while pending and (force or pending[0][0] <= ready_until_ns):
+            _, _, raw, api, kernel = heapq.heappop(pending)
             # The calling thread stays inside the driver for the whole call,
             # so its stack at return is its stack at entry. Query at return:
             # a long call's entry can be older than the pruned history, but
             # its return is always recent.
-            returned_ns = ts + raw.dur
+            returned_ns = raw.ts + raw.dur
             out.append(AttributedEvent(
                 raw, api, self.timeline.attribute(raw.tid, returned_ns),
                 kernel, self.spans.attribute(raw.tid, returned_ns)))
-        # Held events returned within the last hold window, and events not
-        # yet delivered returned after the ring buffer was last drained. The
-        # controller may have spent longer than a hold window since then, so
-        # history is kept back to that drain, not to now. Prune even when
-        # nothing was released, or an idle GPU lets the log grow.
-        if delivered_until_ns is None:
-            delivered_until_ns = now_ns
-        horizon = min(now_ns, delivered_until_ns) - self.hold_ns
-        self.timeline.prune(horizon)
-        self.spans.prune(horizon)
+        while pending and (now_ns - pending[0][0] >= self.max_wait_ns
+                           or len(pending) > self.max_pending):
+            # The profile stream is too far behind to wait for.
+            _, _, raw, api, kernel = heapq.heappop(pending)
+            self._waited_out += 1
+            out.append(AttributedEvent(raw, api, None, kernel))
+        # History must reach back to every call still to be attributed: the
+        # ones held here, and the ones not yet delivered, which returned
+        # after the ring buffer was last drained. The controller may have
+        # spent longer than a hold window since then, so the clock alone is
+        # not enough. Prune even when nothing was released, or an idle GPU
+        # lets the log grow.
+        horizon = min(now_ns, delivered_until_ns)
+        if pending:
+            horizon = min(horizon, pending[0][0])
+        self.timeline.prune(horizon - self.hold_ns)
+        self.spans.prune(horizon - self.hold_ns)
         return out
 
 
@@ -490,10 +537,11 @@ class CaptureStats:
     def snapshot(self, *, lost_events: int, dropped_nested_calls: int,
                  observed_outstanding_bytes: int, render_failed: bool,
                  trace_failed: bool = False,
-                 lost_profile_records: int = 0) -> dict:
+                 lost_profile_records: int = 0,
+                 refused_attributions: int = 0) -> dict:
         complete = not any((lost_events, dropped_nested_calls,
                             render_failed, trace_failed,
-                            lost_profile_records))
+                            lost_profile_records, refused_attributions))
         return {
             "schema_version": 1,
             "complete": complete,
@@ -507,6 +555,7 @@ class CaptureStats:
                 "render_failed": render_failed,
                 "trace_failed": trace_failed,
                 "lost_profile_records": lost_profile_records,
+                "refused_attributions": refused_attributions,
             },
             "timing": {
                 "total_api_duration_ns": self.total_api_duration_ns,

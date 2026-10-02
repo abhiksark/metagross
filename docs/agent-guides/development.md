@@ -62,9 +62,10 @@ predictable, and diagnosable. Favor a boring core over clever tracing magic.
   be complete, numeric where expected, and match passwd data.
 - Drop the target to the invoking sudo user when valid metadata is available.
 - Preserve `HOME`, `USER`, and `LOGNAME` for the dropped user.
-- The profile write descriptor crosses the single exec into the private runner.
-  Restore close-on-exec there before target code runs; target exec descendants
-  must not inherit it. Other controller descriptors remain close-on-exec.
+- The profile write descriptor and the drop-counter eventfd cross the single
+  exec into the private runner. Restore close-on-exec there before target code
+  runs; target exec descendants must not inherit them. Other controller
+  descriptors remain close-on-exec.
 - Maintain the startup barrier: the child must not execute target code until the
   parent has attached every required uprobe/uretprobe to the exact child PID and
   any explicitly requested dashboard has acknowledged capture start.
