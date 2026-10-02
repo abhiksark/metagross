@@ -623,7 +623,11 @@ identify async tasks or individual source lines. A C extension API call can stil
 be attributed to its nearest active project Python caller.
 
 Target exit statuses from 0 through 255 are preserved. A target signal returns
-`128 + signal`, including 130 for Ctrl-C. Metagross returns 1 for validation,
+`128 + signal`, including 130 for Ctrl-C. Metagross passes Ctrl-C and SIGTERM
+on to the script and keeps tracing until the script exits, so a script that
+handles the signal shuts down as it would untraced and the capture still ends
+with its summary. If Metagross itself is killed, the kernel sends the script
+SIGTERM, so the script does not run on unattended. Metagross returns 1 for validation,
 dependency, privilege, probe, compile, attach, transport, or cleanup
 failures, and 2 for invalid command-line syntax. A broken trace output stops
 rendering but lets the target finish and preserves its status.
@@ -667,8 +671,9 @@ controller dies.
 
 After the target exits, the dashboard keeps serving until Ctrl-C or SIGTERM,
 then Metagross returns the target's exit status. SIGTERM before the target
-exits, for example `docker stop` during a run, ends Metagross immediately
-without a final summary; use Ctrl-C to stop the target and finish the capture. Add `--output` or
+exits, for example `docker stop` during a run, is passed to the script; when
+the script exits, Metagross finishes the capture, stops the dashboard instead
+of serving on, and returns the script's status. Add `--output` or
 `--summary-output` when a durable copy is also required. In Docker, run the
 container with `--network host` so `127.0.0.1` is the host's loopback; see the
 [Docker guide](../examples/docker/README.md).

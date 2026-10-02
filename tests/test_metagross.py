@@ -4047,7 +4047,19 @@ class PrivateDashboardTest(unittest.TestCase):
         self.assertEqual(result, 3)
         start.assert_called_once_with(None, 8765)
         self.assertEqual(trace.call_args.args[4:], (1, "t" * 43))
+        self.assertEqual(trace.call_args.kwargs, {"stop_requests": []})
         serve.assert_called_once_with(fake)
+        stop.assert_called_once_with(fake)
+
+    def test_run_live_does_not_keep_serving_after_sigterm(self):
+        # `docker stop` or `timeout` asked for everything to end.
+        def trace(*_args, stop_requests):
+            stop_requests.append(signal.SIGTERM)
+            return 143
+
+        result, fake, _, _, serve, stop = self._run_live_web(trace)
+        self.assertEqual(result, 143)
+        serve.assert_not_called()
         stop.assert_called_once_with(fake)
 
     def test_run_live_stops_the_dashboard_when_tracing_fails(self):

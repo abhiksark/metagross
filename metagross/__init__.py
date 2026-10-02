@@ -468,6 +468,7 @@ def _drop_privileges(creds) -> None:
     os.environ["LOGNAME"] = creds.user
 
 
+_PR_SET_PDEATHSIG = 1
 _PR_SET_NO_NEW_PRIVS = 38
 
 
@@ -477,6 +478,20 @@ def _forbid_new_privileges() -> None:
     zero = ct.c_ulong(0)
     if libc.prctl(_PR_SET_NO_NEW_PRIVS, ct.c_ulong(1), zero, zero, zero) != 0:
         raise OSError(ct.get_errno(), "prctl(PR_SET_NO_NEW_PRIVS) failed")
+
+
+def _die_with_parent() -> None:
+    """Have the kernel send this process SIGTERM when the controller exits.
+
+    Without it, a controller that is killed leaves the script running with
+    nobody tracing it or waiting for it. A change of credentials clears the
+    setting, so this must follow the privilege drop; it survives the exec.
+    """
+    libc = ct.CDLL(None, use_errno=True)
+    zero = ct.c_ulong(0)
+    if libc.prctl(_PR_SET_PDEATHSIG, ct.c_ulong(signal.SIGTERM),
+                  zero, zero, zero) != 0:
+        raise OSError(ct.get_errno(), "prctl(PR_SET_PDEATHSIG) failed")
 
 
 def _machine() -> str:
@@ -530,7 +545,10 @@ def _child_main(
     if creds is not None:
         _drop_privileges(creds)
     _forbid_new_privileges()
+    _die_with_parent()
 
+    # A controller that died before the signal was armed is caught here: the
+    # barrier reads end-of-file.
     if os.read(barrier_r, 1) == b"":
         _exit_flushed(1)  # parent died before releasing the barrier
     os.close(barrier_r)
@@ -723,16 +741,24 @@ def run_live(cfg: Config) -> int:
     # fails before output files are truncated or the target is forked.
     port = _DEFAULT_WEB_PORT if cfg.web_port is None else cfg.web_port
     dashboard = _start_private_dashboard(creds, port)
+    stop_requests: list[int] = []
     try:
-        status = _trace(cfg, creds, uid, gid, dashboard.port, dashboard.token)
-        _serve_until_stopped(dashboard)
+        status = _trace(cfg, creds, uid, gid, dashboard.port, dashboard.token,
+                        stop_requests=stop_requests)
+        # A SIGTERM during the run asked for everything to stop.
+        if not stop_requests:
+            _serve_until_stopped(dashboard)
         return status
     finally:
         _stop_dashboard(dashboard)
 
 
-def _trace(cfg, creds, uid, gid, dashboard_port, dashboard_token) -> int:
-    """Attach probes, run the target, and return its exit status."""
+def _trace(cfg, creds, uid, gid, dashboard_port, dashboard_token,
+           stop_requests=None) -> int:
+    """Attach probes, run the target, and return its exit status.
+
+    A SIGTERM received during the run is appended to `stop_requests`.
+    """
     publisher = None
 
     # 2. Validate the target, resolve libcuda, and load bcc (lazily, since
@@ -987,6 +1013,19 @@ def _trace(cfg, creds, uid, gid, dashboard_port, dashboard_token) -> int:
     lost_profile = 0
     libcuda_mismatch = False
     libcuda_check_due = time.monotonic() + _LIBCUDA_CHECK_INTERVAL_S
+
+    def _forward_sigterm(_signum, _frame):
+        # Like Ctrl-C: the script decides how to stop, and its exit ends the
+        # capture with a final summary.
+        if stop_requests is not None:
+            stop_requests.append(signal.SIGTERM)
+        if not reaped:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+
+    previous_sigterm = signal.signal(signal.SIGTERM, _forward_sigterm)
     try:
         renderer.header()
         while True:
@@ -1090,6 +1129,7 @@ def _trace(cfg, creds, uid, gid, dashboard_port, dashboard_token) -> int:
         status = _reap_and_capture()
         print(f"metagross: {exc}", file=sys.stderr)
     finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
         os.close(profile_r)
         os.close(drops_fd)
         b.cleanup()

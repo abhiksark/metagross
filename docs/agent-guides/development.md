@@ -82,6 +82,9 @@ predictable, and diagnosable. Favor a boring core over clever tracing magic.
 - Allow the target interpreter to finalize normally. Reserve child `os._exit`
   for startup failure before exec, flushing startup diagnostics first.
 - Broken trace pipes must not kill the target.
+- Forward SIGINT and SIGTERM to the target and keep tracing until it exits.
+  The child arms `PR_SET_PDEATHSIG` after the credential drop, so a killed
+  controller does not leave the target running.
 - Pop `METAGROSS_DASHBOARD_TOKEN` before forking and defensively remove it again
   in the child before target code runs. Never put it in diagnostics, URLs,
   browser assets, API state, or response bodies.

@@ -24,6 +24,11 @@ User-visible changes to Metagross. Versions follow `metagross.__version__`.
   `--ebpf` without privileges or GPU access, no longer mistakes an option
   value ending in `.py` for the script, passes extra `docker run` options
   from `METAGROSS_DOCKER_ARGS`, and refuses to run from `/workspace`.
+- SIGTERM to Metagross during a run, for example from `docker stop` or
+  `timeout`, is passed to the script, as Ctrl-C already was. The capture ends
+  with its summary instead of being cut off, and `--web` stops serving.
+- Fix: the script no longer keeps running unattended when Metagross is
+  killed; the kernel sends it SIGTERM.
 - Breaking: table rows show durations in the unit that fits (`3.5us` instead
   of `0.00ms`), and the API column is wide enough for every traced API.
 - Fix: a browser that closes its connection no longer makes the dashboard

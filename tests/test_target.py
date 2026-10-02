@@ -101,6 +101,18 @@ class TargetExecutionTest(unittest.TestCase):
                 else:
                     self.assertEqual(records, [])
 
+    def test_target_is_signalled_when_the_controller_dies(self):
+        # PR_GET_PDEATHSIG (2) reads back what the child armed before exec.
+        source = (
+            "import ctypes\n"
+            "armed = ctypes.c_int(0)\n"
+            "ctypes.CDLL(None).prctl(2, ctypes.byref(armed), 0, 0, 0)\n"
+            "print(armed.value)\n"
+        )
+        code, stdout, stderr, _ = self._run(source)
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(int(stdout), signal.SIGTERM)
+
     def test_target_main_module_remains_available_during_shutdown(self):
         source = (
             "import atexit, threading, time\n"
