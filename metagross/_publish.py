@@ -49,6 +49,44 @@ def take_dashboard_token(environ) -> str:
     return token
 
 
+def listener_owners(port: int,
+                    tables=("/proc/net/tcp", "/proc/net/tcp6")) -> set[int]:
+    """Return the user IDs that own a listening TCP socket on `port`."""
+    owners = set()
+    for table in tables:
+        try:
+            with open(table, encoding="ascii") as stream:
+                rows = stream.read().splitlines()[1:]
+        except OSError:
+            continue  # no IPv6, for example
+        for row in rows:
+            fields = row.split()
+            # local address:port, remote, state (0A is LISTEN), ..., uid
+            if (len(fields) > 7 and fields[3] == "0A"
+                    and int(fields[1].rpartition(":")[2], 16) == port):
+                owners.add(int(fields[7]))
+    return owners
+
+
+def require_own_receiver(port: int, allowed_uids) -> None:
+    """Refuse to deliver to a port that another user is listening on.
+
+    The first request carries the producer token and the events follow it.
+    A local user who took the port before the receiver started would get
+    both. Any address counts: an IPv6 wildcard listener also receives
+    connections made to 127.0.0.1.
+    """
+    owners = listener_owners(port)
+    if not owners:
+        raise DashboardPublishError(
+            f"no dashboard is listening on port {port}")
+    foreign = owners - set(allowed_uids)
+    if foreign:
+        raise DashboardPublishError(
+            f"port {port} is served by another user (uid {min(foreign)}); "
+            "not sending the capture and its token there")
+
+
 class DashboardPublisher:
     """Offer events without blocking and deliver them in one ordered worker."""
 

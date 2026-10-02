@@ -151,7 +151,9 @@ predictable, and diagnosable. Favor a boring core over clever tracing magic.
   until Ctrl-C or SIGTERM and return the target's status.
 - The privileged producer may connect only to numeric IPv4 `127.0.0.1` at the
   validated port with `http.client`; do not add DNS, proxy, redirect,
-  non-loopback, or browser-token paths.
+  non-loopback, or browser-token paths. Before the first request, which
+  carries the token, it must confirm that every socket listening on the port
+  belongs to the target user or root.
 - Keep JSON encoding and HTTP outside the trace loop. The trace loop may only
   normalize an event and perform a nonblocking offer to a bounded FIFO.
 - Capture start is fail-closed while the target is behind the startup barrier.

@@ -892,6 +892,9 @@ def _trace(cfg, creds, uid, gid, dashboard_port, dashboard_token,
         from metagross import _publish
 
         try:
+            # The receiver must be the invoking user's (or root's), before
+            # the token or any event is sent to it.
+            _publish.require_own_receiver(dashboard_port, {0, uid})
             publisher = _publish.DashboardPublisher(
                 dashboard_port,
                 dashboard_token,

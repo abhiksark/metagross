@@ -736,7 +736,10 @@ receiver and removes Docker's network-namespace isolation. It is separate from
 the still-required `--pid=host`, which keeps eBPF process identity consistent.
 Use both only with trusted local containers. The matching token is removed from
 the controller environment before the target starts and is never sent to the
-browser.
+browser. Before it sends the token or any event, Metagross checks that the
+socket listening on the port belongs to the invoking user or to root, and
+refuses otherwise, so another local user who took the port first receives
+nothing. Start the receiver before the trace.
 
 No `/traces` mount, JSONL file, or summary file is needed. The dashboard starts
 at `WAITING`, changes to `LIVE`, and retains the completed capture in memory.

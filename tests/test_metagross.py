@@ -3466,6 +3466,56 @@ class RendererTest(unittest.TestCase):
         self.assertEqual(stream.flush_count, 1)
 
 
+class ReceiverOwnerTest(unittest.TestCase):
+    """Direct delivery sends its token first, so the listener is checked."""
+
+    def _listen(self, family, address):
+        listener = socket.socket(family, socket.SOCK_STREAM)
+        self.addCleanup(listener.close)
+        listener.bind((address, 0))
+        listener.listen()
+        return listener.getsockname()[1]
+
+    def test_a_receiver_of_the_caller_is_accepted(self):
+        port = self._listen(socket.AF_INET, "127.0.0.1")
+        self.assertEqual(_publish.listener_owners(port), {os.getuid()})
+        _publish.require_own_receiver(port, {0, os.getuid()})
+
+    def test_a_listener_of_another_user_is_refused(self):
+        port = self._listen(socket.AF_INET, "127.0.0.1")
+        with self.assertRaisesRegex(_publish.DashboardPublishError,
+                                    f"another user \\(uid {os.getuid()}\\)"):
+            _publish.require_own_receiver(port, {os.getuid() + 1})
+
+    def test_an_ipv6_wildcard_listener_counts(self):
+        # It also receives connections made to 127.0.0.1.
+        try:
+            port = self._listen(socket.AF_INET6, "::")
+        except OSError:
+            self.skipTest("no IPv6 here")
+        self.assertEqual(_publish.listener_owners(port), {os.getuid()})
+
+    def test_a_port_nobody_listens_on_is_refused(self):
+        port = self._listen(socket.AF_INET, "127.0.0.1")
+        with self.assertRaisesRegex(_publish.DashboardPublishError,
+                                    "no dashboard is listening on port 1 *$"):
+            with mock.patch("metagross._publish.listener_owners",
+                            return_value=set()):
+                _publish.require_own_receiver(1, {0})
+        table = os.path.join(tempfile.mkdtemp(), "tcp")
+        self.addCleanup(shutil.rmtree, os.path.dirname(table))
+        with open(table, "w", encoding="ascii") as stream:
+            stream.write(
+                "  sl  local_address rem_address   st tx_queue rx_queue\n"
+                "   0: 0100007F:223D 00000000:0000 0A 00000000:00000000 "
+                "00:00000000 00000000  1234        0 99 1 0 100 0 0 10 0\n"
+                "   1: 0100007F:223D 0100007F:C350 01 00000000:00000000 "
+                "00:00000000 00000000  5678        0 98 1 0 20 4 30 10 -1\n")
+        # Port 0x223D is 8765; only the listening row (state 0A) counts.
+        self.assertEqual(_publish.listener_owners(8765, tables=(table,)), {1234})
+        self.assertEqual(_publish.listener_owners(port, tables=(table,)), set())
+
+
 class DashboardPublisherTest(unittest.TestCase):
     TOKEN = "dashboard-token-" + ("x" * 32)
 

@@ -56,6 +56,9 @@ User-visible changes to Metagross. Versions follow `metagross.__version__`.
 - Fix: a tracer error after the script has started no longer kills the
   script. Metagross stops tracing, lets the script finish, returns its exit
   status, and marks the capture incomplete (`trace_failed`).
+- Security: `--dashboard-port` delivery checks that the listening socket
+  belongs to the invoking user or root before sending the producer token and
+  the capture, so another local user who took the port first gets neither.
 - Breaking, security: `--output` and `--summary-output` are refused in a
   directory that does not belong to the invoking user, unless it is a shared
   sticky directory such as `/tmp`. Before, a user allowed to run only
