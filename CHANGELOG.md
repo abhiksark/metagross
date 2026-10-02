@@ -30,6 +30,10 @@ User-visible changes to Metagross. Versions follow `metagross.__version__`.
   `incomplete_reasons` list.
 - The snapshot viewer lists the top `metagross.span()` regions, and the
   browser dashboard shows a selected call's span and filters by it.
+- Fix: `view --snapshot --recent N` prints N recent events instead of always
+  eight; the snapshot's lists are labelled by their real order (number of
+  calls); and kernel names that differ only after 500 characters are no
+  longer merged.
 - Breaking, security: `--output` and `--summary-output` are refused in a
   directory that does not belong to the invoking user, unless it is a shared
   sticky directory such as `/tmp`. Before, a user allowed to run only

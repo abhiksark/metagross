@@ -19,13 +19,14 @@ from pathlib import Path
 
 _MAX_LINE_BYTES = 1 << 20
 _MAX_SUMMARY_BYTES = 4 << 20
-_MAX_TEXT = 500
+_MAX_TEXT = 1024  # a kernel name is at most 1,023 bytes in the trace
 _MAX_DETAIL_TEXT = 200
 _MAX_DETAILS = 32
 _MAX_APIS = 512
 _MAX_FUNCTIONS = 4096
 _MAX_KERNELS = 4096
 _MAX_SPANS = 4096
+_SNAPSHOT_RECENT_ROWS = 8
 _MAX_MEMORY_SAMPLES = 2000
 _MAX_RECENT = 10_000
 _DEFAULT_RECENT = 500
@@ -515,7 +516,8 @@ def _time_cell(timestamp: str) -> str:
     return timestamp[:12]
 
 
-def render_snapshot(model: TraceModel, width: int = 120) -> list[str]:
+def render_snapshot(model: TraceModel, width: int = 120,
+                    recent_rows: int = _SNAPSHOT_RECENT_ROWS) -> list[str]:
     width = max(60, min(width, 240))
     lines = []
     title = "METAGROSS TRACE"
@@ -567,7 +569,9 @@ def render_snapshot(model: TraceModel, width: int = 120) -> list[str]:
     lines.extend(_fit(f"Incomplete: {reason}", width)
                  for reason in model.incomplete_reasons())
 
-    lines.extend(("", _heading("TOP APIS (CPU duration)", width)))
+    # Every list is ordered by number of calls, like the other viewers and
+    # the summary file.
+    lines.extend(("", _heading("TOP APIS (by calls)", width)))
     api_width = width - 41
     lines.append(
         f"{'API':<{api_width}} {'CALLS':>8} {'ERRORS':>7} {'TOTAL':>12} {'MAX':>10}"
@@ -582,7 +586,7 @@ def render_snapshot(model: TraceModel, width: int = 120) -> list[str]:
     if not model.apis:
         lines.append("<no events>")
 
-    lines.extend(("", _heading("TOP FUNCTIONS", width)))
+    lines.extend(("", _heading("TOP FUNCTIONS (by calls)", width)))
     function_columns = width - 23
     location_width = min(24, max(16, function_columns // 2))
     name_width = function_columns - location_width
@@ -601,7 +605,7 @@ def render_snapshot(model: TraceModel, width: int = 120) -> list[str]:
     if not model.functions:
         lines.append("<no attributed functions>")
 
-    lines.extend(("", _heading("TOP KERNELS", width)))
+    lines.extend(("", _heading("TOP KERNELS (by launches)", width)))
     kernel_width = width - 24
     lines.append(f"{'KERNEL':<{kernel_width}} {'LAUNCHES':>10} {'TOTAL CPU':>12}")
     for kernel, aggregate in _top(model.kernels, 6):
@@ -631,7 +635,7 @@ def render_snapshot(model: TraceModel, width: int = 120) -> list[str]:
         f"{'TIME':<12} {'FUNCTION':<{function_width}} "
         f"{'API':<{api_width}} {'RET':>5} {'CPU':>10}"
     )
-    for event in list(model.recent)[-8:]:
+    for event in list(model.recent)[-recent_rows:]:
         function = event.function or "<unknown>"
         lines.append(
             f"{_fit(_time_cell(event.timestamp), 12):<12} "
@@ -747,9 +751,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="receive one authenticated in-memory capture for --web",
     )
     parser.add_argument(
-        "--recent", type=_recent_limit, default=_DEFAULT_RECENT, metavar="N",
-        help=f"recent events to keep (default: {_DEFAULT_RECENT}, "
-             f"at most {_MAX_RECENT})")
+        "--recent", type=_recent_limit, metavar="N",
+        help=f"recent events to keep (default: {_DEFAULT_RECENT}, at most "
+             f"{_MAX_RECENT}); with --snapshot, how many to print "
+             f"(default: {_SNAPSHOT_RECENT_ROWS})")
     parser.add_argument(
         "--width",
         type=_snapshot_width,
@@ -852,6 +857,7 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+    recent = _DEFAULT_RECENT if args.recent is None else args.recent
     if args.web:
         from metagross import _web
 
@@ -869,7 +875,7 @@ def main(argv: list[str] | None = None) -> int:
             return _web.run_web_dashboard(
                 None,
                 None,
-                args.recent,
+                recent,
                 refresh_seconds,
                 port,
                 ingest_token=ingest_token,
@@ -878,7 +884,7 @@ def main(argv: list[str] | None = None) -> int:
         return _web.run_web_dashboard(
             args.trace,
             args.summary,
-            args.recent,
+            recent,
             refresh_seconds,
             port,
             host=host,
@@ -888,16 +894,17 @@ def main(argv: list[str] | None = None) -> int:
 
         refresh_seconds = 0.2 if args.refresh is None else args.refresh
         return _tui.run_follow_dashboard(
-            args.trace, args.summary, args.recent, refresh_seconds
+            args.trace, args.summary, recent, refresh_seconds
         )
     try:
-        model = load_trace(args.trace, recent_limit=args.recent)
+        model = load_trace(args.trace, recent_limit=recent)
         if args.summary is not None:
             model.load_summary(load_summary(args.summary))
     except ViewerError as exc:
         print(f"metagross view: {exc}", file=sys.stderr)
         return 1
     width = args.width or shutil.get_terminal_size((120, 24)).columns
-    for line in render_snapshot(model, width=width):
+    recent_rows = _SNAPSHOT_RECENT_ROWS if args.recent is None else args.recent
+    for line in render_snapshot(model, width=width, recent_rows=recent_rows):
         print(line)
     return 0

@@ -369,7 +369,10 @@ GPU. Print a static terminal dashboard from a completed trace with:
 
 `--width COLUMNS` is snapshot-only, accepts 60 through 240, and makes output
 deterministic for CI or saved reports. `--recent N` bounds retained recent
-events in every viewer mode (maximum 10,000).
+events in the live viewers (maximum 10,000) and sets how many recent events
+the snapshot prints (8 by default). The snapshot's top lists are ordered by
+number of calls, like the other viewers and the summary file, and include the
+top `metagross.span()` regions when the trace has any.
 
 To watch a trace while its target is running, start the dependency-free curses
 dashboard in an interactive terminal. The trace may not exist yet; the viewer
@@ -750,7 +753,7 @@ receiver, it cannot certify completion; inspect the controller warning too.
 | `--web` | Serve a browser dashboard, loopback-only unless `--host` is given. |
 | `--receive` | Web-only in-memory receiver; rejects a trace path or `--summary`. |
 | `--summary FILE` | Optional version-1 final capture summary for file modes. |
-| `--recent N` | Retain 1 to 10,000 recent events; default 500. |
+| `--recent N` | Retain 1 to 10,000 recent events; default 500. With `--snapshot`, print that many recent events; default 8. |
 | `--width COLUMNS` | Snapshot-only width, 60 to 240; default uses terminal width (120 fallback). |
 | `--refresh SECONDS` | Follow/web-only interval, 0.05 to 5.0; default 0.2. |
 | `--port PORT` | Web-only port, 0 to 65,535; default 8765, zero selects a free port. |

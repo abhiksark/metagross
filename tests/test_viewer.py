@@ -650,6 +650,43 @@ class LiveDashboardRendererTest(unittest.TestCase):
         self.assertEqual(payload["incomplete_reasons"], reasons)
         self.assertIn(b"data.incomplete_reasons", _web._APP_JS)
 
+    def test_snapshot_lists_are_labelled_by_their_real_order(self):
+        model = _viewer.TraceModel()
+        # Two short calls outrank one long call: the lists are by count.
+        for _ in range(2):
+            model.observe(_viewer.parse_event(_record(
+                api="cuMemFree", kernel=None, duration_ns=1_000)))
+        model.observe(_viewer.parse_event(_record(duration_ns=9_000_000)))
+        text = _viewer.render_snapshot(model, width=100)
+        self.assertNotIn("CPU duration", "\n".join(text))
+        start = next(i for i, line in enumerate(text)
+                     if "TOP APIS (by calls)" in line)
+        self.assertTrue(text[start + 2].startswith("cuMemFree"))
+        self.assertTrue(any("TOP FUNCTIONS (by calls)" in line for line in text))
+        self.assertTrue(any("TOP KERNELS (by launches)" in line for line in text))
+
+    def test_snapshot_prints_as_many_recent_events_as_asked(self):
+        model = _viewer.TraceModel()
+        for index in range(30):
+            model.observe(_viewer.parse_event(_record(tid=index)))
+
+        def recent_rows(**options):
+            text = _viewer.render_snapshot(model, width=100, **options)
+            start = next(i for i, line in enumerate(text)
+                         if "RECENT EVENTS" in line)
+            return len(text) - start - 2
+
+        self.assertEqual(recent_rows(), 8)
+        self.assertEqual(recent_rows(recent_rows=20), 20)
+
+    def test_long_kernel_names_that_differ_late_stay_apart(self):
+        # The trace keeps 1,023 bytes of a name; cutting at 500 merged these.
+        model = _viewer.TraceModel()
+        for suffix in ("A", "B"):
+            model.observe(_viewer.parse_event(
+                _record(kernel="_ZN" + "x" * 900 + suffix)))
+        self.assertEqual(len(model.kernels), 2)
+
     def test_spans_are_listed_in_the_snapshot_and_sent_to_the_browser(self):
         model = _viewer.TraceModel()
         model.observe(_viewer.parse_event(_record(span="forward")))
@@ -2474,6 +2511,25 @@ class ViewerRoutingTest(unittest.TestCase):
             except ValueError:
                 _web._DashboardServer.handle_error(server, None, ("127.0.0.1", 1))
         self.assertIn("a real bug", stderr.getvalue())
+
+    def test_snapshot_recent_option_sets_the_rows_printed(self):
+        with self.trace.open("a", encoding="utf-8") as stream:
+            for index in range(20):
+                stream.write(json.dumps(_record(tid=index)) + "\n")
+
+        def rows(*options):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(metagross.main(
+                    ["view", "--snapshot", "--width", "100", *options,
+                     str(self.trace)]), 0)
+            lines = output.getvalue().splitlines()
+            start = next(i for i, line in enumerate(lines)
+                         if "RECENT EVENTS" in line)
+            return len(lines) - start - 2
+
+        self.assertEqual(rows(), 8)
+        self.assertEqual(rows("--recent", "15"), 15)
 
     def test_snapshot_routes_without_live_trace_validation(self):
         output = io.StringIO()
