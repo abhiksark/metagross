@@ -1192,7 +1192,12 @@ def main(argv: list[str] | None = None) -> int:
     if cfg.dump_ebpf:
         from metagross import _bpf
 
-        print(_bpf.build_source(0, _bpf.select_apis(cfg.trace_families)))
+        try:
+            print(_bpf.build_source(0, _bpf.select_apis(cfg.trace_families)))
+            sys.stdout.flush()
+        except BrokenPipeError:
+            # The reader (`| head`) left; keep the interpreter's exit flush quiet.
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
         return 0
     # 11. Route to the live launcher; report tracer failures as exit 1.
     try:
