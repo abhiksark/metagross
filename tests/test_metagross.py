@@ -344,6 +344,28 @@ class ParseArgsTest(unittest.TestCase):
         self.assertTrue(cfg.python_attribution)
         self.assertIsNone(cfg.trace_families)
 
+    def test_value_options_accept_the_equals_form(self) -> None:
+        cfg = parse_args(["--output=/tmp/x.jsonl", "--trace=launch,sync",
+                          "--web", "--web-port=0", "script.py", "--output=a"])
+        self.assertEqual(cfg.output_path, "/tmp/x.jsonl")
+        self.assertEqual(cfg.trace_families, frozenset(("launch", "sync")))
+        self.assertEqual(cfg.web_port, 0)
+        self.assertEqual(cfg.script_args, ["--output=a"])
+        with self.assertRaisesRegex(UsageError, "--output requires a value"):
+            parse_args(["--output=", "script.py"])
+        with self.assertRaisesRegex(UsageError, "unknown option: --json=1"):
+            parse_args(["--json=1", "script.py"])
+
+    def test_single_dash_arguments_are_unknown_options_not_the_script(self):
+        # `-V` used to be taken as the script and reported as a missing
+        # root privilege.
+        for argument in ("-V", "-v", "-m", "-"):
+            with self.subTest(argument=argument):
+                with self.assertRaisesRegex(UsageError,
+                                            f"unknown option: {argument}"):
+                    parse_args([argument, "script.py"])
+        self.assertEqual(parse_args(["./-odd.py"]).script, "./-odd.py")
+
     def test_options_before_script_args_after(self) -> None:
         cfg: Config = parse_args(
             ["--json", "--output", "/tmp/x.jsonl", "--project-root", "/p",

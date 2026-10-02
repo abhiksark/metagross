@@ -79,7 +79,9 @@ command, `/usr/bin/python3 -m metagross` from the checkout, or the
 [path form](#privilege-and-trust-boundary). Tracing a script needs root.
 
 Metagross options must appear before the script. Everything after the script is
-passed to it unchanged. `--project-root` defaults to the current directory.
+passed to it unchanged. An option that takes a value accepts `--name value`
+and `--name=value`. A script whose name starts with a dash is written as
+`./-name.py`. `--project-root` defaults to the current directory.
 The script must resolve to a regular `.py` file inside that directory.
 Use `/usr/bin/python3 -m metagross --help` (or `-h`) for usage and `--version`
 for the version, without root, BCC, CUDA, or a target script. Help flags after

@@ -130,6 +130,10 @@ _HOST_PID_NAMESPACE_INODE = 0xEFFFFFFC
 _DASHBOARD_READY_TIMEOUT_S = 5.0
 _DEFAULT_WEB_PORT = 8765
 _TRACE_FAMILIES = frozenset(("launch", "memory", "copy", "sync"))
+_VALUE_OPTIONS = frozenset((
+    "--output", "--summary-output", "--project-root", "--trace",
+    "--dashboard-port", "--web-port",
+))
 
 _USAGE = (
     "usage: metagross [--json] [--output FILE]\n"
@@ -195,11 +199,18 @@ def parse_args(argv: list[str]) -> Config:
         if arg == "--version":
             cfg.show_version = True
             return cfg
-        if not arg.startswith("--"):
+        if not arg.startswith("-"):
             cfg.script = arg
             cfg.script_args = list(argv[i + 1 :])
             _check_web_options(cfg)
             return cfg
+        # Only `--name` and `--name=value` are options. A script whose name
+        # starts with a dash is written as `./-name.py`.
+        option, has_inline_value, inline_value = arg.partition("=")
+        if not arg.startswith("--") or (
+                has_inline_value and option not in _VALUE_OPTIONS):
+            raise UsageError(f"unknown option: {arg}")
+        arg = option
         if arg == "--json":
             cfg.json_output = True
         elif arg == "--ebpf":
@@ -214,18 +225,14 @@ def parse_args(argv: list[str]) -> Config:
             cfg.web = True
         elif arg == "--allow-root-target":
             cfg.allow_root_target = True
-        elif arg in (
-            "--output",
-            "--summary-output",
-            "--project-root",
-            "--trace",
-            "--dashboard-port",
-            "--web-port",
-        ):
-            if i + 1 >= len(argv):
+        elif arg in _VALUE_OPTIONS:
+            if inline_value:
+                value = inline_value
+            elif not has_inline_value and i + 1 < len(argv):
+                value = argv[i + 1]
+                i += 1
+            else:
                 raise UsageError(f"{arg} requires a value")
-            value = argv[i + 1]
-            i += 1
             if arg == "--output":
                 cfg.output_path = value
             elif arg == "--summary-output":

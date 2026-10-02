@@ -43,7 +43,9 @@ predictable, and diagnosable. Favor a boring core over clever tracing magic.
 
 ## CLI contract
 
-- Metagross options must appear before the target script.
+- Metagross options must appear before the target script. Only `--name` and
+  `--name=value` are options; any other argument starting with a dash is an
+  unknown option, never the script.
 - Everything after the target script belongs to the target and must pass through
   unchanged.
 - Top-level `-h` and `--help` print usage without a target or privileged imports.

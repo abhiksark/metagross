@@ -15,6 +15,8 @@ User-visible changes to Metagross. Versions follow `metagross.__version__`.
   dashboard from another machine.
 - Metagross refuses to trace on an architecture other than x86-64, where it
   would have reported wrong launch arguments.
+- Options that take a value accept `--name=value`. An argument such as `-V`
+  is reported as an unknown option instead of being taken as the script.
 
 ## 0.1.1 (2026-10-02)
 
