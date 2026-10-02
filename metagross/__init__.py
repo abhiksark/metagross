@@ -121,6 +121,8 @@ class Credentials:
 
 _FINAL_DRAIN_TIMEOUT_S = 2.0
 _LIBCUDA_CHECK_INTERVAL_S = 0.1
+# The initial PID namespace always has this inode (PROC_PID_INIT_INO).
+_HOST_PID_NAMESPACE_INODE = 0xEFFFFFFC
 _DASHBOARD_READY_TIMEOUT_S = 5.0
 _DEFAULT_WEB_PORT = 8765
 _TRACE_FAMILIES = frozenset(("launch", "memory", "copy", "sync"))
@@ -459,6 +461,19 @@ def _forbid_new_privileges() -> None:
         raise OSError(ct.get_errno(), "prctl(PR_SET_NO_NEW_PRIVS) failed")
 
 
+def _in_host_pid_namespace() -> bool:
+    """Return whether process IDs here are the ones the kernel reports.
+
+    The probes filter on the script's process ID as eBPF sees it, which is
+    its ID in the initial PID namespace. In any other namespace `os.fork()`
+    returns a different number and no call would ever match.
+    """
+    try:
+        return os.stat("/proc/self/ns/pid").st_ino == _HOST_PID_NAMESPACE_INODE
+    except OSError:
+        return True  # cannot tell; do not refuse on a guess
+
+
 def _libcuda_mismatch_warning(
         mapped: dict[str, int], lib_path: str) -> str | None:
     """Return a warning if the target loaded a libcuda the probes are not on.
@@ -652,6 +667,10 @@ def run_live(cfg: Config) -> int:
     # 1. Root check; validate sudo metadata, or refuse to run the target as root.
     if os.geteuid() != 0:
         raise MetagrossError("must run as root (use sudo)")
+    if not _in_host_pid_namespace():
+        raise MetagrossError(
+            "not in the host PID namespace, so no CUDA call would be "
+            "matched to the script; start the container with --pid=host")
     dashboard_token = None
     if cfg.dashboard_port is not None:
         from metagross import _publish

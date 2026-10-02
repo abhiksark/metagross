@@ -14,6 +14,8 @@ User-visible changes to Metagross. Versions follow `metagross.__version__`.
 - Fix: a script that loaded a `libcuda` the probes are not on now marks the
   capture incomplete (`capture.libcuda_mismatch`). The check compares files,
   not path strings, and runs ten times a second.
+- Metagross refuses to start outside the host PID namespace, where it used to
+  produce an empty capture reported complete.
 - Fix: a call from a function beyond the 65,536-function limit is `<unknown>`
   instead of being given to its caller.
 - Profile records are decoded about twice as fast, and finished threads no

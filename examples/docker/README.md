@@ -391,8 +391,8 @@ capture was incomplete.
   on the host and verify `/lib/modules/$(uname -r)/build` exists.
 - `open(/sys/kernel/debug/tracing/uprobe_events)` or cleanup failures: include
   both `/sys/kernel/debug` and `/sys/kernel/tracing` mounts.
-- No attributed events or immediate attach failure: verify `--pid=host` was
-  included.
+- `not in the host PID namespace`, or an immediate attach failure: add
+  `--pid=host`.
 - `libcuda.so.1 not found`: verify the container is launched with NVIDIA GPU
   passthrough; the NVIDIA runtime supplies the host driver library.
 - `cannot start the web dashboard`: another process holds the port; pass

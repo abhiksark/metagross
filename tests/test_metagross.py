@@ -3901,6 +3901,30 @@ class PrivateDashboardTest(unittest.TestCase):
         stop.assert_called_once_with(fake)
 
 
+class PidNamespaceTest(unittest.TestCase):
+    def test_only_the_initial_pid_namespace_is_accepted(self):
+        with mock.patch("metagross.os.stat",
+                        return_value=mock.Mock(st_ino=0xEFFFFFFC)):
+            self.assertTrue(metagross._in_host_pid_namespace())
+        with mock.patch("metagross.os.stat",
+                        return_value=mock.Mock(st_ino=4026535076)):
+            self.assertFalse(metagross._in_host_pid_namespace())
+        with mock.patch("metagross.os.stat", side_effect=OSError):
+            self.assertTrue(metagross._in_host_pid_namespace())
+
+    def test_tracing_is_refused_outside_the_host_pid_namespace(self):
+        # There the probes would match no process: an empty capture that
+        # looks complete.
+        cfg = Config(script=__file__, project_root=os.path.dirname(__file__))
+        with mock.patch("metagross.os.geteuid", return_value=0), \
+                mock.patch("metagross._in_host_pid_namespace",
+                           return_value=False), \
+                mock.patch("metagross.os.fork",
+                           side_effect=AssertionError("must not fork")):
+            with self.assertRaisesRegex(MetagrossError, "--pid=host"):
+                metagross.run_live(cfg)
+
+
 class RunLiveInitFailureTest(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()

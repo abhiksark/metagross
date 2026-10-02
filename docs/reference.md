@@ -508,6 +508,11 @@ until a `libcuda` appears; if it is a different file, it warns on stderr and
 marks the capture incomplete (`libcuda_mismatch`). A script that exits before
 the first check is not checked.
 
+**Host PID namespace**: The probes select the script by the process ID the
+kernel reports, which is its ID in the host PID namespace. Metagross refuses
+to start in any other PID namespace, for example a container started without
+`--pid=host`, because no call would be matched.
+
 **Other profilers**: Attribution uses the Python profiling hook
 (`sys.setprofile`). If the script installs its own profile function, as
 `cProfile` does on Python 3.11 and earlier, Metagross forgets the frames open at
