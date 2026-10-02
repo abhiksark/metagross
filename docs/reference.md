@@ -834,9 +834,11 @@ profile data is decoded so the ring buffer keeps being read. A call waits at
 most five seconds for its profile history, and at most 200,000 calls wait at
 once; beyond either limit the oldest are written as `<unknown>`. If the tracer
 stops reading
-altogether, the script waits at most one second for it, then carries on and
-drops profile records until the tracer reads again; the capture is marked
-incomplete.
+altogether, the script waits at most one second for it, asleep rather than
+spinning, then carries on and drops profile records until the tracer reads
+again; the capture is marked incomplete. It does not wait again for 30
+seconds, so a tracer that is slow but alive costs the script at most one
+second in that time.
 
 The dashboard server closes a connection that is silent for 10 seconds and
 serves at most 32 connections at once; further clients are disconnected. This

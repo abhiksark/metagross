@@ -34,6 +34,10 @@ User-visible changes to Metagross. Versions follow `metagross.__version__`.
   eight; the snapshot's lists are labelled by their real order (number of
   calls); and kernel names that differ only after 500 characters are no
   longer merged.
+- Fix: when the tracer falls behind, the script waits for it at most one
+  second in any 30, asleep instead of spinning. Before, a tracer that was
+  slow but alive could cost one second for every function called for the
+  first time.
 - Breaking, security: `--output` and `--summary-output` are refused in a
   directory that does not belong to the invoking user, unless it is a shared
   sticky directory such as `/tmp`. Before, a user allowed to run only

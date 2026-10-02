@@ -60,6 +60,13 @@ def _encode_frame(kind, tid, ts_ns, func, path, line):
             + _profile._encode_frame_ref(kind, tid, ts_ns, 0))
 
 
+def _writer(os_write, **options):
+    """A profile writer on a fake descriptor that never sleeps."""
+    return _profile._DropCountWriter(
+        7, os_write=os_write, wait_writable=lambda fd, timeout_s: None,
+        **options)
+
+
 def _is_project_file(path, project_root):
     return _profile._ProjectClassifier(project_root).includes(path)
 
@@ -1734,7 +1741,7 @@ class ProfileDropTest(unittest.TestCase):
             seen.append(_profile.record_type(data))  # DEF must reach here
             return len(data)
 
-        writer = _profile._DropCountWriter(7, os_write=fake_write)
+        writer = _writer(fake_write)
         emitter = _profile._FrameEmitter(writer.write)
         emitter.emit(_profile.CALL, 1, 10, "f", "/p/a.py", 1)
         self.assertEqual(writer.dropped, 1)               # the CALL dropped
@@ -1747,8 +1754,7 @@ class ProfileDropTest(unittest.TestCase):
         drops_fd = os.eventfd(0, os.EFD_NONBLOCK)
         self.addCleanup(os.close, drops_fd)
         clock = iter([0.0, 5.0]).__next__  # the bounded wait times out at once
-        writer = _profile._DropCountWriter(
-            7, os_write=full_pipe, clock=clock, drops_fd=drops_fd)
+        writer = _writer(full_pipe, clock=clock, drops_fd=drops_fd)
         emitter = _profile._FrameEmitter(writer.write)
         emitter.span(1, 10, "step")                              # ordinary
         emitter.emit(_profile.CALL, 1, 20, "f", "/p/a.py", 1)    # its FRAME_DEF
@@ -1764,7 +1770,7 @@ class ProfileDropTest(unittest.TestCase):
                 raise BlockingIOError()
             return len(data)
 
-        writer = _profile._DropCountWriter(7, os_write=flaky_write)
+        writer = _writer(flaky_write)
         _profile._FrameEmitter(writer.write).hook_replaced(10)
         self.assertEqual(len(attempts), 3)
         self.assertEqual(writer.dropped, 0)
@@ -1778,7 +1784,7 @@ class ProfileDropTest(unittest.TestCase):
                 raise BlockingIOError()
             return len(data)
 
-        writer = _profile._DropCountWriter(7, os_write=flaky_write)
+        writer = _writer(flaky_write)
         _profile._FrameEmitter(writer.write).end(10)
         self.assertEqual(len(attempts), 3)
         self.assertEqual(writer.dropped, 0)
@@ -1792,7 +1798,7 @@ class ProfileDropTest(unittest.TestCase):
                 raise BlockingIOError()
             return len(data)
 
-        writer = _profile._DropCountWriter(7, os_write=flaky_write)
+        writer = _writer(flaky_write)
         emitter = _profile._FrameEmitter(writer.write)
         emitter.emit(_profile.CALL, 1, 10, "f", "/p/a.py", 1)
         # The FRAME_DEF retried until it fit (3 attempts); the CALL then
@@ -1811,8 +1817,7 @@ class ProfileDropTest(unittest.TestCase):
             written.append(data)
             return len(data)
 
-        writer = _profile._DropCountWriter(
-            7, os_write=stalled_write, clock=lambda: float(next(ticks)))
+        writer = _writer(stalled_write, clock=lambda: float(next(ticks)))
         emitter = _profile._FrameEmitter(writer.write)
         emitter.emit(_profile.CALL, 1, 10, "f", "/p/a.py", 1)  # must return
         self.assertEqual(writer.dropped, 1)  # the DEF; its CALL was not sent
@@ -1838,8 +1843,7 @@ class ProfileDropTest(unittest.TestCase):
             raise BlockingIOError()
 
         ticks = iter(range(1000))
-        writer = _profile._DropCountWriter(
-            7, os_write=stalled_write, clock=lambda: next(ticks) / 4)
+        writer = _writer(stalled_write, clock=lambda: next(ticks) / 4)
         emitter = _profile._FrameEmitter(writer.write)
         emitter.emit(_profile.CALL, 1, 10, "f", "/p/a.py", 1)
         waited = len(attempts)
@@ -1848,11 +1852,61 @@ class ProfileDropTest(unittest.TestCase):
         self.assertEqual(len(attempts), waited + 1)  # one try, no second wait
         self.assertEqual(writer.dropped, 2)
 
+    def test_a_slow_controller_costs_one_wait_per_cooldown(self):
+        # The controller reads a little now and then: a definition gets
+        # through, the pipe fills again. That must not cost the script a
+        # full wait for every function it calls for the first time.
+        now = [0.0]
+        full = [True]
+        waits = []
+
+        def write(fd, data):
+            if full[0]:
+                raise BlockingIOError()
+            return len(data)
+
+        def wait(fd, timeout_s):
+            waits.append(timeout_s)
+            now[0] += timeout_s
+
+        writer = _profile._DropCountWriter(
+            7, os_write=write, clock=lambda: now[0], wait_writable=wait)
+        emitter = _profile._FrameEmitter(writer.write)
+        emitter.emit(_profile.CALL, 1, 10, "a", "/p/a.py", 1)
+        self.assertEqual(waits, [_profile._MUST_DELIVER_TIMEOUT_S])
+        full[0] = False
+        emitter.emit(_profile.CALL, 1, 20, "b", "/p/a.py", 2)  # gets through
+        full[0] = True
+        emitter.emit(_profile.CALL, 1, 30, "c", "/p/a.py", 3)
+        self.assertEqual(len(waits), 1)                        # no second wait
+        now[0] += _profile._STALL_COOLDOWN_S
+        emitter.emit(_profile.CALL, 1, 40, "d", "/p/a.py", 4)
+        self.assertEqual(len(waits), 2)                        # allowed again
+
+    def test_waiting_for_room_sleeps_on_the_descriptor(self):
+        r, w = os.pipe()
+        self.addCleanup(os.close, r)
+        self.addCleanup(os.close, w)
+        os.set_blocking(w, False)
+        fcntl.fcntl(w, fcntl.F_SETPIPE_SZ, 4096)
+        while True:
+            try:
+                os.write(w, b"x" * 4096)
+            except BlockingIOError:
+                break
+        threading.Timer(0.2, os.read, (r, 1 << 16)).start()
+        writer = _profile._DropCountWriter(w)
+        started = time.monotonic()
+        cpu = time.process_time()
+        self.assertTrue(writer.write(_profile.encode_end(1)))
+        self.assertGreaterEqual(time.monotonic() - started, 0.15)
+        self.assertLess(time.process_time() - cpu, 0.1)  # asleep, not spinning
+
     def test_other_oserror_on_frame_def_is_swallowed_not_dropped_or_raised(self):
         def broken_write(fd, data):
             raise OSError("broken pipe")
 
-        writer = _profile._DropCountWriter(7, os_write=broken_write)
+        writer = _writer(broken_write)
         emitter = _profile._FrameEmitter(writer.write)
         emitter.emit(_profile.CALL, 1, 10, "f", "/p/a.py", 1)  # must not raise
         self.assertEqual(writer.dropped, 0)  # OSError is swallowed, not counted

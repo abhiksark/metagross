@@ -39,6 +39,7 @@ _MAX_FRAMES = 1 << 16  # distinct frames the controller keeps per capture
 _MAX_QUEUED_CHUNKS = 256  # 64 KiB reads the controller may fall behind by
 _POLL_CHUNKS = 8  # 64 KiB reads decoded per call, so the caller's loop keeps turning
 _MUST_DELIVER_TIMEOUT_S = 1.0  # wait on a full pipe for a record that must arrive
+_STALL_COOLDOWN_S = 30.0  # after such a wait times out, do not wait again this soon
 
 # Every record starts with this 6-byte common header.
 _COMMON = struct.Struct("<BIB")  # rtype, seq, _reserved
@@ -153,6 +154,16 @@ class _FrameEmitter:
             self._write(encode_end(ts))
 
 
+def _wait_writable(fd: int, timeout_s: float) -> None:
+    """Sleep until `fd` accepts a write, fails, or the timeout passes."""
+    poller = select.poll()  # not select(): the fd number may exceed 1023
+    try:
+        poller.register(fd, select.POLLOUT)
+        poller.poll(timeout_s * 1000)
+    except OSError:
+        pass  # the write that follows reports what is wrong
+
+
 class _DropCountWriter:
     """Write profile records through a non-blocking fd; drop-and-count
     ordinary records under pipe overrun, and wait briefly for the ones that
@@ -160,11 +171,12 @@ class _DropCountWriter:
 
     A FRAME_DEF assigns the frame_id later CALL/RETURN records reference,
     a HOOK_REPLACED tells the reader to stop trusting open frames, and an
-    END tells it nothing was dropped at the tail, so these are retried while
-    the pipe is full. The wait is bounded: a controller that has stopped
-    reading must not hang the target. Once a wait times out, later ones are
-    skipped until one of these records is written again, so a stalled
-    controller costs the target one timeout, not one per record.
+    END tells it nothing was dropped at the tail, so these are waited for
+    while the pipe is full. The wait is bounded: a controller that has
+    stopped reading must not hang the target. Once a wait times out the
+    capture is incomplete whatever happens next, so no further wait is made
+    for `_STALL_COOLDOWN_S`: a controller that is slow but alive costs the
+    target one timeout in that period, not one per record.
     Every other record type is best-effort: on `BlockingIOError` (EAGAIN,
     pipe full) it is dropped and counted rather than blocking the target's
     own thread on tracer backpressure.
@@ -178,11 +190,12 @@ class _DropCountWriter:
     """
 
     def __init__(self, fd: int, os_write=os.write, clock=time.monotonic,
-                 drops_fd: int | None = None):
+                 drops_fd: int | None = None, wait_writable=_wait_writable):
         self._fd = fd
         self._os_write = os_write
         self._clock = clock
-        self._stalled = False
+        self._wait_writable = wait_writable
+        self._no_wait_before = 0.0
         self._drops_fd = drops_fd
         self.dropped = 0
 
@@ -211,27 +224,29 @@ class _DropCountWriter:
         return True
 
     def _write_or_time_out(self, data: bytes) -> bool:
-        deadline = self._clock() + (
-            0 if self._stalled else _MUST_DELIVER_TIMEOUT_S)
+        now = self._clock()
+        may_wait = now >= self._no_wait_before
+        deadline = now + _MUST_DELIVER_TIMEOUT_S if may_wait else now
         while True:
             try:
                 self._os_write(self._fd, data)
             except BlockingIOError:
-                if self._clock() >= deadline:
+                now = self._clock()
+                if now >= deadline:
                     # The reader learns of this from the seq hole a later
                     # record shows, or from the stream ending without END.
-                    self._stalled = True
+                    if may_wait:
+                        self._no_wait_before = now + _STALL_COOLDOWN_S
                     self._count_drop()
                     return False
-                # Pipe momentarily full: retry until it drains. This runs
-                # under `_FrameEmitter`'s lock, so yield the GIL between
-                # attempts rather than busy-spinning and starving other
-                # target threads' emits for however long the pipe stays full.
-                time.sleep(0)
+                # This runs under `_FrameEmitter`'s lock, so sleep in the
+                # kernel until the pipe has room instead of spinning: other
+                # target threads then queue behind an idle thread, not a
+                # busy one.
+                self._wait_writable(self._fd, deadline - now)
                 continue
             except OSError:
                 return True  # broken trace pipe must never kill the target
-            self._stalled = False
             return True
 
 
