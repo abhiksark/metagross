@@ -10,9 +10,10 @@ permissions:
 jobs:
   unittest:
     runs-on: ubuntu-22.04
+    timeout-minutes: 10
     strategy:
       matrix:
-        python-version: ['3.10', '3.11', '3.12', '3.13']
+        python-version: ['3.10', '3.11', '3.12', '3.13', '3.14']
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -29,18 +30,20 @@ jobs:
 
   lint:
     runs-on: ubuntu-22.04
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
-      - run: pip install "ruff==0.16.8"
+      - run: pip install -r .github/requirements.txt
       - name: Undefined names and unused imports
         run: ruff check .
 
   stub-live:
     # The real tracer against tests/stub_libcuda.c: root and BCC, no GPU.
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install BCC and kernel headers
@@ -53,18 +56,45 @@ jobs:
             -o /usr/lib/x86_64-linux-gnu/libcuda.so.1 tests/stub_libcuda.c
           sudo ldconfig
       - name: Trace the stub workload
+        shell: bash  # pipefail, so a failing test fails the step through tee
         run: |
           sudo env RUN_STUB_INTEGRATION=1 \
-            /usr/bin/python3 -m unittest -v tests.test_stub_live
+            /usr/bin/python3 -m unittest -v tests.test_stub_live 2>&1 | tee stub.log
+          # A skipped test would pass this job without tracing anything.
+          ! grep -q skipped stub.log
+      - name: Output ownership tests that need root
+        shell: bash
+        run: |
+          sudo /usr/bin/python3 -m unittest -v \
+            tests.test_metagross.OutputSafetyTest 2>&1 | tee output.log
+          ! grep -q skipped output.log
 
-  coverage:
+  sdist:
+    # The source archive must carry what its own tests need.
     runs-on: ubuntu-22.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
-      - run: pip install "coverage==7.16.2"
+      - run: pip install -r .github/requirements.txt
+      - name: Unit tests from the unpacked source archive
+        run: |
+          python -m build --sdist --outdir "$RUNNER_TEMP/dist"
+          tar xzf "$RUNNER_TEMP"/dist/metagross-*.tar.gz -C "$RUNNER_TEMP"
+          cd "$RUNNER_TEMP"/metagross-*/
+          python -m unittest
+
+  coverage:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - run: pip install -r .github/requirements.txt
       - name: Coverage floor
         run: |
           python -m coverage run --source=metagross -m unittest
@@ -72,6 +102,7 @@ jobs:
 
   web-js-syntax:
     runs-on: ubuntu-22.04
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -79,7 +110,7 @@ jobs:
           python-version: '3.12'
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: '20'
+          node-version: '22'
       - name: Extract embedded dashboard JS
         run: python -c "from metagross import _web; open('_web_app.js', 'wb').write(_web._APP_JS)"
       - name: Syntax-check embedded dashboard JS

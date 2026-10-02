@@ -1,4 +1,4 @@
-# Keep the SHA-pinned GitHub Actions in .github/workflows current.
+# Keep the SHA-pinned GitHub Actions and the CI tool pins current.
 version: 2
 updates:
   - package-ecosystem: github-actions
@@ -9,3 +9,7 @@ updates:
       github-actions:
         patterns:
           - "*"
+  - package-ecosystem: pip
+    directory: /.github
+    schedule:
+      interval: weekly

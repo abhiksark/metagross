@@ -49,8 +49,10 @@ Run the smallest affected test first, then the default unprivileged gate:
 git diff --check
 ```
 
-CI also runs `ruff check .` (ruff 0.16.8) for undefined names and unused
-imports; run it locally if you have ruff installed.
+CI also runs `ruff check .` for undefined names and unused imports, with the
+version pinned in `.github/requirements.txt`; run it locally if you have ruff
+installed. Another job builds the source archive and runs the unit tests from
+it, so a new test fixture or example needs a line in `MANIFEST.in`.
 
 CI also runs the tracer against a stub driver library, with root and BCC but no
 GPU; see the stub live gate in the
