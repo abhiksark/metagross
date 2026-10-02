@@ -1,16 +1,50 @@
 #!/bin/sh
 # examples/docker/metagross
 # Runs Metagross from its Docker image on a script in the current directory.
+image=${METAGROSS_IMAGE:-metagross-pytorch}
+
+case "$PWD/" in
+    /workspace/*)
+        echo "metagross: /workspace holds the image's own files;" \
+             "run from another directory" >&2
+        exit 1 ;;
+esac
+
+if [ "${1-}" = view ]; then
+    # The viewers only read saved files: no privileges, GPU, or kernel
+    # mounts, and they run as you instead of root.
+    options=
+    [ -t 0 ] && options=-t
+    for arg in "$@"; do
+        [ "$arg" = --web ] && options="$options --network=host"
+    done
+    exec docker run --rm -i --init $options --user "$(id -u):$(id -g)" \
+        -v "$PWD:$PWD" -w "$PWD" "$image" "$@"
+fi
+
 network=
+skip=
 for arg in "$@"; do
+    if [ -n "$skip" ]; then
+        skip=
+        continue
+    fi
     case "$arg" in
+        -h|--help|--version|--ebpf)
+            # Help, the version, and the eBPF source need no privileges.
+            exec docker run --rm -i "$image" "$@" ;;
         --web) network=--network=host ;;
-        *.py) break ;;  # the script: what follows belongs to it
+        --output|--summary-output|--project-root|--trace|--dashboard-port|--web-port)
+            skip=1 ;;  # the next argument is this option's value
+        --*) ;;
+        *) break ;;  # the script: what follows belongs to it
     esac
 done
+# METAGROSS_DOCKER_ARGS adds `docker run` options, for example
+# "-e CUDA_VISIBLE_DEVICES=1 -v /data:/data:ro".
 exec docker run --rm -i --gpus all --privileged --pid=host $network \
     -v /lib/modules:/lib/modules:ro -v /usr/src:/usr/src:ro \
     -v /sys/kernel/debug:/sys/kernel/debug \
     -v /sys/kernel/tracing:/sys/kernel/tracing \
-    -v "$PWD:$PWD" -w "$PWD" \
-    "${METAGROSS_IMAGE:-metagross-pytorch}" "$@"
+    -v "$PWD:$PWD" -w "$PWD" ${METAGROSS_DOCKER_ARGS-} \
+    "$image" "$@"

@@ -85,14 +85,15 @@ metagross --web run.py      # live browser dashboard
 metagross                   # the included basic workload
 ```
 
-Each call runs this command, with every argument passed to Metagross unchanged:
+A call that traces a script runs this command, with every argument passed to
+Metagross unchanged:
 
 ```sh
 docker run --rm -i --gpus all --privileged --pid=host \
   -v /lib/modules:/lib/modules:ro -v /usr/src:/usr/src:ro \
   -v /sys/kernel/debug:/sys/kernel/debug \
   -v /sys/kernel/tracing:/sys/kernel/tracing \
-  -v "$PWD:$PWD" -w "$PWD" \
+  -v "$PWD:$PWD" -w "$PWD" $METAGROSS_DOCKER_ARGS \
   metagross-pytorch "$@"
 ```
 
@@ -108,6 +109,16 @@ docker run --rm -i --gpus all --privileged --pid=host \
   dashboard. After the script it is one of the script's own arguments.
 - `METAGROSS_IMAGE` selects another image tag, for example
   `METAGROSS_IMAGE=metagross-pytorch:cu128 metagross run.py`.
+- `METAGROSS_DOCKER_ARGS` adds `docker run` options. Your shell's environment
+  variables and other directories do not reach the script unless you pass
+  them, for example
+  `METAGROSS_DOCKER_ARGS="-e CUDA_VISIBLE_DEVICES=1 -v /data:/data:ro" metagross run.py`.
+- `metagross view ...` runs the viewers as you, with only the current
+  directory mounted and no privileges, GPU, or kernel mounts, so the trace
+  files must be under the current directory. `--help`, `--version`, and
+  `--ebpf` before the script also run without privileges.
+- The command refuses to run from `/workspace` or a directory below it, where
+  the image keeps its own files.
 - `--output` and `--summary-output` refuse a path if your group or other
   users can write to the current directory or to any directory between it and
   the output file. With a umask of 002, the default on Ubuntu, the current

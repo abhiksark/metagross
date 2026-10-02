@@ -151,6 +151,9 @@ it; the command then exits with your script's status.
   `--web-port`). This removes Docker's network isolation for a container that
   already runs privileged in the host PID namespace.
 - Set `METAGROSS_IMAGE` to use another image tag, such as a CUDA 12.8 build.
+- Your shell's environment variables and other directories do not reach the
+  script. Add them with `METAGROSS_DOCKER_ARGS`, for example
+  `METAGROSS_DOCKER_ARGS="-e CUDA_VISIBLE_DEVICES=1 -v /data:/data:ro"`.
 - The capture is kept in memory only. To also save it to files, see
   [Write JSONL to the host](examples/docker/README.md#write-jsonl-to-the-host).
 
@@ -207,6 +210,9 @@ Python 3.10 or newer, without Docker, root, BCC, CUDA, or a GPU:
 python3 -m metagross --help
 python3 -m metagross view --help
 ```
+
+The `metagross` command also runs `view`, `--help`, and `--version`, in a
+container without privileges or GPU access.
 
 ## Limits
 

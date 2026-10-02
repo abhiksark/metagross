@@ -526,7 +526,7 @@ class DockerWrapperTest(unittest.TestCase):
     WRAPPER = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            os.pardir, "examples", "docker", "metagross")
 
-    def _docker_argv(self, *args, image=None):
+    def _docker_argv(self, *args, image=None, docker_args=None):
         """Run the wrapper against a fake docker and return docker's argv."""
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = os.path.join(tmp, "bin")
@@ -540,8 +540,11 @@ class DockerWrapperTest(unittest.TestCase):
             env = dict(os.environ, PWD=project,
                        PATH=bin_dir + os.pathsep + os.environ["PATH"])
             env.pop("METAGROSS_IMAGE", None)
+            env.pop("METAGROSS_DOCKER_ARGS", None)
             if image is not None:
                 env["METAGROSS_IMAGE"] = image
+            if docker_args is not None:
+                env["METAGROSS_DOCKER_ARGS"] = docker_args
             result = subprocess.run(
                 ["sh", self.WRAPPER, *args], cwd=project, env=env,
                 capture_output=True, text=True, check=True,
@@ -564,6 +567,47 @@ class DockerWrapperTest(unittest.TestCase):
         _, argv = self._docker_argv("run.py", "--web")
         self.assertNotIn("--network=host", argv)
         self.assertEqual(argv[-2:], ["run.py", "--web"])
+
+    def test_an_option_value_ending_in_py_is_not_the_script(self):
+        for output in (("--output", "out.py"), ("--output=out.py",)):
+            with self.subTest(output=output):
+                _, argv = self._docker_argv(*output, "--web", "run.py")
+                self.assertIn("--network=host", argv)
+
+    def test_help_version_and_ebpf_run_without_privileges(self):
+        for arguments in (["--help"], ["-h"], ["--version"],
+                          ["--trace", "launch", "--ebpf"]):
+            with self.subTest(arguments=arguments):
+                _, argv = self._docker_argv(*arguments)
+                self.assertEqual(
+                    argv, ["run", "--rm", "-i", "metagross-pytorch", *arguments])
+
+    def test_help_after_the_script_belongs_to_the_script(self):
+        _, argv = self._docker_argv("run.py", "--help")
+        self.assertIn("--privileged", argv)
+
+    def test_viewers_run_as_the_caller_without_privileges(self):
+        project, argv = self._docker_argv("view", "--snapshot", "trace.jsonl")
+        for option in ("--privileged", "--pid=host", "--gpus", "--network=host"):
+            self.assertNotIn(option, argv)
+        self.assertEqual(argv[argv.index("--user") + 1],
+                         f"{os.getuid()}:{os.getgid()}")
+        self.assertIn(f"{project}:{project}", argv)
+        self.assertNotIn("/sys/kernel/debug:/sys/kernel/debug", argv)
+        self.assertEqual(argv[-3:], ["view", "--snapshot", "trace.jsonl"])
+
+    def test_web_viewer_uses_host_network(self):
+        _, argv = self._docker_argv("view", "--web", "trace.jsonl")
+        self.assertIn("--network=host", argv)
+        self.assertNotIn("--privileged", argv)
+
+    def test_extra_docker_options_are_passed_through(self):
+        _, argv = self._docker_argv(
+            "run.py", docker_args="-e CUDA_VISIBLE_DEVICES=1 -v /data:/data:ro")
+        image = argv.index("metagross-pytorch")
+        self.assertEqual(argv[image - 4:image],
+                         ["-e", "CUDA_VISIBLE_DEVICES=1", "-v", "/data:/data:ro"])
+        self.assertEqual(argv[image + 1:], ["run.py"])
 
     def test_image_override(self):
         _, argv = self._docker_argv(image="metagross-pytorch:cu128")

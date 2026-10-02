@@ -20,6 +20,10 @@ User-visible changes to Metagross. Versions follow `metagross.__version__`.
 - Fix: an existing `--output` or `--summary-output` file is emptied only when
   the script is about to start, so a run that fails to attach no longer
   destroys the earlier capture.
+- The Docker `metagross` command runs `view`, `--help`, `--version`, and
+  `--ebpf` without privileges or GPU access, no longer mistakes an option
+  value ending in `.py` for the script, passes extra `docker run` options
+  from `METAGROSS_DOCKER_ARGS`, and refuses to run from `/workspace`.
 - Fix: a browser that closes its connection no longer makes the dashboard
   print a traceback, and viewer option errors no longer name internal
   functions.
