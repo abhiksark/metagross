@@ -162,7 +162,9 @@ order; sort by `timestamp` if the order matters.
 ### Op spans
 
 `metagross.span("name")` is a public context manager the target script can
-call to mark a named region of its own code:
+call to mark a named region of its own code. It and `metagross.__version__`
+are the whole Python API; every other name in the package is internal and can
+change in any release.
 
 ```python
 import metagross

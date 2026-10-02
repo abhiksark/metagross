@@ -387,7 +387,7 @@ class TopLevelHelpTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(stdout.getvalue(),
                          f"metagross {metagross.__version__}\n")
-        self.assertRegex(metagross.__version__, r"^\d+\.\d+\.\d+$")
+        self.assertRegex(metagross.__version__, r"^\d+\.\d+\.\d+(\.dev\d+)?$")
 
     def test_help_after_target_is_passed_through(self):
         cfg = metagross.parse_args(["target.py", "-h", "--help"])

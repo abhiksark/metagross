@@ -62,7 +62,11 @@ import time
 import traceback
 from typing import NoReturn
 
-__version__ = "0.1.1"
+__version__ = "0.1.2.dev0"
+
+# The Python API. Every other name in this package is internal, whether or not
+# it starts with an underscore, and can change in any release.
+__all__ = ["__version__", "main", "span"]
 
 
 def __getattr__(name: str):

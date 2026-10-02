@@ -8,6 +8,8 @@ User-visible changes to Metagross. Versions follow `metagross.__version__`.
 - The source archive now carries the tests' fixtures, the examples, and the
   documents the README links, so its unit tests run from the unpacked archive.
   The wheel carries the logo and font notices next to the license.
+- `metagross.__all__` names the Python API: `span`, `main`, and
+  `__version__`. A checkout between releases reports a `.dev0` version.
 
 ## 0.1.1 (2026-10-02)
 

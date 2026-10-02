@@ -77,5 +77,16 @@ When packaging or distribution is introduced, make sure to document and test:
 - Update `CHANGELOG.md` for user-visible changes.
 - The version lives in `metagross/__init__.py` (`__version__`); `pyproject.toml`
   reads it from there.
-- If semantic releases are added later, ensure commit messages match the release
-  tooling's expectations.
+
+## Versions
+
+- A release is `MAJOR.MINOR.PATCH`, set by a `chore: release X.Y.Z` commit that
+  also dates the changelog section, and carries the annotated tag `vX.Y.Z`.
+- Before 1.0, a patch release fixes behavior and may add options, output
+  fields, or summary fields. A minor release may change or remove them; the
+  changelog entry then starts with `Breaking:`.
+- Right after tagging, set `__version__` on master to the next patch version
+  with a `.dev0` suffix and open an `Unreleased` changelog section, so a
+  checkout between releases never reports a released version.
+- The Python API is the names in `metagross.__all__`. Other names in the
+  package are internal, with or without a leading underscore.
