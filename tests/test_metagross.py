@@ -42,10 +42,12 @@ _real_in_host_pid_namespace = metagross._in_host_pid_namespace
 
 def setUpModule():
     # The unit suite must also pass inside a container, which has its own
-    # PID namespace. PidNamespaceTest exercises the real check.
-    patcher = mock.patch("metagross._in_host_pid_namespace", return_value=True)
-    patcher.start()
-    unittest.addModuleCleanup(patcher.stop)
+    # PID namespace, and on any architecture. PidNamespaceTest exercises the
+    # real namespace check.
+    for name, value in (("_in_host_pid_namespace", True), ("_machine", "x86_64")):
+        patcher = mock.patch(f"metagross.{name}", return_value=value)
+        patcher.start()
+        unittest.addModuleCleanup(patcher.stop)
 
 
 def _reset_seq():
@@ -4000,6 +4002,27 @@ class PidNamespaceTest(unittest.TestCase):
                            side_effect=AssertionError("must not fork")):
             with self.assertRaisesRegex(MetagrossError, "--pid=host"):
                 metagross.run_live(cfg)
+
+
+class ArchitectureTest(unittest.TestCase):
+    def test_tracing_is_refused_on_other_architectures(self):
+        # The launch probes read the x86-64 stack layout; on arm64 they
+        # would report wrong block, shared-memory and stream values.
+        cfg = Config(script=__file__, project_root=os.path.dirname(__file__))
+        with mock.patch("metagross.os.geteuid", return_value=0), \
+                mock.patch("metagross._machine", return_value="aarch64"), \
+                mock.patch("metagross.os.fork",
+                           side_effect=AssertionError("must not fork")):
+            with self.assertRaisesRegex(MetagrossError,
+                                        "only x86-64.*aarch64"):
+                metagross.run_live(cfg)
+
+    def test_unprivileged_commands_work_on_any_architecture(self):
+        with mock.patch("metagross._machine", return_value="aarch64"), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(metagross.main(["--ebpf"]), 0)
+            self.assertEqual(metagross.main(["--version"]), 0)
+        self.assertIn("enter_cuLaunchKernel", out.getvalue())
 
 
 class RunLiveInitFailureTest(unittest.TestCase):

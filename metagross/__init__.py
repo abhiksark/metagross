@@ -465,6 +465,10 @@ def _forbid_new_privileges() -> None:
         raise OSError(ct.get_errno(), "prctl(PR_SET_NO_NEW_PRIVS) failed")
 
 
+def _machine() -> str:
+    return os.uname().machine
+
+
 def _in_host_pid_namespace() -> bool:
     """Return whether process IDs here are the ones the kernel reports.
 
@@ -671,6 +675,11 @@ def run_live(cfg: Config) -> int:
     # 1. Root check; validate sudo metadata, or refuse to run the target as root.
     if os.geteuid() != 0:
         raise MetagrossError("must run as root (use sudo)")
+    if _machine() != "x86_64":
+        # The probes read launch arguments from the x86-64 calling
+        # convention; elsewhere they would report plausible wrong values.
+        raise MetagrossError(
+            f"only x86-64 is supported; this machine is {_machine()}")
     if not _in_host_pid_namespace():
         raise MetagrossError(
             "not in the host PID namespace, so no CUDA call would be "

@@ -552,7 +552,7 @@ used, so multi-GPU activity is not separated.
 
 **x86-64 only**: Launch arguments are read from the System V AMD64 stack
 layout and libcuda is looked up in x86-64 library paths. Other architectures,
-including arm64, are not supported.
+including arm64, are not supported, and Metagross refuses to trace on them.
 
 **One libcuda**: Probes are attached to the `libcuda.so.1` Metagross finds
 in the standard library paths or the loader cache. If the script loads a

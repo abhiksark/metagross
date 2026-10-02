@@ -13,6 +13,8 @@ User-visible changes to Metagross. Versions follow `metagross.__version__`.
 - The reference documents how to run without the Docker image (system Python,
   a virtual environment, or your own image) and how to open the built-in
   dashboard from another machine.
+- Metagross refuses to trace on an architecture other than x86-64, where it
+  would have reported wrong launch arguments.
 
 ## 0.1.1 (2026-10-02)
 
