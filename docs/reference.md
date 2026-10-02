@@ -453,9 +453,12 @@ The profiling callback runs for every Python call/return and emits records for
 project frames. On one desktop machine it added roughly 4 to 5 µs to each call
 of a project function and 0.4 to 0.5 µs to every other Python call (Python 3.10
 and 3.13). Short-lived or Python-call-heavy programs can therefore slow down
-substantially; measure overhead on the target workload. Metagross is
-intended for local diagnosis rather than production monitoring and traces only
-the main Python process.
+substantially; measure overhead on the target workload. On the same machine a
+traced driver call took about 2 µs longer at the median and 3 µs at the 99th
+percentile: a PyTorch kernel launch went from 2.8 µs to 4.7 µs with the launch
+probes alone, and to 5.2 µs with every probe and Python attribution. Metagross
+is intended for local diagnosis rather than production monitoring and traces
+only the main Python process.
 
 **Host-side timing only**: Reported durations are elapsed monotonic time from
 CUDA API entry to return, including waiting and time when the calling thread is

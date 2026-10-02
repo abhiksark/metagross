@@ -446,6 +446,14 @@ class BenchmarkHarnessTest(unittest.TestCase):
         self.assertIn("/workspace/benchmarks/steady_state.py", command)
         self.assertIn("--iterations", command)
         self.assertIn("2000", command)
+        self.assertIn("--stats", command)
+
+    def test_profile_loss_is_read_from_the_stats_line(self):
+        match = self.benchmark["_PROFILE_LOSS_RE"].search(
+            "metagross: lost 12 profile records (writer overrun)\n"
+            "metagross: stats events=5 attributed=3 unknown=2 errors=0 lost=0 "
+            "dropped=0 lost_profile=12 refused=2 complete=false\n")
+        self.assertEqual(match.groups(), ("12", "2"))
 
     def test_summary_counts_loss_and_uses_median(self):
         summary = self.benchmark["_summarize"]([
@@ -454,11 +462,14 @@ class BenchmarkHarnessTest(unittest.TestCase):
             {"elapsed_seconds": 1.0, "lost_events": 0,
              "dropped_nested_calls": 1},
             {"elapsed_seconds": 2.0, "lost_events": 3,
-             "dropped_nested_calls": 0},
+             "dropped_nested_calls": 0, "lost_profile_records": 7,
+             "refused_attributions": 4},
         ])
         self.assertEqual(summary["median_seconds"], 2.0)
         self.assertEqual(summary["lost_events"], 5)
         self.assertEqual(summary["dropped_nested_calls"], 1)
+        self.assertEqual(summary["lost_profile_records"], 7)
+        self.assertEqual(summary["refused_attributions"], 4)
         self.assertIsNone(summary["target_median_seconds"])
 
 

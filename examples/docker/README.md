@@ -335,7 +335,8 @@ docker run --rm --gpus all \
 ## Benchmark tracing overhead
 
 The host-side benchmark runner alternates bare and traced Docker runs and writes
-machine-readable samples, medians, event-loss counters, and host/image metadata.
+machine-readable samples, medians, loss counters for events and for profile
+records, and host/image metadata.
 Rebuild the image after changing Metagross, then run a focused comparison from
 the repository root:
 
@@ -376,8 +377,8 @@ python3 examples/docker/benchmark_overhead.py \
 ```
 
 The comparison is hardware- and software-specific; it is an overhead regression
-tool, not a model-performance benchmark. A nonzero lost-event count means that
-capture was incomplete.
+tool, not a model-performance benchmark. A nonzero count in any of the three
+loss columns means that capture was incomplete.
 
 ## Troubleshooting
 

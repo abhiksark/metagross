@@ -23,7 +23,8 @@ PORTFOLIO_WORKLOADS = (
     "complex_pipeline.py",
 )
 STEADY_STATE_WORKLOADS = {
-    "python-calls": ("python", 20_000, 5),
+    # Enough records to overflow the 1 MiB profile pipe if the tracer lags.
+    "python-calls": ("python", 200_000, 5),
     "rapid-launches": ("launch", 2_000, 5),
     "compute-heavy": ("compute", 100, 5),
 }
@@ -37,6 +38,10 @@ _TRACE_MOUNTS = (
 )
 _LOST_RE = re.compile(r"metagross: lost (\d+) events")
 _DROPPED_RE = re.compile(r"metagross: dropped (\d+) nested calls")
+_PROFILE_LOSS_RE = re.compile(
+    r"metagross: stats .*lost_profile=(\d+) refused=(\d+)")
+_LOSS_KEYS = ("lost_events", "dropped_nested_calls", "lost_profile_records",
+              "refused_attributions")
 
 
 class BenchmarkError(RuntimeError):
@@ -108,7 +113,7 @@ def _docker_command(image: str, workload: str, mode: str) -> list[str]:
         command.extend(("-v", f"{host}:{container}:{access}"))
     command.append(image)
     command.extend((
-        "--json", "--output", "/benchmark-output/trace.jsonl",
+        "--json", "--output", "/benchmark-output/trace.jsonl", "--stats",
         "--project-root", project_root,
     ))
     if mode == "no-attribution":
@@ -137,10 +142,15 @@ def _run_sample(image: str, workload: str, mode: str,
             f"{result.stderr.strip()}")
     lost = sum(int(value) for value in _LOST_RE.findall(result.stderr))
     dropped = sum(int(value) for value in _DROPPED_RE.findall(result.stderr))
+    profile_loss = _PROFILE_LOSS_RE.search(result.stderr)
+    lost_profile, refused = (
+        map(int, profile_loss.groups()) if profile_loss else (0, 0))
     sample = {
         "elapsed_seconds": elapsed,
         "lost_events": lost,
         "dropped_nested_calls": dropped,
+        "lost_profile_records": lost_profile,
+        "refused_attributions": refused,
     }
     if workload in STEADY_STATE_WORKLOADS:
         try:
@@ -189,11 +199,9 @@ def _summarize(samples: list[dict]) -> dict:
         "median_seconds": statistics.median(elapsed),
         "min_seconds": min(elapsed),
         "max_seconds": max(elapsed),
-        "lost_events": sum(sample["lost_events"] for sample in samples),
-        "dropped_nested_calls": sum(
-            sample["dropped_nested_calls"] for sample in samples
-        ),
     }
+    for key in _LOSS_KEYS:
+        summary[key] = sum(sample.get(key, 0) for sample in samples)
     target_elapsed = [
         sample["target_metrics"]["median_seconds"] for sample in samples
         if "target_metrics" in sample
@@ -268,7 +276,7 @@ def run_benchmark(args: argparse.Namespace) -> dict:
 def _print_summary(report: dict) -> None:
     print(
         "WORKLOAD                 MODE                 E2E  E2E/BARE  "
-        "TARGET TARGET/BARE LOST",
+        "TARGET TARGET/BARE LOST PROFILE-LOST REFUSED",
         file=sys.stderr,
     )
     for workload, modes in report["results"].items():
@@ -285,7 +293,9 @@ def _print_summary(report: dict) -> None:
                 f"{workload:24} {mode:17} "
                 f"{result['median_seconds']:6.3f}s {ratio_text:>9} "
                 f"{target_text:>8} {target_ratio_text:>11} "
-                f"{result['lost_events']}",
+                f"{result['lost_events']:4} "
+                f"{result['lost_profile_records']:12} "
+                f"{result['refused_attributions']:7}",
                 file=sys.stderr,
             )
 
