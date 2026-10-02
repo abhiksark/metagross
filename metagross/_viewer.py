@@ -607,8 +607,16 @@ class _ViewerParser(argparse.ArgumentParser):
         raise SystemExit(status)
 
 
+def _number(value: str, kind=int):
+    # A plain ValueError would make argparse name this function in its message.
+    try:
+        return kind(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a number") from None
+
+
 def _positive_int(value: str) -> int:
-    parsed = int(value)
+    parsed = _number(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be greater than zero")
     return parsed
@@ -629,14 +637,14 @@ def _snapshot_width(value: str) -> int:
 
 
 def _refresh_interval(value: str) -> float:
-    parsed = float(value)
+    parsed = _number(value, float)
     if not 0.05 <= parsed <= 5.0:
         raise argparse.ArgumentTypeError("must be between 0.05 and 5.0 seconds")
     return parsed
 
 
 def _web_port(value: str) -> int:
-    parsed = int(value)
+    parsed = _number(value)
     if not 0 <= parsed <= 65_535:
         raise argparse.ArgumentTypeError("must be between 0 and 65535")
     return parsed
@@ -667,8 +675,12 @@ def build_parser() -> argparse.ArgumentParser:
         prog="metagross view",
         description="View a Metagross trace without root, BCC, or CUDA.",
     )
-    parser.add_argument("trace", nargs="?", type=Path)
-    parser.add_argument("--summary", type=Path)
+    parser.add_argument(
+        "trace", nargs="?", type=Path, metavar="TRACE",
+        help="JSONL trace written with --json --output")
+    parser.add_argument(
+        "--summary", type=Path, metavar="FILE",
+        help="final summary written with --summary-output")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
         "--snapshot",
@@ -690,7 +702,10 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="receive one authenticated in-memory capture for --web",
     )
-    parser.add_argument("--recent", type=_recent_limit, default=_DEFAULT_RECENT)
+    parser.add_argument(
+        "--recent", type=_recent_limit, default=_DEFAULT_RECENT, metavar="N",
+        help=f"recent events to keep (default: {_DEFAULT_RECENT}, "
+             f"at most {_MAX_RECENT})")
     parser.add_argument(
         "--width",
         type=_snapshot_width,

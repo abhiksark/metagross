@@ -20,6 +20,9 @@ User-visible changes to Metagross. Versions follow `metagross.__version__`.
 - Fix: an existing `--output` or `--summary-output` file is emptied only when
   the script is about to start, so a run that fails to attach no longer
   destroys the earlier capture.
+- Fix: a browser that closes its connection no longer makes the dashboard
+  print a traceback, and viewer option errors no longer name internal
+  functions.
 
 ## 0.1.1 (2026-10-02)
 

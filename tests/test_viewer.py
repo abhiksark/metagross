@@ -2382,6 +2382,38 @@ class ViewerRoutingTest(unittest.TestCase):
         self.trace = Path(self.directory.name) / "events.jsonl"
         self.trace.write_text(json.dumps(_record()) + "\n", encoding="utf-8")
 
+    def test_a_value_that_is_not_a_number_is_reported_plainly(self):
+        for arguments in (["--snapshot", "--recent", "abc"],
+                          ["--snapshot", "--width", "wide"],
+                          ["--web", "--port", "x"],
+                          ["--follow", "--refresh", "fast"]):
+            with self.subTest(arguments=arguments):
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    result = metagross.main(
+                        ["view", *arguments, str(self.trace)])
+                self.assertEqual(result, 2)
+                self.assertIn(f"{arguments[-1]!r} is not a number",
+                              stderr.getvalue())
+                # argparse names the converter function for a ValueError.
+                self.assertNotIn("invalid _", stderr.getvalue())
+
+    def test_a_dropped_connection_prints_no_traceback(self):
+        stderr = io.StringIO()
+        server = mock.Mock(spec=_web._DashboardServer)
+        with contextlib.redirect_stderr(stderr):
+            try:
+                raise BrokenPipeError(32, "Broken pipe")
+            except BrokenPipeError:
+                _web._DashboardServer.handle_error(server, None, ("127.0.0.1", 1))
+        self.assertEqual(stderr.getvalue(), "")
+        with contextlib.redirect_stderr(stderr):
+            try:
+                raise ValueError("a real bug")
+            except ValueError:
+                _web._DashboardServer.handle_error(server, None, ("127.0.0.1", 1))
+        self.assertIn("a real bug", stderr.getvalue())
+
     def test_snapshot_routes_without_live_trace_validation(self):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):

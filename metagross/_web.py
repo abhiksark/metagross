@@ -1822,7 +1822,6 @@ class _DashboardServer(http.server.ThreadingHTTPServer):
         # A non-loopback bind (the --host opt-in) lets LAN viewers read state.
         self.lan_mode = not ipaddress.ip_address(self.server_address[0]).is_loopback
 
-
     def process_request(self, request, client_address) -> None:
         # One thread per connection: without a cap, idle clients could hold
         # an unbounded number of them.
@@ -1840,6 +1839,14 @@ class _DashboardServer(http.server.ThreadingHTTPServer):
             super().process_request_thread(request, client_address)
         finally:
             self._slots.release()
+
+    def handle_error(self, request, client_address) -> None:
+        # A viewer that closes its connection mid-response is routine. The
+        # default would print a traceback, which under `--web` lands in the
+        # terminal that carries the trace table.
+        if isinstance(sys.exc_info()[1], ConnectionError):
+            return
+        super().handle_error(request, client_address)
 
 
 class _IngestRequestError(Exception):
