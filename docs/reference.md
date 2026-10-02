@@ -129,7 +129,9 @@ and returns. For each selected CUDA API, an eBPF uprobe stores call arguments
 and its paired uretprobe emits a completed event with the return code and
 CPU-side duration. Metagross joins GPU and profile events by native thread ID
 and the shared monotonic clock, then attributes each API call to the project
-frame that was active at API entry.
+frame its calling thread was in. A thread stays inside the driver for the
+whole call, so its frame at entry and at return are the same; Metagross looks
+it up at return, which is why a call that blocks for seconds keeps its frame.
 
 Calls in the standard library, site packages, virtual-environment packages,
 Metagross itself, and code with no source file (`exec`, frozen modules,
@@ -139,6 +141,11 @@ attributable to the project function that initiated it. Imported project
 modules and threads started through `threading` are included; threads started
 with the low-level `_thread` module are not profiled, so their calls are
 `<unknown>`.
+
+Attribution follows the interpreter, not object lifetime. Python reports a
+function's return before it releases that function's local variables, so a
+driver call made by a destructor at function exit, such as a free, is
+attributed to the caller.
 
 The target remains behind a pipe barrier until every uprobe and uretprobe
 pair is attached for its exact process ID. API calls that occur before any
@@ -477,13 +484,15 @@ bytes of a name; table rows show the first 124 characters followed by `...`.
 
 **CUDA graphs**: Replaying a graph is one `cuGraphLaunch` row with no kernel
 name; the kernels inside the graph are not listed, because the driver replays
-them without calling `cuLaunchKernel`. While a graph is being captured, each
-kernel recorded into it appears as an ordinary launch row, although it only
-runs when the graph is replayed.
+them without calling `cuLaunchKernel`. While a graph is being captured from a
+stream, each kernel recorded into it appears as an ordinary launch row,
+although it only runs when the graph is replayed. A graph built node by node
+with `cuGraphAddKernelNode` produces no launch rows, only its replays.
 
 **Untraced driver APIs**: Only the APIs in the [table](#traced-api-table) are
 traced. In particular, `cuMemsetD*`, 2D, 3D, peer and batched copies,
-pooled, managed, host and pitched allocations, and `cuStreamWaitEvent` are not
+pooled, managed, host and pitched allocations, `cuStreamWaitEvent`,
+`cuLaunchCooperativeKernel`, and `cuLaunchHostFunc` are not
 recorded. A capture of a workload that relies on these is partial even when it
 reports `complete`.
 
