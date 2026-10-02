@@ -85,7 +85,9 @@ predictable, and diagnosable. Favor a boring core over clever tracing magic.
   Use the controller's interpreter and locate the runner from this installation.
 - Allow the target interpreter to finalize normally. Reserve child `os._exit`
   for startup failure before exec, flushing startup diagnostics first.
-- Broken trace pipes must not kill the target.
+- Broken trace pipes must not kill the target. Neither must a tracer error
+  after the barrier is released: detach the probes, keep the profile pipe
+  open and drained, wait for the target, and return its status.
 - Forward SIGINT and SIGTERM to the target and keep tracing until it exits.
   The child arms `PR_SET_PDEATHSIG` after the credential drop, so a killed
   controller does not leave the target running.

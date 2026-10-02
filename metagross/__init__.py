@@ -1001,18 +1001,18 @@ def _trace(cfg, creds, uid, gid, dashboard_port, dashboard_token,
 
     # 9. Event loop: drain GPU events and profiling records, attribute,
     # render, and watch for the child's exit.
-    def _reap_and_capture():
-        """Ensure the child is dead and reaped; return its wait status."""
+    def _wait_untraced():
+        """Wait for a target that is no longer traced; pass Ctrl-C on."""
         nonlocal status, reaped
-        if reaped:
-            return status
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except OSError:
-            pass
-        _, status = os.waitpid(pid, 0)
-        reaped = True
-        return status
+        while not reaped:
+            try:
+                _, status = os.waitpid(pid, 0)
+                reaped = True
+            except KeyboardInterrupt:
+                try:
+                    os.kill(pid, signal.SIGINT)
+                except OSError:
+                    pass
 
     status = None
     interrupted = False
@@ -1134,13 +1134,21 @@ def _trace(cfg, creds, uid, gid, dashboard_port, dashboard_token,
                   file=sys.stderr)
     except Exception as exc:
         trace_failed = True
-        # Any unexpected failure here must not lose the target's exit
-        # status: kill and reap the child so its status is captured, warn
-        # once, and fall through to report that status below.
-        status = _reap_and_capture()
-        print(f"metagross: {exc}", file=sys.stderr)
-    finally:
+        # A failure in the tracer must not take the script down with it.
+        # Stop tracing, let the script finish, and report its own status.
+        if reaped:
+            print(f"metagross: {exc}", file=sys.stderr)
+        else:
+            print(f"metagross: tracing stopped on an error: {exc}; the "
+                  "script continues untraced", file=sys.stderr)
+            # Keep emptying the profile pipe: full, it would make the script
+            # wait; closed, it would raise SIGPIPE in a script that restored
+            # the default handler.
+            profile_reader.discard()
+    except BaseException:
         signal.signal(signal.SIGTERM, previous_sigterm)
+        raise
+    finally:
         os.close(profile_r)
         os.close(drops_fd)
         b.cleanup()
@@ -1151,8 +1159,10 @@ def _trace(cfg, creds, uid, gid, dashboard_port, dashboard_token,
                 render_broken = True
                 print(f"metagross: {exc}", file=sys.stderr)
 
-    if status is None:
-        status = _reap_and_capture()
+    try:
+        _wait_untraced()  # returns at once unless tracing stopped early
+    finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
 
     target_exit_status = exit_status_from_wait(status)
     if stats is not None:

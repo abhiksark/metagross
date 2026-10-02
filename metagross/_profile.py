@@ -538,6 +538,7 @@ class ProfileReader:
         self._thread = threading.Thread(target=self._run, name="metagross-profile",
                                         daemon=True)
         self._busy = False  # the thread holds bytes that are not queued yet
+        self._discarding = False
         self._dropped = 0   # records the target reports it dropped
         self._announced_drops = 0
         self.at_eof = False
@@ -558,7 +559,8 @@ class ProfileReader:
                 select.select([self._fd], [], [])
                 self._busy = True
                 data = os.read(self._fd, 65536)
-                self._q.put(data)
+                if not (self._discarding and data):
+                    self._q.put(data)
                 self._busy = False
                 if not data:
                     break  # EOF: write end closed
@@ -573,6 +575,20 @@ class ProfileReader:
     # final-drain deadline, this thread stays blocked in os.read on its dup;
     # the daemon thread and its dup are reclaimed at process exit, which is
     # imminent once run_live returns. Do not close the dup from another thread.
+
+    def discard(self) -> None:
+        """Stop keeping what the target writes, but keep emptying the pipe.
+
+        For a capture abandoned while the target runs on. The read end stays
+        open and drained, so the target neither waits on a full pipe nor
+        writes into a closed one.
+        """
+        self._discarding = True
+        while True:  # the thread may be waiting for room to queue a chunk
+            try:
+                self._q.get_nowait()
+            except queue.Empty:
+                break
 
     def _consume(self, item) -> list:
         if not item:

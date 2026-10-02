@@ -51,6 +51,9 @@ User-visible changes to Metagross. Versions follow `metagross.__version__`.
 - A call whose arguments the probe could not read carries `unread: true` in
   its details instead of zeros that look real, and a call that could not be
   recorded because the in-flight table was full counts as a lost event.
+- Fix: a tracer error after the script has started no longer kills the
+  script. Metagross stops tracing, lets the script finish, returns its exit
+  status, and marks the capture incomplete (`trace_failed`).
 - Breaking, security: `--output` and `--summary-output` are refused in a
   directory that does not belong to the invoking user, unless it is a shared
   sticky directory such as `/tmp`. Before, a user allowed to run only

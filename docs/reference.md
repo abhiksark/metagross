@@ -647,7 +647,12 @@ with its summary. If Metagross itself is killed, the kernel sends the script
 SIGTERM, so the script does not run on unattended. Metagross returns 1 for validation,
 dependency, privilege, probe, compile, attach, transport, or cleanup
 failures, and 2 for invalid command-line syntax. A broken trace output stops
-rendering but lets the target finish and preserves its status.
+rendering but lets the target finish and preserves its status. An error in
+the tracer after the script has started does the same: Metagross prints
+`tracing stopped on an error`, removes its probes, lets the script run to its
+end, returns the script's status, and marks the capture incomplete
+(`trace_failed`). The script keeps its profiling hook, and so its overhead,
+until it exits.
 With `--web`, Metagross keeps serving the finished capture after the target
 exits and returns the target's status once Ctrl-C or SIGTERM stops the
 dashboard, so a non-interactive run blocks until it is signalled. A dashboard
