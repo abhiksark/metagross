@@ -732,10 +732,11 @@ as lost profile records and treated like any other loss: the frames known at
 that point are forgotten and the capture is incomplete. On every loop
 tick, whether or not the GPU is active, frame history older than 100 ms before
 the last ring buffer drain and the oldest call still waiting is discarded,
-and nothing is kept for a thread whose history is empty.
-A call waits at most five seconds for its profile history, and at
-most 200,000 calls wait at once; beyond either limit the oldest are
-written as `<unknown>`. If the tracer stops reading
+nothing is kept for a thread whose history is empty, and at most 512 KiB of
+profile data is decoded so the ring buffer keeps being read. A call waits at
+most five seconds for its profile history, and at most 200,000 calls wait at
+once; beyond either limit the oldest are written as `<unknown>`. If the tracer
+stops reading
 altogether, the script waits at most one second for it, then carries on and
 drops profile records until the tracer reads again; the capture is marked
 incomplete.

@@ -1795,6 +1795,24 @@ class ProfileReaderTest(unittest.TestCase):
         out.extend(reader.poll())
         self.assertEqual([r for r in out if r[0] == "gap"], [("gap", 200)])
 
+    def test_poll_decodes_a_bounded_number_of_chunks(self):
+        # One call must not keep the event loop from the ring buffer for as
+        # long as the target keeps writing.
+        r, w = os.pipe()
+        self.addCleanup(os.close, r)
+        self.addCleanup(os.close, w)
+        reader = _profile.ProfileReader(r)
+        reader._q.put(_profile.encode_hello(pid=1, start_ns=0))
+        for ts in (10, 20, 30):
+            reader._q.put(_profile.encode_frame(
+                _profile.CALL, 7, ts, "run", "/p/a.py", 3))
+        self.assertEqual(reader.poll(max_chunks=2), [
+            ("frame", _profile.CALL, 7, 10, "run", "/p/a.py", 3)])
+        self.assertTrue(reader.has_backlog())
+        self.assertEqual(reader.drained_ns, 0)
+        self.assertEqual(len(reader.poll()), 2)
+        self.assertFalse(reader.has_backlog())
+
     def test_backlog_is_bounded_when_the_controller_falls_behind(self):
         r, w = os.pipe()
         reader = _profile.ProfileReader(r, max_chunks=2)

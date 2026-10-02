@@ -13,7 +13,8 @@ User-visible changes to Metagross. Versions follow `metagross.__version__`.
   nonzero count marks the capture incomplete.
 - Fix: a call from a function beyond the 65,536-function limit is `<unknown>`
   instead of being given to its caller.
-- Finished threads no longer accumulate in the tracer.
+- Profile records are decoded about twice as fast, and finished threads no
+  longer accumulate in the tracer.
 - Fix: a mapped file with a name that is not valid UTF-8 no longer makes
   the tracer fail and kill the script, and the wrong-`libcuda` warning no
   longer prints control characters from the library path.

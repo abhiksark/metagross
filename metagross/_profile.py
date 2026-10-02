@@ -37,6 +37,7 @@ _SEQ_MOD = 2**32
 _MAX_STR = 500
 _MAX_FRAMES = 1 << 16  # distinct frames the controller keeps per capture
 _MAX_QUEUED_CHUNKS = 256  # 64 KiB reads the controller may fall behind by
+_POLL_CHUNKS = 8  # 64 KiB reads decoded per call, so the caller's loop keeps turning
 _MUST_DELIVER_TIMEOUT_S = 1.0  # wait on a full pipe for a record that must arrive
 
 # Every record starts with this 6-byte common header.
@@ -326,16 +327,20 @@ class RecordReader:
         self._pending_gap = False
 
     def feed(self, data: bytes) -> list[tuple]:
-        self._buf += data
+        # One buffer per call and an offset into it: slicing the remainder
+        # off after every record would copy the chunk once per record.
+        buf = self._buf + data
+        size = len(buf)
+        pos = 0
         out: list[tuple] = []
-        while len(self._buf) >= _COMMON.size:
-            rtype, seq, _reserved = _COMMON.unpack_from(self._buf)
+        while size - pos >= _COMMON.size:
+            rtype, seq, _reserved = _COMMON.unpack_from(buf, pos)
+            body = pos + _COMMON.size
             if rtype == HELLO:
-                need = _COMMON.size + _HELLO_BODY.size
-                if len(self._buf) < need:
+                end = body + _HELLO_BODY.size
+                if size < end:
                     break
-                version, _pid, _start_ns = _HELLO_BODY.unpack_from(
-                    self._buf, _COMMON.size)
+                version, _pid, _start_ns = _HELLO_BODY.unpack_from(buf, body)
                 self.version = version
                 if self._expected is None:
                     # The very first record ever: this HELLO establishes
@@ -347,36 +352,29 @@ class RecordReader:
                     # one), but route it through the same gap check as
                     # every other rtype for a uniform invariant.
                     self._note_seq(seq, out, None)
-                self._buf = self._buf[need:]
-                continue
-            if rtype == FRAME_DEF:
-                prefix_off = _COMMON.size
-                if len(self._buf) < prefix_off + _FRAME_DEF_PREFIX.size:
+            elif rtype == FRAME_DEF:
+                names = body + _FRAME_DEF_PREFIX.size
+                if size < names:
                     break
                 frame_id, line, _pad, fl, pl = _FRAME_DEF_PREFIX.unpack_from(
-                    self._buf, prefix_off)
+                    buf, body)
                 if fl > _MAX_STR or pl > _MAX_STR:
                     return self._corrupt(out)  # the hook never writes this
-                body_off = prefix_off + _FRAME_DEF_PREFIX.size
-                total = body_off + fl + pl
-                if len(self._buf) < total:
+                end = names + fl + pl
+                if size < end:
                     break
-                func = self._buf[body_off:body_off + fl].decode("utf-8", "replace")
-                path = self._buf[body_off + fl:total].decode("utf-8", "replace")
-                self._buf = self._buf[total:]
+                func = buf[names:names + fl].decode("utf-8", "replace")
+                path = buf[names + fl:end].decode("utf-8", "replace")
                 # FRAME_DEF carries no ts_ns of its own; a gap revealed here
                 # has an unknown ts until the next timestamped record.
                 self._note_seq(seq, out, None)
                 if frame_id in self._frames or len(self._frames) < _MAX_FRAMES:
                     self._frames[frame_id] = (func, path, line)
-                continue
-            if rtype in (_FRAME_CALL_RTYPE, _FRAME_RETURN_RTYPE):
-                need = _COMMON.size + _FRAME_REF_BODY.size
-                if len(self._buf) < need:
+            elif rtype in (_FRAME_CALL_RTYPE, _FRAME_RETURN_RTYPE):
+                end = body + _FRAME_REF_BODY.size
+                if size < end:
                     break
-                tid, ts_ns, frame_id = _FRAME_REF_BODY.unpack_from(
-                    self._buf, _COMMON.size)
-                self._buf = self._buf[need:]
+                tid, ts_ns, frame_id = _FRAME_REF_BODY.unpack_from(buf, body)
                 self._note_seq(seq, out, ts_ns)
                 frame = self._frames.get(frame_id)
                 if frame is None:
@@ -387,59 +385,51 @@ class RecordReader:
                     # it for the unknown frame's calls, so report a gap.
                     self.lost_records += 1
                     out.append(("gap", ts_ns))
-                    continue
-                kind = _KIND_BY_FRAME_RTYPE[rtype]
-                out.append(("frame", kind, tid, ts_ns, *frame))
-                continue
-            if rtype == SPAN_SET:
-                prefix_off = _COMMON.size
-                if len(self._buf) < prefix_off + _SPAN_SET_PREFIX.size:
+                else:
+                    kind = _KIND_BY_FRAME_RTYPE[rtype]
+                    out.append(("frame", kind, tid, ts_ns, *frame))
+            elif rtype == SPAN_SET:
+                name_at = body + _SPAN_SET_PREFIX.size
+                if size < name_at:
                     break
-                tid, ts_ns, nl = _SPAN_SET_PREFIX.unpack_from(
-                    self._buf, prefix_off)
+                tid, ts_ns, nl = _SPAN_SET_PREFIX.unpack_from(buf, body)
                 if nl > _MAX_STR:
                     return self._corrupt(out)
-                body_off = prefix_off + _SPAN_SET_PREFIX.size
-                total = body_off + nl
-                if len(self._buf) < total:
+                end = name_at + nl
+                if size < end:
                     break
-                name = self._buf[body_off:total].decode("utf-8", "replace")
-                self._buf = self._buf[total:]
+                name = buf[name_at:end].decode("utf-8", "replace")
                 self._note_seq(seq, out, ts_ns)
                 out.append(("span", tid, ts_ns, name))
-                continue
-            if rtype == SPAN_CLEAR:
-                need = _COMMON.size + _SPAN_CLEAR_BODY.size
-                if len(self._buf) < need:
+            elif rtype == SPAN_CLEAR:
+                end = body + _SPAN_CLEAR_BODY.size
+                if size < end:
                     break
-                tid, ts_ns = _SPAN_CLEAR_BODY.unpack_from(self._buf, _COMMON.size)
-                self._buf = self._buf[need:]
+                tid, ts_ns = _SPAN_CLEAR_BODY.unpack_from(buf, body)
                 self._note_seq(seq, out, ts_ns)
                 out.append(("span", tid, ts_ns, None))
-                continue
-            if rtype == HOOK_REPLACED:
-                need = _COMMON.size + _HOOK_REPLACED_BODY.size
-                if len(self._buf) < need:
+            elif rtype == HOOK_REPLACED:
+                end = body + _HOOK_REPLACED_BODY.size
+                if size < end:
                     break
-                (ts_ns,) = _HOOK_REPLACED_BODY.unpack_from(self._buf, _COMMON.size)
-                self._buf = self._buf[need:]
+                (ts_ns,) = _HOOK_REPLACED_BODY.unpack_from(buf, body)
                 self._note_seq(seq, out, ts_ns)
                 # Frames open on that thread will never be seen to return;
                 # treat it like lost records and forget what came before.
                 self.hook_replacements += 1
                 self.lost_records += 1
                 out.append(("gap", ts_ns))
-                continue
-            if rtype == END:
-                need = _COMMON.size + _END_BODY.size
-                if len(self._buf) < need:
+            elif rtype == END:
+                end = body + _END_BODY.size
+                if size < end:
                     break
-                (ts_ns,) = _END_BODY.unpack_from(self._buf, _COMMON.size)
-                self._buf = self._buf[need:]
+                (ts_ns,) = _END_BODY.unpack_from(buf, body)
                 self._note_seq(seq, out, ts_ns)
                 self._ended = True
-                continue
-            return self._corrupt(out)  # unknown rtype
+            else:
+                return self._corrupt(out)  # unknown rtype
+            pos = end
+        self._buf = buf[pos:]
         return out
 
     def _corrupt(self, out: list) -> list:
@@ -579,15 +569,21 @@ class ProfileReader:
         """Return whether the stream stopped without the target's END."""
         return self._reader.ended_early
 
-    def poll(self) -> list:
+    def has_backlog(self) -> bool:
+        """Return whether `poll` left chunks it has not decoded yet."""
+        return not self.at_eof and not self._q.empty()
+
+    def poll(self, max_chunks: int = _POLL_CHUNKS) -> list:
         out = []
-        while not self.at_eof:
+        for _ in range(max_chunks):
+            if self.at_eof:
+                break
             try:
                 item = self._q.get_nowait()
             except queue.Empty:
                 break
             out.extend(self._consume(item))
-        if self._reader._pending_gap:
+        if self._reader._pending_gap and not self.has_backlog():
             # A gap revealed on a no-ts record is normally resolved by the
             # next real-ts record (see RecordReader._note_seq), but poll()
             # is called roughly every event-loop tick and the resolving

@@ -934,7 +934,9 @@ def _trace(cfg, creds, uid, gid, dashboard_port, dashboard_token) -> int:
                     # over by the poll below. The profile drain after it can
                     # take long, so history is pruned relative to this time.
                     ring_drained_ns = time.monotonic_ns()
-                    b.ring_buffer_poll(50)
+                    # Do not sleep on the ring buffer while profile records
+                    # are waiting to be decoded.
+                    b.ring_buffer_poll(0 if profile_reader.has_backlog() else 50)
                     for rec in profile_reader.poll():
                         joiner.on_profile_record(rec)
                     _emit_all(joiner.flush(
