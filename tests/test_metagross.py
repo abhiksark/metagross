@@ -3124,7 +3124,23 @@ class RendererTest(unittest.TestCase):
         self.assertIn("train_step", out)
         self.assertIn("train.py:31", out)
         self.assertIn("kernel=vec_add", out)
-        self.assertIn("0.02ms", out)
+        self.assertIn("20.0us", out)
+
+    def test_table_columns_fit_every_api_and_short_durations(self):
+        # Most driver calls take a few microseconds, which two decimals of
+        # a millisecond showed as 0.00ms.
+        header = None
+        for api in _bpf.APIS:
+            if api.category == "register":
+                continue
+            raw = _raw(api.api_id, ts=3_600_000_000_000, dur=3_500, tid=1)
+            out = self._emit(_events.AttributedEvent(raw, api, None),
+                             json_output=False)
+            header, row = out.splitlines()
+            with self.subTest(api=api.base):
+                self.assertEqual(row[header.index("RET"):][:1], "0")
+                self.assertEqual(
+                    row[header.index("DURATION"):].split()[0], "3.5us")
 
     def test_table_cuts_a_long_kernel_name_but_json_keeps_it(self):
         name = "_ZN2at6native" + "x" * 600

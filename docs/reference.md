@@ -255,9 +255,11 @@ task's span with the last one reported on every Python call, which adds about
 The table begins with this illustrative shape (timings vary):
 
 ```text
-TIME        FUNCTION          LOCATION            API             RET  DURATION DETAILS
-12:10:03.41 compute           gpu_demo.py:86      LaunchKernel    0    0.05ms   kernel=vec_add grid=8,1,1 block=128,1,1 shared=0 stream=0x0
+TIME        FUNCTION          LOCATION            API               RET  DURATION DETAILS
+12:10:03.41 compute           gpu_demo.py:86      LaunchKernel      0    50.0us   kernel=vec_add grid=8,1,1 block=128,1,1 shared=0 stream=0x0
 ```
+
+`DURATION` uses the unit that fits the value: `ns`, `us`, `ms`, or `s`.
 
 Detail strings use shell-safe quoting. Control characters in a row, which can
 only come from target-supplied kernel, span, or file names, are printed as `?`.

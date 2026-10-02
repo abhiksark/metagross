@@ -24,6 +24,8 @@ User-visible changes to Metagross. Versions follow `metagross.__version__`.
   `--ebpf` without privileges or GPU access, no longer mistakes an option
   value ending in `.py` for the script, passes extra `docker run` options
   from `METAGROSS_DOCKER_ARGS`, and refuses to run from `/workspace`.
+- Breaking: table rows show durations in the unit that fits (`3.5us` instead
+  of `0.00ms`), and the API column is wide enough for every traced API.
 - Fix: a browser that closes its connection no longer makes the dashboard
   print a traceback, and viewer option errors no longer name internal
   functions.

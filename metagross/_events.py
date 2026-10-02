@@ -13,7 +13,7 @@ import shlex
 import time
 import unicodedata
 
-from metagross import _bpf, MetagrossError
+from metagross import _bpf, _viewer, MetagrossError
 
 
 _UNSET = object()
@@ -609,8 +609,9 @@ def printable(text: str) -> str:
         for character in text)
 
 
+# The API column fits the longest name, `StreamSynchronize`.
 _COLUMNS = (("TIME", 12), ("FUNCTION", 18), ("LOCATION", 20),
-            ("API", 16), ("RET", 5), ("DURATION", 9))
+            ("API", 18), ("RET", 5), ("DURATION", 9))
 
 
 def event_record(
@@ -673,7 +674,7 @@ class Renderer:
                if ev.frame else "<unknown>")
         cells = (moment.strftime("%H:%M:%S.") + f"{moment.microsecond // 10000:02d}",
                  func, loc, ev.api.base.removeprefix("cu"),
-                 str(ev.raw.ret), f"{ev.raw.dur / 1e6:.2f}ms")
+                 str(ev.raw.ret), _viewer._duration(ev.raw.dur))
         row = "".join(c.ljust(w) if len(c) < w else c + " "
                       for c, (_, w) in zip(cells, _COLUMNS))
         self._write(printable(row + shell_quote_details(details)) + "\n")
