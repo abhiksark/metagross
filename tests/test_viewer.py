@@ -2079,7 +2079,7 @@ async function paste(text, blocked = false) {
         environment["PYTHONDONTWRITEBYTECODE"] = "1"
         process = subprocess.Popen(
             [
-                "/usr/bin/python3",
+                sys.executable,
                 "-B",
                 "-m",
                 "metagross",
@@ -2201,7 +2201,7 @@ async function paste(text, blocked = false) {
         environment["METAGROSS_DASHBOARD_TOKEN"] = token
         process = subprocess.Popen(
             [
-                "/usr/bin/python3",
+                sys.executable,
                 "-B",
                 "-m",
                 "metagross",
@@ -2783,7 +2783,7 @@ class LiveDashboardPtyTest(unittest.TestCase):
                 environment["PYTHONDONTWRITEBYTECODE"] = "1"
                 process = subprocess.Popen(
                     [
-                        "/usr/bin/python3",
+                        sys.executable,
                         "-B",
                         "-m",
                         "metagross",

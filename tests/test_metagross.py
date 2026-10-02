@@ -37,6 +37,16 @@ from metagross import _web
 
 INTEGRATION = os.environ.get("RUN_EBPF_INTEGRATION") == "1"
 
+_real_in_host_pid_namespace = metagross._in_host_pid_namespace
+
+
+def setUpModule():
+    # The unit suite must also pass inside a container, which has its own
+    # PID namespace. PidNamespaceTest exercises the real check.
+    patcher = mock.patch("metagross._in_host_pid_namespace", return_value=True)
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
+
 
 def _fresh_output_path(test):
     """Return a not-yet-created trace-output path metagross can create and own.
@@ -3941,12 +3951,12 @@ class PidNamespaceTest(unittest.TestCase):
     def test_only_the_initial_pid_namespace_is_accepted(self):
         with mock.patch("metagross.os.stat",
                         return_value=mock.Mock(st_ino=0xEFFFFFFC)):
-            self.assertTrue(metagross._in_host_pid_namespace())
+            self.assertTrue(_real_in_host_pid_namespace())
         with mock.patch("metagross.os.stat",
                         return_value=mock.Mock(st_ino=4026535076)):
-            self.assertFalse(metagross._in_host_pid_namespace())
+            self.assertFalse(_real_in_host_pid_namespace())
         with mock.patch("metagross.os.stat", side_effect=OSError):
-            self.assertTrue(metagross._in_host_pid_namespace())
+            self.assertTrue(_real_in_host_pid_namespace())
 
     def test_tracing_is_refused_outside_the_host_pid_namespace(self):
         # There the probes would match no process: an empty capture that
