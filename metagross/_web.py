@@ -1239,7 +1239,9 @@ _APP_JS = rb"""(() => {
     setText("status-text", data.status);
     byId("status-badge").className = `status-badge ${statusClass(data.status)}`;
     const warning = byId("warning");
-    const warningText = data.trace_error || data.summary_error;
+    const reasons = data.incomplete_reasons || [];
+    const warningText = data.trace_error || data.summary_error
+      || (reasons.length ? `Incomplete: ${reasons.join("; ")}` : "");
     warning.hidden = !warningText;
     warning.textContent = warningText || "";
     byId("token-form").hidden = true;
@@ -1536,6 +1538,7 @@ def _model_payload(
             _viewer.sanitize_text(summary_error) if summary_error is not None else None
         ),
         "refresh_ms": max(50, int(refresh_seconds * 1000)),
+        "incomplete_reasons": model.incomplete_reasons(),
         "metrics": {
             "events": model.events,
             "event_rate": round(event_rate, 1),

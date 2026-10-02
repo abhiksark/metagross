@@ -620,6 +620,47 @@ class LiveDashboardRendererTest(unittest.TestCase):
         self.assertEqual(lines[-2], "Summary warning: invalid summary")
         self.assertIn("q quit", lines[-1])
 
+    def test_every_viewer_says_why_a_capture_is_incomplete(self):
+        model = _viewer.TraceModel()
+        model.observe(_viewer.parse_event(_record()))
+        model.load_summary({
+            "schema_version": 1, "complete": False,
+            "capture": {"events": 1, "lost_events": 0,
+                        "lost_profile_records": 7,
+                        "refused_attributions": 1200,
+                        "libcuda_mismatch": True, "trace_failed": False},
+        })
+        reasons = [
+            "7 profile records lost",
+            "1,200 calls left unattributed for lack of profile history",
+            "the script used a libcuda that was not traced",
+        ]
+        self.assertEqual(model.incomplete_reasons(), reasons)
+        snapshot = _viewer.render_snapshot(model, width=100)
+        self.assertIn("INCOMPLETE", snapshot[0])
+        for reason in reasons:
+            self.assertIn(f"Incomplete: {reason}", snapshot)
+        live = _tui.render_live_dashboard(
+            model, width=160, height=18, event_rate=1.0)
+        self.assertEqual(len(live), 18)
+        self.assertEqual(live[-2], "Incomplete: " + "; ".join(reasons))
+        payload = _web._model_payload(
+            model, trace_name="t", waiting=False, trace_error=None,
+            summary_error=None, event_rate=0.0, refresh_seconds=0.2)
+        self.assertEqual(payload["incomplete_reasons"], reasons)
+        self.assertIn(b"data.incomplete_reasons", _web._APP_JS)
+
+    def test_a_complete_capture_shows_no_reason(self):
+        model = _viewer.TraceModel()
+        model.observe(_viewer.parse_event(_record()))
+        self.assertEqual(model.incomplete_reasons(), [])  # no summary yet
+        model.load_summary({"schema_version": 1, "complete": True,
+                            "capture": {"events": 1, "lost_events": 0,
+                                        "libcuda_mismatch": False}})
+        self.assertEqual(model.incomplete_reasons(), [])
+        self.assertNotIn(
+            "Incomplete", "\n".join(_viewer.render_snapshot(model, width=100)))
+
     def test_color_setup_falls_back_without_failing_dashboard(self):
         class CursesError(Exception):
             pass

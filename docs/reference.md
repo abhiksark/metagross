@@ -771,7 +771,7 @@ web server returns 130.
 | `PAUSED` | Terminal follower consumption is paused. |
 | `EVENTS ONLY` | Snapshot has valid events but no completeness summary. |
 | `COMPLETE` | Summary declares completeness and event count matches. |
-| `INCOMPLETE` | Capture or direct delivery reports loss/failure. |
+| `INCOMPLETE` | Capture or direct delivery reports loss/failure. Every viewer prints the reason, for example `7 profile records lost`. |
 | `MISMATCH` | Observed event count disagrees with the summary. |
 | `MALFORMED` or ` / MALFORMED` | Invalid lines were skipped; inspect the count. |
 | `LIVE / SUMMARY ERROR` | Non-empty summary is invalid; retry occurs on change. |
@@ -785,8 +785,10 @@ its newline arrives and reset on trace replacement or truncation.
 
 The browser state payload uses `schema_version: 1`. Its fields are
 `generation`, `trace_name`, `status`, `waiting`, `trace_error`, `summary_error`,
-`refresh_ms`, `metrics`, `timeline`, `top_apis`, `top_functions`, `top_kernels`,
-`recent_events`, and `memory_samples`. It is a bounded display model, not a
+`refresh_ms`, `incomplete_reasons`, `metrics`, `timeline`, `top_apis`,
+`top_functions`, `top_kernels`, `recent_events`, and `memory_samples`.
+`incomplete_reasons` is a list of sentences saying why the final summary
+reports the capture incomplete; it is empty otherwise. It is a bounded display model, not a
 replacement for the durable JSONL capture. The timeline represents retained
 recent events, while aggregates summarize all successfully read events.
 

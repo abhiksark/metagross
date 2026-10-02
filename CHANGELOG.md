@@ -24,6 +24,10 @@ User-visible changes to Metagross. Versions follow `metagross.__version__`.
   `--ebpf` without privileges or GPU access, no longer mistakes an option
   value ending in `.py` for the script, passes extra `docker run` options
   from `METAGROSS_DOCKER_ARGS`, and refuses to run from `/workspace`.
+- The snapshot, terminal, and browser viewers say why a capture is
+  incomplete, for example `7 profile records lost` or `the script used a
+  libcuda that was not traced`. The dashboard state gains an
+  `incomplete_reasons` list.
 - Breaking, security: `--output` and `--summary-output` are refused in a
   directory that does not belong to the invoking user, unless it is a shared
   sticky directory such as `/tmp`. Before, a user allowed to run only

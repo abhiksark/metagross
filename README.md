@@ -162,7 +162,7 @@ it; the command then exits with your script's status.
 | Area | What it shows |
 |------|---------------|
 | Metric strip | Events and event rate, attributed percentage, CUDA errors, CPU API time, synchronization time, copied bytes, and current and peak observed allocations. |
-| Integrity counters | Lost, dropped, delivery-dropped, and malformed event counts. |
+| Integrity counters | Lost, dropped, delivery-dropped, and malformed event counts. An incomplete capture also shows the reason above the timeline. |
 | CUDA API timeline | One lane per function name, plus `<unknown>`, with zoom, pan, and API-family and text filters. |
 | Selection details | The selected call's timing, thread, function, file, kernel, and captured arguments. |
 | Events view | The most recent calls matching the timeline filters (500 by default), newest first. |

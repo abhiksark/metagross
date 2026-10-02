@@ -211,7 +211,8 @@ def render_live_dashboard(
 
     action = "resume" if paused else "pause"
     footer = f"q quit | p {action} | Ctrl-C stop | refresh {refresh_seconds:.2f}s"
-    reserved_rows = 1 + (1 if summary_error else 0)
+    reasons = model.incomplete_reasons()
+    reserved_rows = 1 + (1 if summary_error else 0) + (1 if reasons else 0)
     body_height = height - reserved_rows
 
     if width >= 79 and height >= _MIN_TERMINAL_HEIGHT:
@@ -239,6 +240,8 @@ def render_live_dashboard(
     lines = lines[:body_height]
     while len(lines) < body_height:
         lines.append("")
+    if reasons:
+        lines.append(_viewer._fit("Incomplete: " + "; ".join(reasons), width))
     if summary_error:
         lines.append(_viewer._fit(f"Summary warning: {summary_error}", width))
     lines.append(_viewer._fit(footer, width))

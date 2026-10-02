@@ -31,6 +31,23 @@ _DEFAULT_RECENT = 500
 _MAX_INT = 2**63
 
 
+# What in a summary's `capture` object makes a capture incomplete, in the
+# words the viewers show.
+_LOSS_COUNTERS = (
+    ("lost_events", "{} events lost in the ring buffer"),
+    ("dropped_nested_calls", "{} nested calls dropped"),
+    ("lost_profile_records", "{} profile records lost"),
+    ("refused_attributions",
+     "{} calls left unattributed for lack of profile history"),
+    ("delivery_dropped", "{} events not delivered to the dashboard"),
+)
+_FAILURE_FLAGS = (
+    ("libcuda_mismatch", "the script used a libcuda that was not traced"),
+    ("render_failed", "writing the trace output failed"),
+    ("trace_failed", "the tracer stopped on an error"),
+)
+
+
 class ViewerError(Exception):
     """A trace or summary cannot be viewed safely."""
 
@@ -186,6 +203,17 @@ class TraceModel:
         if self.malformed_lines:
             status += " / MALFORMED"
         return status
+
+    def incomplete_reasons(self) -> list[str]:
+        """Return why the summary reports the capture incomplete."""
+        reasons = []
+        for name, text in _LOSS_COUNTERS:
+            count = self.summary_capture(name)
+            if _is_int(count) and count > 0:
+                reasons.append(text.format(f"{count:,}"))
+        reasons.extend(text for name, text in _FAILURE_FLAGS
+                       if self.summary_capture(name) is True)
+        return reasons
 
     def summary_capture(self, name: str, default=0):
         if self.summary is None:
@@ -532,6 +560,9 @@ def render_snapshot(model: TraceModel, width: int = 120) -> list[str]:
                 width,
             )
         )
+
+    lines.extend(_fit(f"Incomplete: {reason}", width)
+                 for reason in model.incomplete_reasons())
 
     lines.extend(("", _heading("TOP APIS (CPU duration)", width)))
     api_width = width - 41
