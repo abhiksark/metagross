@@ -650,6 +650,26 @@ class LiveDashboardRendererTest(unittest.TestCase):
         self.assertEqual(payload["incomplete_reasons"], reasons)
         self.assertIn(b"data.incomplete_reasons", _web._APP_JS)
 
+    def test_spans_are_listed_in_the_snapshot_and_sent_to_the_browser(self):
+        model = _viewer.TraceModel()
+        model.observe(_viewer.parse_event(_record(span="forward")))
+        model.observe(_viewer.parse_event(_record(span="forward")))
+        model.observe(_viewer.parse_event(_record()))
+        text = "\n".join(_viewer.render_snapshot(model, width=100))
+        self.assertIn("TOP SPANS (by calls)", text)
+        self.assertRegex(text, r"forward +2 ")
+        payload = _web._model_payload(
+            model, trace_name="t", waiting=False, trace_error=None,
+            summary_error=None, event_rate=0.0, refresh_seconds=0.2)
+        self.assertEqual(
+            [event["span"] for event in payload["timeline"]["events"]],
+            ["forward", "forward", None])
+        self.assertIn(b'setText("detail-span"', _web._APP_JS)
+        without = _viewer.TraceModel()
+        without.observe(_viewer.parse_event(_record()))
+        self.assertNotIn(
+            "TOP SPANS", "\n".join(_viewer.render_snapshot(without, width=100)))
+
     def test_a_complete_capture_shows_no_reason(self):
         model = _viewer.TraceModel()
         model.observe(_viewer.parse_event(_record()))

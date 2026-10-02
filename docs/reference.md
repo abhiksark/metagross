@@ -433,7 +433,7 @@ needs no TTY, root, BCC, CUDA, GPU, JavaScript packages, or external network
 access. Choose another port with `--port PORT`; use `--port 0` to let the OS
 select a free one. The timeline-first workspace groups CUDA driver
 API events by attributed project function and provides API/function/kernel
-search, API-family filters, 1x to 16x zoom, drag-to-pan navigation, synchronized
+and span search, API-family filters, 1x to 16x zoom, drag-to-pan navigation, synchronized
 timeline and event-table selection, and a source/detail inspector. Compute-style
 summary sections retain allocation history and top APIs, functions, and kernels.
 Clipped timeline labels expose their full event summary on pointer hover or
@@ -810,8 +810,8 @@ before the first state request. After a server restart, use its new private URL.
 ## Storage and display bounds
 
 Viewer line reads are limited to 1 MiB and summary reads to 4 MiB. Aggregate
-storage is bounded to 512 APIs, 4,096 functions, and 4,096 kernels, with overflow
-folded into other groups. Memory history retains 2,000 samples. The configured
+storage is bounded to 512 APIs, 4,096 functions, 4,096 kernels, and 4,096
+spans, with overflow folded into other groups. Memory history retains 2,000 samples. The configured
 recent-event bound is at most 10,000; the web payload can show a smaller subset.
 The browser timeline and Events view cap that retained window at 1,000 events,
 memory samples at 120, and each top-groups section at eight rows.

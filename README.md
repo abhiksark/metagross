@@ -191,9 +191,10 @@ with metagross.span("step"):
 ```
 
 Calls made inside the block by the same thread or `asyncio` task carry `"step"`
-in the `span` field of table and JSONL output; the web dashboard does not show
-spans. Spans need function attribution and do nothing when the script runs
-outside a trace.
+in the `span` field of table and JSONL output. The snapshot viewer lists the
+top spans and the web dashboard shows a selected call's span and filters by
+it; the terminal follow view does not show spans. Spans need function
+attribution and do nothing when the script runs outside a trace.
 See [op spans](docs/reference.md#op-spans) and the annotated
 [`examples/quicklook.py`](examples/quicklook.py).
 

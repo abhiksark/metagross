@@ -147,7 +147,7 @@ _INDEX_HTML = b"""<!doctype html>
       <div class="analysis-toolbar">
         <label class="search-control">
           <span class="sr-only">Search timeline</span>
-          <input id="trace-search" type="search" autocomplete="off" placeholder="Filter API, function, kernel">
+          <input id="trace-search" type="search" autocomplete="off" placeholder="Filter API, function, kernel, span">
         </label>
         <div class="family-filters" aria-label="CUDA API family filters">
           <button class="family-filter launch active" data-family="launch" type="button" aria-pressed="true">Launch</button>
@@ -216,6 +216,7 @@ _INDEX_HTML = b"""<!doctype html>
               <div><dt>Function</dt><dd id="detail-function">-</dd></div>
               <div><dt>Location</dt><dd id="detail-location">-</dd></div>
               <div><dt>Kernel</dt><dd id="detail-kernel">-</dd></div>
+              <div><dt>Span</dt><dd id="detail-span">-</dd></div>
             </dl>
           </section>
           <section class="detail-section">
@@ -884,7 +885,7 @@ _APP_JS = rb"""(() => {
     if (!activeFamilies.has(event.family)) return false;
     const query = searchInput.value.trim().toLowerCase();
     if (!query) return true;
-    return [event.api, event.function, event.kernel, event.file]
+    return [event.api, event.function, event.kernel, event.file, event.span]
       .filter(Boolean)
       .some((value) => String(value).toLowerCase().includes(query));
   }
@@ -1043,6 +1044,7 @@ _APP_JS = rb"""(() => {
     setText("detail-function", event.function || "<unknown>");
     setText("detail-location", event.file ? `${event.file}:${event.line || 0}` : "<unknown>");
     setText("detail-kernel", event.kernel || "<not applicable>");
+    setText("detail-span", event.span || "<none>");
     setText("detail-json", JSON.stringify(event.details, null, 2));
     const result = byId("detail-result");
     result.textContent = event.return_code ? `ERR ${event.return_code}` : "OK";
@@ -1393,6 +1395,7 @@ def _event_payload(event: _viewer.ViewerEvent) -> dict:
         "duration_ns": event.duration_ns,
         "duration": _viewer._duration(event.duration_ns),
         "details": event.details,
+        "span": event.span,
     }
 
 

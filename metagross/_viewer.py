@@ -25,6 +25,7 @@ _MAX_DETAILS = 32
 _MAX_APIS = 512
 _MAX_FUNCTIONS = 4096
 _MAX_KERNELS = 4096
+_MAX_SPANS = 4096
 _MAX_MEMORY_SAMPLES = 2000
 _MAX_RECENT = 10_000
 _DEFAULT_RECENT = 500
@@ -65,6 +66,7 @@ class ViewerEvent:
     return_code: int
     duration_ns: int
     details: dict
+    span: str | None = None
 
 
 @dataclasses.dataclass
@@ -109,6 +111,7 @@ class TraceModel:
         self.apis: dict[str, Aggregate] = {}
         self.functions: dict[tuple[str, str, int], Aggregate] = {}
         self.kernels: dict[str, Aggregate] = {}
+        self.spans: dict[str, Aggregate] = {}
 
     @staticmethod
     def _group(groups: dict, key, limit: int, overflow_key) -> Aggregate:
@@ -141,6 +144,8 @@ class TraceModel:
             self._group(self.kernels, event.kernel, _MAX_KERNELS, "<other>").observe(
                 event
             )
+        if event.span is not None:
+            self._group(self.spans, event.span, _MAX_SPANS, "<other>").observe(event)
 
         if event.api in (
             "cuStreamSynchronize",
@@ -331,11 +336,8 @@ def parse_event(record) -> ViewerEvent:
     line = record.get("line")
     if line is not None and not _is_bounded_int(line):
         raise ValueError("line must be an integer within range or null")
-    # "span" is additive: older records omit it entirely, and a
-    # present value must be an optional string like kernel/function. The
-    # value itself is not carried onto ViewerEvent -- the viewer does not
-    # render spans yet -- so this call exists purely to validate the type.
-    _optional_text(record, "span")
+    # "span" is additive: older records omit it entirely.
+    span = _optional_text(record, "span")
     duration_ns = _required_int(record, "duration_ns")
     if duration_ns < 0:
         raise ValueError("duration_ns must not be negative")
@@ -368,6 +370,7 @@ def parse_event(record) -> ViewerEvent:
         return_code=_required_int(record, "return_code"),
         duration_ns=duration_ns,
         details=safe_details,
+        span=span,
     )
 
 
@@ -609,6 +612,16 @@ def render_snapshot(model: TraceModel, width: int = 120) -> list[str]:
         )
     if not model.kernels:
         lines.append("<no resolved kernels>")
+
+    if model.spans:
+        lines.extend(("", _heading("TOP SPANS (by calls)", width)))
+        lines.append(f"{'SPAN':<{kernel_width}} {'CALLS':>10} {'TOTAL CPU':>12}")
+        for span, aggregate in _top(model.spans, 6):
+            lines.append(
+                f"{_fit(span, kernel_width):<{kernel_width}} "
+                f"{aggregate.count:>10,} "
+                f"{_duration(aggregate.total_duration_ns):>12}"
+            )
 
     lines.extend(("", _heading("RECENT EVENTS", width)))
     text_width = width - 31
